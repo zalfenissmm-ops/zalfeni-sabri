@@ -32,3 +32,40 @@ Swing structure: up
 
 لا تعتمد على مؤشر واحد فقط. الإشارة الأقوى هي توافق الإشارات الثلاث معًا، والقوة (ADX)
 تخبرك متى تثق بالاتجاه ومتى يكون السوق عرضيًا وغير موثوق للتداول باتجاه واحد.
+
+---
+
+## SMC Strategy — smc_strategy.py
+
+أداة ثانية تكتشف إعدادات **Smart Money Concepts** من نفس نوع ملفات CSV:
+سيولة (Equal Highs/Lows)، تصيّد السيولة (Liquidity Sweep)، هيكل السعر (BOS/CHoCH)،
+أوردر بلوك (Order Block)، فجوة سعرية (FVG)، ومنطقة العلاوة/الخصم (Premium/Discount).
+
+### الاستخدام
+
+```bash
+python3 smc_strategy.py data.csv --swing 1 --tolerance 0.0015 --impulse 1.8
+```
+
+- `--swing`: نافذة اكتشاف القمم/القيعان (كل ما قلّت، كل ما اكتشفت قمم/قيعان أقرب لبعضها).
+- `--tolerance`: نسبة التفاوت المسموحة لاعتبار قمتين/قاعين "متساويين" = مجمع سيولة.
+- `--impulse`: مضاعف حجم الشمعة عشان تعتبر "اندفاعية" لتحديد الأوردر بلوك.
+
+### مثال على المخرجات
+
+```
+Direction        : SHORT (CHoCH at candle #13)
+Liquidity sweep  : {'index': 11, 'kind': 'high', 'level': 81.0}
+Order block      : {'index': 12, 'kind': 'bearish_ob', 'top': 80.0, 'bottom': 76.0}
+FVG              : {'index': 13, 'kind': 'bearish', 'bottom': 65.0, 'top': 76.0}
+Equilibrium (50%): 59.50000
+In premium zone   : True
+In order block   : True
+In FVG           : False
+Entry ready      : True
+Suggested SL     : 81.08100
+Suggested TP     : 37.96200
+```
+
+`Entry ready: True` يعني السعر رجع لمنطقة العلاوة (فوق 50% من الهبوط) وداخل الأوردر بلوك أو الفجوة السعرية —
+نفس النقطة اللي كانت متوضحة في خريطة الاستراتيجية.
