@@ -1,3 +1,22 @@
+## البداية السريعة — trend_bot.py (ملف واحد، أمر واحد)
+
+كل شيء (إشارة LONG/SHORT/FLAT + باك-تست + جلب مباشر من MT5) مجمّع في ملف واحد `trend_bot.py`،
+يخدم بأمر واحد بلا ما تحتاج تركّب بقية الملفات:
+
+```bash
+# من ملف CSV محلي
+python3 trend_bot.py data.csv --verbose
+
+# مباشرة من MT5 (يحتاج ترمينال MT5 محلول + pip install MetaTrader5)
+python3 trend_bot.py --mt5 --symbol EURUSD --timeframe H1 --count 1000 --out eurusd_h1.csv
+```
+
+يطبعلك الإشارة الحالية ثم نتائج الباك-تست فنفس الوقت. بقية الملفات فالريبو (`trend_identifier.py`,
+`smc_strategy.py`, `trend_following_strategy.py`, `trend_following_backtest.py`, `mt5_fetch.py`)
+باقيين موجودين لمن يحب يخدم بيهم منفصلين أو يبني عليهم.
+
+---
+
 # Trend Identifier — أداة تحديد الترند
 
 أداة بايثون (بدون مكتبات خارجية) لتحديد اتجاه السوق وقوته من بيانات الشموع (OHLC)،
