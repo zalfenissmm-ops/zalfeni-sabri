@@ -1,3 +1,32 @@
+## استراتيجية متعددة الفريمات — mtf_trend_strategy.py
+
+تطبيق دقيق لوثيقة `strategy_spec.md` المتفق عليها: 1H يحدد الاتجاه (هيكل + MA50/MA200 + ADX/DI)،
+15m يحدد منطقة Pullback (لمس MA50 أو آخر Swing من ZigZag مبني على ATR)، 5m يعطي إشارة تأكيد
+(Pin Bar / Engulfing / كسر بسيط) قبل الدخول. الستوب = آخر Swing (15m) ± 0.5×ATR، الهدف بنسبة 1:2،
+باك-تست bar-by-bar على فريم 5m بلا Look-ahead، وإشعارات تليقرام فوضع `--live`.
+
+### الاستخدام
+
+```bash
+# من CSV محلي (بيانات 5 دقائق: date,open,high,low,close)
+python3 mtf_trend_strategy.py data.csv --days 30
+
+# مباشرة من MT5، مرة وحدة (باك-تست 30 يوم + تحليل حالي)، وبعدها مراقبة كل 5 د + تليقرام
+python3 mtf_trend_strategy.py --mt5 --symbol EURUSD --days 30 --live --interval 5 \
+    --telegram-token <TOKEN> --telegram-chat-id <CHAT_ID>
+
+# أو عبر yfinance (محدودة بآخر ~60 يوم من بيانات 5 دقائق حسب Yahoo)
+python3 mtf_trend_strategy.py --yfinance --symbol EURUSD=X --days 30
+```
+
+كل مرحلة من مراحل الاستراتيجية تطبع نتيجتها (Phase 1: الاتجاه، Phase 2: Pullback + التأكيد،
+Phase 3/4: SL/TP) — فكل تحليل، باك-تست، أو دورة مراقبة حية.
+
+`--telegram-token`/`--telegram-chat-id` اختياريين (أو `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`
+كمتغيرات بيئة) — بلاهم الأداة تخدم عادي، غير ما تبعثش إشعارات.
+
+---
+
 ## البداية السريعة — trend_bot.py (ملف واحد، أمر واحد)
 
 كل شيء (إشارة LONG/SHORT/FLAT + باك-تست + جلب مباشر من MT5) مجمّع في ملف واحد `trend_bot.py`،
