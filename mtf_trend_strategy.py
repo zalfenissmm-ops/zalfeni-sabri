@@ -90,6 +90,33 @@ def load_csv(path: str) -> list[Candle]:
     return candles
 
 
+def _copy_rates_robust(symbol: str, bars_needed: int, chunk: int = 5000, retries: int = 3):
+    """Pull M5 bars via copy_rates_from_pos in chunks, walking further back
+    in position until bars_needed is met or the terminal has no more to
+    give. One huge copy_rates_range call for a long span often fails
+    outright ("Terminal: Call failed") when that whole range isn't cached
+    locally yet; small position-based chunks are what actually makes MT5
+    fetch older history from the broker on demand, and a short retry
+    absorbs the occasional transient failure."""
+    collected = []
+    pos = 0
+    while len(collected) < bars_needed:
+        take = min(chunk, bars_needed - len(collected))
+        batch = None
+        for attempt in range(retries):
+            batch = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, pos, take)
+            if batch is not None and len(batch) > 0:
+                break
+            time.sleep(0.5)
+        if batch is None or len(batch) == 0:
+            break
+        collected = list(batch) + collected
+        pos += len(batch)
+        if len(batch) < take:
+            break  # terminal had no older bars left to give
+    return collected
+
+
 def fetch_mt5(
     symbol: str, history_days: int, login: int | None = None, password: str | None = None,
     server: str | None = None, path: str | None = None,
@@ -107,12 +134,15 @@ def fetch_mt5(
             code, desc = mt5.last_error()
             raise ValueError(f"Symbol '{symbol}' not available: [{code}] {desc}")
 
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=history_days)
-        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, start, end)
-        if rates is None or len(rates) == 0:
+        bars_needed = history_days * 288  # M5 bars/day if the market never closed; safe overestimate around weekends
+        rates = _copy_rates_robust(symbol, bars_needed)
+        if not rates:
             code, desc = mt5.last_error()
-            raise ValueError(f"No M5 data returned for {symbol}: [{code}] {desc}")
+            raise ValueError(
+                f"No M5 data returned for {symbol}: [{code}] {desc}. "
+                "Open an M5 chart for this symbol in MT5 and scroll back (or press Home) "
+                "to force the terminal to download older history, then retry."
+            )
 
         return [
             Candle(
