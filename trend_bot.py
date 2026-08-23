@@ -13,14 +13,20 @@ Usage (live from MT5 — needs MT5 terminal running locally + `pip install MetaT
     python3 trend_bot.py --mt5 --symbol EURUSD --timeframe H1 --count 1000
     python3 trend_bot.py --mt5 --symbol EURUSD --timeframe H1 --count 1000 --out eurusd_h1.csv
 
+Usage (run once, print the last 30 days' backtest, then watch for new trades
+every 5 minutes — entry/take-profit/stop-loss printed only when a new trade
+triggers):
+    python3 trend_bot.py --mt5 --symbol EURUSD --timeframe M15 --live --days 30 --interval 5
+
 CSV must have a header row with columns: date,open,high,low,close
 """
 
 import argparse
 import csv
 import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import MetaTrader5 as mt5
@@ -336,6 +342,65 @@ def write_csv(candles: list[Candle], out_path: str) -> None:
             writer.writerow([c.date, f"{c.open:.5f}", f"{c.high:.5f}", f"{c.low:.5f}", f"{c.close:.5f}"])
 
 
+# ------------------------------------------------------------------ time --
+
+def _parse_date(s: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def filter_last_days(candles: list[Candle], days: int) -> list[Candle]:
+    """Keep only candles within `days` of the most recent one. Falls back to
+    the full list if dates can't be parsed (e.g. a non-ISO date column)."""
+    last_dt = _parse_date(candles[-1].date)
+    if last_dt is None:
+        return candles
+    cutoff = last_dt - timedelta(days=days)
+    filtered = [c for c in candles if (dt := _parse_date(c.date)) is not None and dt >= cutoff]
+    return filtered if len(filtered) >= 2 else candles
+
+
+def compute_take_profit(signal: str, entry: float, stop: float, rr: float) -> float:
+    """Fixed target at `rr` times the stop-loss distance — the trailing stop
+    still governs the actual exit; this is a reference TP level only."""
+    risk = abs(entry - stop)
+    return entry + risk * rr if signal == "LONG" else entry - risk * rr
+
+
+# ---------------------------------------------------------------- live ----
+
+def live_loop(fetch_fn, strategy_kwargs: dict, rr: float, interval_minutes: float) -> None:
+    """Re-fetch fresh candles every `interval_minutes` and report only when
+    the signal changes into a new LONG/SHORT position (an actual new trade),
+    printing entry/take-profit/stop-loss for it. Runs until Ctrl+C."""
+    print(f"\n=== Live monitoring (every {interval_minutes} min, Ctrl+C to stop) ===")
+    last_signal = None
+    while True:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            candles = fetch_fn()
+            result = evaluate_trend_following(candles, **strategy_kwargs)
+        except ValueError as e:
+            print(f"[{now}] Skipped (not enough data yet): {e}")
+            time.sleep(interval_minutes * 60)
+            continue
+
+        signal = result["signal"]
+        if signal in ("LONG", "SHORT") and signal != last_signal:
+            entry, stop = result["last_close"], result["trailing_stop"]
+            tp = compute_take_profit(signal, entry, stop, rr)
+            print(f"[{now}] NEW TRADE : {signal}")
+            print(f"  Entry       : {entry:.5f}")
+            print(f"  Take Profit : {tp:.5f}  (RR 1:{rr:g})")
+            print(f"  Stop Loss   : {stop:.5f}")
+        else:
+            print(f"[{now}] No new trade (signal: {signal})")
+        last_signal = signal
+        time.sleep(interval_minutes * 60)
+
+
 # --------------------------------------------------------------- CLI ------
 
 def main() -> None:
@@ -363,15 +428,23 @@ def main() -> None:
     parser.add_argument("--capital", type=float, default=10000.0, help="Backtest starting capital (default: 10000)")
     parser.add_argument("--fee", type=float, default=0.0, help="Backtest round-trip fee %% of notional (default: 0.0)")
     parser.add_argument("--verbose", action="store_true", help="Print every backtest trade, not just the summary")
+    parser.add_argument("--days", type=int, help="Limit the printed backtest to the last N days (default: all fetched data)")
+    parser.add_argument("--rr", type=float, default=2.0, help="Reward:risk ratio used for the suggested take-profit (default: 2.0)")
+    parser.add_argument("--live", action="store_true", help="After the one-time backtest, keep re-checking for new trades every --interval minutes")
+    parser.add_argument("--interval", type=float, default=5.0, help="Live-mode: minutes between checks (default: 5)")
     args = parser.parse_args()
 
     if args.mt5:
         if not args.symbol or not args.timeframe:
             parser.error("--mt5 requires --symbol and --timeframe")
-        candles = fetch_candles_from_mt5(
-            args.symbol, args.timeframe, args.count, args.date_from, args.date_to,
-            args.login, args.password, args.server, args.path,
-        )
+
+        def fetch_fn():
+            return fetch_candles_from_mt5(
+                args.symbol, args.timeframe, args.count, args.date_from, args.date_to,
+                args.login, args.password, args.server, args.path,
+            )
+
+        candles = fetch_fn()
         print(f"Fetched {len(candles)} candles from MT5 ({args.symbol} {args.timeframe})")
         if args.out:
             write_csv(candles, args.out)
@@ -379,7 +452,11 @@ def main() -> None:
     else:
         if not args.csv_path:
             parser.error("provide a csv_path, or use --mt5 --symbol ... --timeframe ...")
-        candles = load_candles(args.csv_path)
+
+        def fetch_fn():
+            return load_candles(args.csv_path)
+
+        candles = fetch_fn()
 
     strategy_kwargs = dict(
         fast=args.fast, slow=args.slow, adx_period=args.adx_period, adx_threshold=args.adx_threshold,
@@ -395,10 +472,17 @@ def main() -> None:
     print(f"ADX({result['adx_period']})            : {result['adx']:.2f} ({strength})")
     print(f"ATR({result['atr_period']})            : {result['atr']:.5f}")
     print(f"Last close          : {result['last_close']:.5f}")
-    print(f"Trailing stop       : {result['trailing_stop']:.5f}" if result["trailing_stop"] is not None else "Trailing stop       : n/a (no active signal)")
+    if result["trailing_stop"] is not None:
+        tp = compute_take_profit(result["signal"], result["last_close"], result["trailing_stop"], args.rr)
+        print(f"Take Profit         : {tp:.5f}  (RR 1:{args.rr:g})")
+        print(f"Stop Loss           : {result['trailing_stop']:.5f}")
+    else:
+        print("Take Profit         : n/a (no active signal)")
+        print("Stop Loss           : n/a (no active signal)")
 
-    print("\n=== Backtest ===")
-    trades = run_backtest(candles, fee_pct=args.fee, **strategy_kwargs)
+    backtest_candles = filter_last_days(candles, args.days) if args.days else candles
+    print(f"\n=== Backtest (last {args.days} days) ===" if args.days else "\n=== Backtest ===")
+    trades = run_backtest(backtest_candles, fee_pct=args.fee, **strategy_kwargs)
     stats = summarize(trades, args.capital)
 
     if args.verbose and trades:
@@ -413,15 +497,17 @@ def main() -> None:
 
     if stats["trades"] == 0:
         print("No trades were taken over this period.")
-        return
+    else:
+        print(f"Trades           : {stats['trades']} ({stats['wins']} win / {stats['losses']} loss)")
+        print(f"Win rate         : {stats['win_rate']:.2f}%")
+        print(f"Total return     : {stats['total_return_pct']:+.2f}% (equity {args.capital:.2f} -> {stats['final_equity']:.2f})")
+        print(f"Avg win / loss   : {stats['avg_win_pct']:+.2f}% / {stats['avg_loss_pct']:+.2f}%")
+        profit_factor = "inf" if stats["profit_factor"] == float("inf") else f"{stats['profit_factor']:.2f}"
+        print(f"Profit factor    : {profit_factor}")
+        print(f"Max drawdown     : {stats['max_drawdown_pct']:.2f}%")
 
-    print(f"Trades           : {stats['trades']} ({stats['wins']} win / {stats['losses']} loss)")
-    print(f"Win rate         : {stats['win_rate']:.2f}%")
-    print(f"Total return     : {stats['total_return_pct']:+.2f}% (equity {args.capital:.2f} -> {stats['final_equity']:.2f})")
-    print(f"Avg win / loss   : {stats['avg_win_pct']:+.2f}% / {stats['avg_loss_pct']:+.2f}%")
-    profit_factor = "inf" if stats["profit_factor"] == float("inf") else f"{stats['profit_factor']:.2f}"
-    print(f"Profit factor    : {profit_factor}")
-    print(f"Max drawdown     : {stats['max_drawdown_pct']:.2f}%")
+    if args.live:
+        live_loop(fetch_fn, strategy_kwargs, args.rr, args.interval)
 
 
 if __name__ == "__main__":
@@ -430,3 +516,6 @@ if __name__ == "__main__":
     except (FileNotFoundError, ValueError, KeyError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        sys.exit(0)
