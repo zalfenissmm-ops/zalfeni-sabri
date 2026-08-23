@@ -139,3 +139,40 @@ Max drawdown     : 0.00%
 الدخول/الخروج يتحسبو بسعر الإغلاق (close) لشمعة الإشارة — تبسيط معقول، لكن فالواقع لازم تستنى الشمعة تكمل
 باش تعرف الإشارة، يعني التنفيذ الحقيقي يتأخر شمعة وحدة. الوقف المتحرك (trailing stop) يتفحص بالـ high/low
 لكل شمعة، وإذا تلمس، الخروج يكون بسعر الوقف نفسه.
+
+---
+
+## جلب البيانات من MT5 — mt5_fetch.py
+
+يسحب الشموع مباشرة من ترمينال MetaTrader 5 ويكتبها CSV بنفس صيغة `date,open,high,low,close`
+اللي تقراها كل الأدوات الفوق.
+
+### الشروط
+
+- ترمينال **MT5 مثبت ومفتوح على نفس الجهاز** اللي تخدم فيه السكريبت (Windows، أو Wine) — مكتبة
+  `MetaTrader5` تتكلم مع الترمينال المحلي وما تتصلش بأي API عن بعد، فما تنجمش تخدم من بيئة سحابية بلا MT5.
+- `pip install MetaTrader5`
+
+### الاستخدام
+
+```bash
+# آخر 1000 شمعة
+python3 mt5_fetch.py --symbol EURUSD --timeframe H1 --count 1000 --out eurusd_h1.csv
+
+# مدى تاريخي محدد
+python3 mt5_fetch.py --symbol EURUSD --timeframe M15 --from 2024-01-01 --to 2024-06-01 --out data.csv
+
+# تسجيل دخول لحساب معيّن بدل استعمال الجلسة المفتوحة في الترمينال
+python3 mt5_fetch.py --symbol XAUUSD --timeframe H4 --count 2000 --out xauusd_h4.csv \
+    --login 12345678 --password "..." --server "Broker-Server"
+```
+
+بعد ما يطلعلك ملف CSV، تنجم تخدم بيه مباشرة مع بقية الأدوات:
+
+```bash
+python3 mt5_fetch.py --symbol EURUSD --timeframe H1 --count 1000 --out eurusd_h1.csv
+python3 trend_following_strategy.py eurusd_h1.csv
+python3 trend_following_backtest.py eurusd_h1.csv --verbose
+```
+
+**Timeframes المتاحة**: `M1 M2 M3 M4 M5 M6 M10 M12 M15 M20 M30 H1 H2 H3 H4 H6 H8 H12 D1 W1 MN1`
