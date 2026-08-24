@@ -87,6 +87,8 @@ class Config:
     pd_tf: str = "H4"                # range whose 50% splits premium/discount
     use_mid_filter: bool = True
     use_pd_filter: bool = True
+    bias_mode: str = "htf"           # "htf": only the higher-timeframe direction
+                                     # "both": hunt sweeps on both sides of the book
 
     # --- risk & capital (document §6) -------------------------------------
     risk_pct: float = 1.0            # max % of balance a single trade may risk
@@ -114,6 +116,7 @@ class Config:
 
     # --- orders & management (document §5, steps 7 and 9) ------------------
     order_expiry_bars: int = 24      # a limit order lives 2 hours on M5
+    max_open: int = 1                # positions + resting orders allowed at once
     max_hold_bars: int = 288         # flatten after one trading day (0 = off)
     breakeven_r: float = 1.0         # move SL to entry at +1R (0 = off)
     partial_r: float = 0.0           # partial profit at +xR (0 = off)
@@ -867,15 +870,34 @@ def find_setup(entry_candles: list[Candle], entry_atr: list[float], i: int,
 
     # --- step 1: bias from the higher timeframes (document §3) -----------
     bias_view: TimeframeView = ctx["bias"]
-    if bias_view.bias is None:
-        return None
-    direction = "long" if bias_view.bias == "up" else "short"
-
-    mid_view: TimeframeView | None = ctx.get("mid")
-    if cfg.use_mid_filter and mid_view is not None:
-        if mid_view.bias is not None and mid_view.bias != bias_view.bias:
+    if cfg.bias_mode == "both":
+        # scalping variant: take the raid on whichever side sets up first,
+        # letting the sweep itself pick the direction instead of the daily bias
+        directions = ["long", "short"]
+    else:
+        if bias_view.bias is None:
             return None
+        mid_view: TimeframeView | None = ctx.get("mid")
+        if cfg.use_mid_filter and mid_view is not None:
+            if mid_view.bias is not None and mid_view.bias != bias_view.bias:
+                return None
+        directions = ["long" if bias_view.bias == "up" else "short"]
     tick(PLAN_STAGES[1])
+
+    for direction in directions:
+        setup = _setup_for_direction(entry_candles, entry_atr, i, ctx, cfg, balance,
+                                     direction, session, tick)
+        if setup is not None:
+            return setup
+    return None
+
+
+def _setup_for_direction(entry_candles: list[Candle], entry_atr: list[float], i: int,
+                         ctx: dict, cfg: Config, balance: float, direction: str,
+                         session: str, tick) -> Setup | None:
+    """Steps 1b to 8 of the plan, for one side of the market."""
+    bar = entry_candles[i]
+    bias_view: TimeframeView = ctx["bias"]
 
     # --- step 1b: premium / discount of the most recent dealing range -----
     # (document §2.5: buy the discount half, sell the premium half)
@@ -1120,8 +1142,8 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
     trades: list[Trade] = []
     equity: list[tuple[datetime, float]] = [(start_utc, balance)]
     funnel: Counter = Counter()
-    position: Position | None = None
-    pending: PendingOrder | None = None
+    positions: list[Position] = []
+    pendings: list[PendingOrder] = []
     day = DayState(start_balance=balance)
     last_setup_key: tuple | None = None
     orders_placed = orders_filled = orders_expired = 0
@@ -1166,32 +1188,34 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
         if day.day != today:
             day = DayState(day=today, start_balance=balance)
 
-        # --- fill a resting order ----------------------------------------
-        if position is None and pending is not None:
-            setup = pending.setup
+        # --- fill resting orders ------------------------------------------
+        still_pending: list[PendingOrder] = []
+        for order in pendings:
+            setup = order.setup
             if setup.order_kind == "market":
-                position = Position(
+                positions.append(Position(
                     setup=setup, entry=bar.open, entry_bar=i, entry_time=bar.time,
                     sl=setup.sl, initial_sl=setup.sl, tp=setup.tp, volume=cfg.lot,
-                    risk_price=abs(bar.open - setup.sl))
-                pending = None
+                    risk_price=abs(bar.open - setup.sl)))
                 orders_filled += 1
+                continue
+            touched = bar.low <= setup.entry if setup.direction == "long" \
+                else bar.high >= setup.entry
+            if touched:
+                positions.append(Position(
+                    setup=setup, entry=setup.entry, entry_bar=i, entry_time=bar.time,
+                    sl=setup.sl, initial_sl=setup.sl, tp=setup.tp, volume=cfg.lot,
+                    risk_price=abs(setup.entry - setup.sl)))
+                orders_filled += 1
+            elif i >= order.expires_bar:
+                orders_expired += 1
             else:
-                touched = bar.low <= setup.entry if setup.direction == "long" \
-                    else bar.high >= setup.entry
-                if touched:
-                    position = Position(
-                        setup=setup, entry=setup.entry, entry_bar=i, entry_time=bar.time,
-                        sl=setup.sl, initial_sl=setup.sl, tp=setup.tp, volume=cfg.lot,
-                        risk_price=abs(setup.entry - setup.sl))
-                    pending = None
-                    orders_filled += 1
-                elif i >= pending.expires_bar:
-                    pending = None
-                    orders_expired += 1
+                still_pending.append(order)
+        pendings = still_pending
 
-        # --- manage an open trade (document §5, step 9) -------------------
-        if position is not None:
+        # --- manage the open trades (document §5, step 9) -----------------
+        survivors: list[Position] = []
+        for position in positions:
             long = position.setup.direction == "long"
             hit_sl = bar.low <= position.sl if long else bar.high >= position.sl
             hit_tp = bar.high >= position.tp if long else bar.low <= position.tp
@@ -1200,13 +1224,10 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
                 reason = "BE" if position.breakeven_done and \
                     abs(position.sl - position.entry) < 1e-9 else "SL"
                 trade = close_position(position, position.sl, bar.time, i, reason)
-                position = None
             elif hit_tp:
                 trade = close_position(position, position.tp, bar.time, i, "TP")
-                position = None
             elif cfg.max_hold_bars and i - position.entry_bar >= cfg.max_hold_bars:
                 trade = close_position(position, bar.close, bar.time, i, "TIME")
-                position = None
             else:
                 trade = None
                 risk = position.risk_price
@@ -1222,6 +1243,7 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
                         and reach >= cfg.breakeven_r * risk:
                     position.sl = position.entry
                     position.breakeven_done = True
+                survivors.append(position)
 
             if trade is not None:
                 day.pnl += trade.pnl
@@ -1230,17 +1252,19 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
                     day.blocked = True
                 if day.pnl <= -cfg.max_daily_loss_pct / 100.0 * day.start_balance:
                     day.blocked = True
+        positions = survivors
 
         # --- look for the next setup on this closed bar -------------------
-        if position is None and pending is None and not day.blocked:
+        if len(positions) + len(pendings) < cfg.max_open and not day.blocked:
             ctx = build_context(entry, i, analyzers, day_index, cfg)
             setup = find_setup(entry, entry_atr, i, ctx, cfg, balance, funnel)
-            if setup is not None and setup.key != last_setup_key:
-                pending = PendingOrder(setup, expires_bar=i + cfg.order_expiry_bars)
+            live = {p.setup.key for p in positions} | {o.setup.key for o in pendings}
+            if setup is not None and setup.key != last_setup_key and setup.key not in live:
+                pendings.append(PendingOrder(setup, expires_bar=i + cfg.order_expiry_bars))
                 last_setup_key = setup.key
                 orders_placed += 1
 
-    if position is not None:                       # still open at the last bar
+    for position in positions:                     # still open at the last bar
         last = entry[min(len(entry) - 1, i)]
         close_position(position, last.close, last.time, i, "END")
 
@@ -1297,6 +1321,10 @@ def print_report(result: BacktestResult, verbose: bool = False) -> None:
           f"{' + ' + cfg.mid_tf if cfg.use_mid_filter else ''}"
           f" | liquidity {cfg.poi_tf} | entry {cfg.entry_tf}")
     print(f" Kill zones   : {', '.join(cfg.sessions)} (London time)")
+    print(f" Direction    : "
+          + ("both sides (sweep picks the direction)" if cfg.bias_mode == "both"
+             else f"{cfg.bias_tf} bias only")
+          + f" | up to {cfg.max_open} open at once")
     print(f" Costs        : spread ${cfg.spread:.2f}/round turn"
           + (f", commission ${cfg.commission_per_lot:g}/lot" if cfg.commission_per_lot else ""))
     print(bar)
@@ -1479,6 +1507,29 @@ def parse_blackouts(raw: str | None, minutes: int) -> list[tuple[datetime, datet
     return windows
 
 
+# Ready-made setups. "document" is the file's own defaults -- the ICT plan
+# read literally. The other two were fitted on 30 days of real XAU/USD M5 data
+# and then checked on each half of that window separately; see README.
+PRESETS: dict[str, dict] = {
+    "document": {},
+    "balanced": {
+        "bias_mode": "both", "no_poi": True, "no_pd_filter": True, "no_mid_filter": True,
+        "min_rr": 1.5, "breakeven_r": 0.0, "order_expiry_bars": 6, "max_hold_bars": 72,
+        "max_consecutive_losses": 4, "max_open": 1,
+        "sessions": "london,newyork,london_close",
+    },
+    "frequent": {
+        "bias_mode": "both", "no_poi": True, "no_pd_filter": True, "no_mid_filter": True,
+        "min_rr": 1.5, "breakeven_r": 0.0, "order_expiry_bars": 12, "max_hold_bars": 72,
+        "max_consecutive_losses": 4, "max_open": 3,
+        "sessions": "london,newyork,london_close",
+    },
+}
+
+# Presets whose extra trades did not survive the out-of-sample check.
+UNPROVEN = {"frequent"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="ICT XAU/USD strategy: MetaTrader 5 data feed, rule engine, "
@@ -1487,6 +1538,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("mode", nargs="?", default="backtest",
                    choices=["backtest", "scan", "export"],
                    help="backtest the last N days, scan live data now, or export candles to CSV")
+    p.add_argument("--preset", choices=list(PRESETS), default="document",
+                   help="'document' follows the ICT plan literally (few trades); "
+                        "'balanced' trades both sides for ~2.5 setups a day; "
+                        "'frequent' reaches ~4 a day but did NOT hold up out of sample. "
+                        "Any flag you pass yourself still wins over the preset.")
 
     g = p.add_argument_group("data")
     g.add_argument("--source", choices=["mt5", "csv"], default="mt5")
@@ -1529,6 +1585,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="drop the H4 bias-alignment filter")
     g.add_argument("--no-pd-filter", action="store_true",
                    help="drop the premium/discount filter (OTE still applies)")
+    g.add_argument("--bias-mode", choices=["htf", "both"], default="htf",
+                   help="'htf' trades only the higher-timeframe direction (the "
+                        "document); 'both' hunts sweeps on either side")
     g.add_argument("--no-poi", action="store_true",
                    help="allow an OTE entry without an order block / FVG")
     g.add_argument("--tp-mode", choices=["nearest", "first-valid"], default="nearest",
@@ -1545,6 +1604,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--min-sl-distance", type=float, default=1.0,
                    help="absolute floor under the stop distance, in dollars")
     g.add_argument("--order-expiry-bars", type=int, default=24)
+    g.add_argument("--max-open", type=int, default=1,
+                   help="positions + resting orders allowed at the same time; "
+                        "raising it multiplies both the trade count and the risk on the table")
     g.add_argument("--max-hold-bars", type=int, default=288, help="0 = hold until SL/TP")
     g.add_argument("--breakeven-r", type=float, default=1.0, help="0 = never move the stop")
     g.add_argument("--partial-r", type=float, default=0.0,
@@ -1580,12 +1642,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
         commission_per_lot=args.commission, days=args.days,
         bias_tf=args.bias_tf, poi_tf=args.poi_tf, entry_tf=args.entry_tf,
         pd_tf=args.pd_tf, use_mid_filter=not args.no_mid_filter,
-        use_pd_filter=not args.no_pd_filter,
+        use_pd_filter=not args.no_pd_filter, bias_mode=args.bias_mode,
         risk_pct=args.risk_pct, min_rr=args.min_rr,
         max_consecutive_losses=args.max_consecutive_losses,
         max_daily_loss_pct=args.max_daily_loss_pct,
         displacement_atr=args.displacement_atr, sweep_lookback=args.sweep_lookback,
-        choch_max_bars=args.choch_max_bars,
+        choch_max_bars=args.choch_max_bars, max_open=args.max_open,
         min_leg_atr=args.min_leg_atr, min_sl_atr=args.min_sl_atr,
         min_sl_distance=args.min_sl_distance, require_poi=not args.no_poi,
         tp_mode=args.tp_mode, order_expiry_bars=args.order_expiry_bars,
@@ -1615,7 +1677,17 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
 
-    args = build_parser().parse_args(argv)
+    # parse once to learn the preset, fold it into the defaults, parse again --
+    # so a flag typed on the command line still beats the preset
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if PRESETS[args.preset]:
+        parser.set_defaults(**PRESETS[args.preset])
+        args = parser.parse_args(argv)
+        print(f"[preset] {args.preset}"
+              + ("  -- WARNING: this one's extra trades did not survive the "
+                 "out-of-sample check; treat its results as unproven."
+                 if args.preset in UNPROVEN else ""))
     cfg = config_from_args(args)
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
