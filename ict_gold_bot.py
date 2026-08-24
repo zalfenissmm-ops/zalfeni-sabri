@@ -1024,8 +1024,13 @@ def find_setup(entry_candles: list[Candle], entry_atr: list[float], i: int,
     """The document's trading plan, steps 1-8, evaluated on the close of bar
     `i`. Returns a ready-to-place order, or None with the reason counted in
     the funnel. Nothing after bar `i` is ever read."""
+    counted: set[str] = set()
+
     def tick(stage: str) -> None:
-        if funnel is not None:
+        """Count each bar once per stage. Both directions are evaluated on the
+        same bar, so without this a stage could out-count the bars above it."""
+        if funnel is not None and stage not in counted:
+            counted.add(stage)
             funnel[stage] += 1
 
     bar = entry_candles[i]
@@ -1591,6 +1596,85 @@ def write_trades_csv(path: str, trades: list[Trade]) -> None:
 
 
 # ===========================================================================
+# 8b. WALK-FORWARD — the test that tells you whether an edge is real
+# ===========================================================================
+
+
+def walk_forward(data: dict[str, list[Candle]], cfg: Config, start_utc: datetime,
+                 end_utc: datetime, segment_days: int, label: str = "") -> dict:
+    """Replay the strategy over consecutive slices of time and report each one
+    separately.
+
+    A single number over one window says almost nothing: settings tuned on that
+    window will always flatter themselves on it. What matters is whether the
+    result repeats on stretches the settings were never fitted to. Segments that
+    alternate between profit and loss mean the edge is noise, however good the
+    total looks."""
+    segments = []
+    cursor = start_utc
+    while cursor < end_utc:
+        seg_end = min(cursor + timedelta(days=segment_days), end_utc)
+        if (seg_end - cursor).days < max(3, segment_days // 3):
+            break                                   # ignore a stub at the tail
+        result = run_backtest(data, cfg, cursor, seg_end)
+        trades = result.trades
+        wins = [t for t in trades if t.pnl > 0]
+        gross_loss = -sum(t.pnl for t in trades if t.pnl <= 0)
+        gross_win = sum(t.pnl for t in wins)
+        dd, _ = max_drawdown(result.equity)
+        segments.append({
+            "start": cursor, "end": seg_end, "trades": len(trades),
+            "net": sum(t.pnl for t in trades), "dd": dd,
+            "wr": (len(wins) / len(trades) * 100) if trades else 0.0,
+            "pf": (gross_win / gross_loss) if gross_loss else (99.0 if gross_win else 0.0),
+        })
+        cursor = seg_end
+
+    total = sum(s["net"] for s in segments)
+    traded = [s for s in segments if s["trades"] > 0]
+    winning = [s for s in traded if s["net"] > 0]
+
+    bar = "=" * 78
+    print()
+    print(bar)
+    print(f" WALK-FORWARD{' — ' + label if label else ''}   "
+          f"{start_utc:%Y-%m-%d} -> {end_utc:%Y-%m-%d}, {segment_days}-day segments")
+    print(bar)
+    print(f" {'segment':<25}{'trades':>8}{'win':>8}{'net $':>10}{'pf':>7}{'maxDD $':>10}")
+    print("-" * 78)
+    for s in segments:
+        print(f" {s['start']:%Y-%m-%d} -> {s['end']:%Y-%m-%d}{s['trades']:>8}"
+              f"{s['wr']:>7.1f}%{s['net']:>+10.2f}{s['pf']:>7.2f}{s['dd']:>10.2f}")
+    print("-" * 78)
+
+    if not traded:
+        print(" No trades in any segment.")
+        print(bar)
+        return {"segments": segments, "total": 0.0, "verdict": "no trades"}
+
+    share = len(winning) / len(traded)
+    print(f" Total          : ${total:+,.2f} over {sum(s['trades'] for s in segments)} trades")
+    print(f" Segments won   : {len(winning)} of {len(traded)}  ({share * 100:.0f}%)")
+    print(f" Worst segment  : ${min(s['net'] for s in traded):+,.2f}")
+
+    if len(traded) < 3:
+        verdict = ("Not enough segments to judge. Download more history "
+                   "(`download`) and re-run over a longer window.")
+    elif share >= 0.7 and total > 0:
+        verdict = ("Profitable in most segments. That is the strongest evidence "
+                   "this file can give you -- it is still not a promise.")
+    elif total > 0:
+        verdict = (f"Positive overall but only {share * 100:.0f}% of segments won: the total "
+                   "is carried by a few good stretches, not a repeatable edge.")
+    else:
+        verdict = ("Negative overall. Whatever this configuration looked like on the "
+                   "window it was chosen on, it does not hold up here.")
+    print(f" Verdict        : {verdict}")
+    print(bar)
+    return {"segments": segments, "total": total, "share": share, "verdict": verdict}
+
+
+# ===========================================================================
 # 9. LIVE SCAN — the same rules applied to the newest closed bar
 # ===========================================================================
 
@@ -1695,8 +1779,19 @@ PRESETS: dict[str, dict] = {
     },
 }
 
-# Presets whose extra trades did not survive the out-of-sample check.
-UNPROVEN = {"frequent"}
+# What is actually known about each preset, from testing rather than hope.
+PRESET_NOTES = {
+    "document": "the ICT plan read literally -- very few trades, so its result "
+                "is not statistically meaningful either way",
+    "balanced": "fitted on 30 days of XAU/USD (+11%), then LOST 4.2% when retested "
+                "on 90 days of the same symbol -- fitted, not validated",
+    "frequent": "reaches ~4 trades a day, but its profit came from 3 trades out of "
+                "85 and it lost money in the second half -- not validated",
+}
+
+# Nothing here has been shown to hold up out of sample. Run `walkforward`
+# before trusting any of it.
+UNPROVEN = {"balanced", "frequent"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1705,10 +1800,10 @@ def build_parser() -> argparse.ArgumentParser:
                     "and a 30-day backtest on a $1,000 / 0.01-lot account.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("mode", nargs="?", default="backtest",
-                   choices=["backtest", "scan", "export", "download"],
-                   help="backtest the last N days, scan live data now, export the "
-                        "candles a backtest needs, or download the deepest history "
-                        "this broker will serve")
+                   choices=["backtest", "walkforward", "scan", "export", "download"],
+                   help="backtest the last N days, walk-forward test it segment by "
+                        "segment, scan live data now, export the candles a backtest "
+                        "needs, or download the deepest history this broker serves")
     p.add_argument("--preset", choices=list(PRESETS), default="document",
                    help="'document' follows the ICT plan literally (few trades); "
                         "'balanced' trades both sides for ~2.5 setups a day; "
@@ -1795,6 +1890,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--save-data", action="store_true",
                    help="also write the downloaded candles to --csv-dir, so later "
                         "runs can replay them without MetaTrader 5")
+    g.add_argument("--segment-days", type=int, default=30,
+                   help="walkforward mode: length of each test segment")
+    g.add_argument("--compare", action="store_true",
+                   help="walkforward mode: run every preset over the same segments")
     g.add_argument("--verbose", action="store_true", help="print the signal funnel")
     g.add_argument("--csv-out", default=None, help="write the trade list to this CSV")
     return p
@@ -1862,10 +1961,10 @@ def main(argv: list[str] | None = None) -> int:
     if PRESETS[args.preset]:
         parser.set_defaults(**PRESETS[args.preset])
         args = parser.parse_args(argv)
-        print(f"[preset] {args.preset}"
-              + ("  -- WARNING: this one's extra trades did not survive the "
-                 "out-of-sample check; treat its results as unproven."
-                 if args.preset in UNPROVEN else ""))
+        print(f"[preset] {args.preset}: {PRESET_NOTES[args.preset]}")
+        if args.preset in UNPROVEN:
+            print("[preset] Check it on your own data with: "
+                  f"{os.path.basename(sys.argv[0])} walkforward --preset {args.preset}")
     cfg = config_from_args(args)
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
@@ -1905,6 +2004,19 @@ def main(argv: list[str] | None = None) -> int:
     # the window ends at the last closed entry-timeframe bar we actually have
     end_utc = data[cfg.entry_tf][-1].time + timedelta(minutes=TF_MINUTES[cfg.entry_tf])
     start_utc = end_utc - timedelta(days=cfg.days)
+
+    if args.mode == "walkforward":
+        if args.compare:
+            for name in PRESETS:
+                variant = build_parser()
+                variant.set_defaults(**PRESETS[name])
+                walk_forward(data, config_from_args(variant.parse_args(argv)),
+                             start_utc, end_utc, args.segment_days, label=name)
+        else:
+            walk_forward(data, cfg, start_utc, end_utc, args.segment_days,
+                         label=args.preset)
+        return 0
+
     result = run_backtest(data, cfg, start_utc, end_utc)
     print_report(result, verbose=args.verbose)
     if args.csv_out:
