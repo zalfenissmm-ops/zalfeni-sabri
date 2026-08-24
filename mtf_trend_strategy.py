@@ -415,19 +415,37 @@ def evaluate_trend(
 
 # ------------------------------------------- Phase 2a: pullback (15m) -----
 
+def _recent_pivot(pivots: list[Pivot], kind: str, current_index: int, max_age: int | None) -> Pivot | None:
+    """Most recent pivot of `kind`, but only if it's still within `max_age`
+    bars of the current bar -- a swing from long ago is no longer a
+    meaningful reference level for a pullback zone or a stop."""
+    candidates = [p for p in pivots if p.kind == kind]
+    if not candidates:
+        return None
+    latest = candidates[-1]
+    if max_age is not None and (current_index - latest.index) > max_age:
+        return None
+    return latest
+
+
 def evaluate_pullback_zone(
     candles_15m: list[Candle], direction: str, ma_fast: int, zigzag_atr_period: int, zigzag_atr_mult: float,
+    pivot_max_age: int | None = None, zone_atr_tolerance: float = 0.25,
 ) -> dict:
     closes = [c.close for c in candles_15m]
     ma = compute_sma(closes, ma_fast)
+    atr = compute_atr(candles_15m, zigzag_atr_period)
     pivots = zigzag(candles_15m, zigzag_atr_period, zigzag_atr_mult)
-    lows = [p for p in pivots if p.kind == "low"]
-    highs = [p for p in pivots if p.kind == "high"]
-    swing_level = lows[-1].price if direction == "up" and lows else (highs[-1].price if direction == "down" and highs else None)
+    swing = _recent_pivot(pivots, "low" if direction == "up" else "high", len(candles_15m) - 1, pivot_max_age)
+    swing_level = swing.price if swing else None
 
+    # A literal "the candle's wick touched the exact level" is stricter than
+    # how a pullback is actually judged in practice -- allow price to come
+    # within a small ATR-scaled band of the level too.
+    band = zone_atr_tolerance * atr if atr else 0.0
     cur = candles_15m[-1]
-    touched_ma = ma is not None and cur.low <= ma <= cur.high
-    touched_swing = swing_level is not None and cur.low <= swing_level <= cur.high
+    touched_ma = ma is not None and (cur.low - band) <= ma <= (cur.high + band)
+    touched_swing = swing_level is not None and (cur.low - band) <= swing_level <= (cur.high + band)
     return {
         "in_zone": touched_ma or touched_swing, "ma": ma, "swing_level": swing_level,
         "touched_ma": touched_ma, "touched_swing": touched_swing,
@@ -493,14 +511,13 @@ def evaluate_confirmation(candles_5m: list[Candle], direction: str, lookback: in
 
 # --------------------------------------------- Phase 3/4: SL / TP --------
 
-def compute_stop_loss(pivots_15m: list[Pivot], direction: str, atr15: float | None) -> float | None:
+def compute_stop_loss(pivots_15m: list[Pivot], direction: str, atr15: float | None, current_index: int, pivot_max_age: int | None = None) -> float | None:
     if atr15 is None:
         return None
-    lows = [p for p in pivots_15m if p.kind == "low"]
-    highs = [p for p in pivots_15m if p.kind == "high"]
-    if direction == "up":
-        return lows[-1].price - 0.5 * atr15 if lows else None
-    return highs[-1].price + 0.5 * atr15 if highs else None
+    pivot = _recent_pivot(pivots_15m, "low" if direction == "up" else "high", current_index, pivot_max_age)
+    if pivot is None:
+        return None
+    return pivot.price - 0.5 * atr15 if direction == "up" else pivot.price + 0.5 * atr15
 
 
 def compute_take_profit(entry: float, stop: float, direction: str, rr: float = 2.0) -> float:
@@ -534,7 +551,8 @@ def evaluate_state(m5_so_far: list[Candle], h1_closed: list[Candle], m15_closed:
         cache["m15_count"] = len(m15_closed)
         cache["pullback"] = (
             evaluate_pullback_zone(m15_closed, trend["direction"], params["pullback_ma"],
-                                    params["zigzag_atr_period"], params["zigzag_atr_mult"])
+                                    params["zigzag_atr_period"], params["zigzag_atr_mult"],
+                                    params["pivot_max_age"], params["zone_atr_tolerance"])
             if trend["direction"] != "none" and len(m15_closed) >= 2 else None
         )
 
@@ -547,7 +565,7 @@ def evaluate_state(m5_so_far: list[Candle], h1_closed: list[Candle], m15_closed:
         if confirmation["confirmed"]:
             atr15 = compute_atr(m15_closed, params["zigzag_atr_period"])
             pivots15 = zigzag(m15_closed, params["zigzag_atr_period"], params["zigzag_atr_mult"])
-            stop = compute_stop_loss(pivots15, trend["direction"], atr15)
+            stop = compute_stop_loss(pivots15, trend["direction"], atr15, len(m15_closed) - 1, params["pivot_max_age"])
             entry = m5_so_far[-1].close
             # A stale/far-away ZigZag pivot can land the stop on the wrong
             # side of entry (e.g. below entry for a short) — reject rather
@@ -871,6 +889,8 @@ def main() -> None:
     parser.add_argument("--pullback-ma", type=int, default=50, help="MA period checked for the 15m pullback zone (default: 50)")
     parser.add_argument("--confirm-lookback", type=int, default=5, help="Bars used for the 5m break-of-range confirmation (default: 5)")
     parser.add_argument("--rr", type=float, default=1.5, help="Reward:risk ratio for take-profit (default: 1.5)")
+    parser.add_argument("--pivot-max-age", type=int, default=200, help="Ignore a ZigZag swing (for pullback/stop) older than this many 15m bars (default: 200 ~ 50h); 0 disables the limit")
+    parser.add_argument("--zone-atr-tolerance", type=float, default=0.25, help="ATR multiple of tolerance around MA/swing to count as 'touched' for the pullback zone (default: 0.25)")
 
     parser.add_argument("--lot", type=float, default=0.01, help="Fixed lot size per trade (default: 0.01)")
     parser.add_argument("--contract-size", type=float, default=100000, help="Units per 1.0 lot (default: 100000)")
@@ -898,6 +918,7 @@ def main() -> None:
         adx_period=args.adx_period, adx_threshold=args.adx_threshold, ma_fast=args.ma_fast, ma_slow=args.ma_slow,
         zigzag_atr_period=args.zigzag_atr_period, zigzag_atr_mult=args.zigzag_mult, pullback_ma=args.pullback_ma,
         confirmation_lookback=args.confirm_lookback, rr=args.rr,
+        pivot_max_age=(args.pivot_max_age or None), zone_atr_tolerance=args.zone_atr_tolerance,
     )
 
     if args.optimize:
