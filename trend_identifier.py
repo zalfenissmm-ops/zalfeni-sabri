@@ -74,10 +74,14 @@ def wilder_smooth_avg(values: list[float], period: int) -> list[float]:
     return result
 
 
-def adx(candles: list[Candle], period: int = 14) -> float:
-    """Latest ADX value using Wilder's original method."""
+def adx_series(candles: list[Candle], period: int = 14) -> list[float | None]:
+    """ADX aligned to candle index: element i is the value a trader could read
+    at candle i's close, or None while Wilder's warm-up (2*period-1 candles)
+    is still filling. Aligned indexing is what lets the backtest read ADX at an
+    arbitrary bar without recomputing the whole series."""
+    aligned: list[float | None] = [None] * len(candles)
     if len(candles) < period * 2:
-        raise ValueError(f"Need at least {period * 2} candles to compute ADX({period})")
+        return aligned
 
     plus_dm, minus_dm, tr = [], [], []
     for prev, cur in zip(candles, candles[1:]):
@@ -101,11 +105,18 @@ def adx(candles: list[Candle], period: int = 14) -> float:
         di_sum = plus_di + minus_di
         dx_values.append(0.0 if di_sum == 0 else 100 * abs(plus_di - minus_di) / di_sum)
 
-    if len(dx_values) < period:
-        raise ValueError(f"Need at least {period * 2} candles to compute ADX({period})")
+    values = wilder_smooth_avg(dx_values, period)
+    offset = 2 * period - 1  # first candle index the smoothed DX average covers
+    for j, value in enumerate(values):
+        aligned[offset + j] = value
+    return aligned
 
-    adx_series = wilder_smooth_avg(dx_values, period)
-    return adx_series[-1]
+
+def adx(candles: list[Candle], period: int = 14) -> float:
+    """Latest ADX value using Wilder's original method."""
+    if len(candles) < period * 2:
+        raise ValueError(f"Need at least {period * 2} candles to compute ADX({period})")
+    return adx_series(candles, period)[-1]
 
 
 def swing_points(candles: list[Candle], window: int = 5) -> tuple[list[float], list[float]]:
