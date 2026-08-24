@@ -775,32 +775,56 @@ def live_loop(args, symbols: list[str], params: dict, telegram_token: str | None
 
 # --------------------------------------------------------- optimization --
 
+def _rank_key(r: dict) -> tuple:
+    return (r["profit_factor"] if r["profit_factor"] != float("inf") else 1e9, r["trades"])
+
+
+def _refine_grid(center: float, step: float, min_val: float) -> list[float]:
+    return sorted({v for v in (round(center - step, 4), round(center, 4), round(center + step, 4)) if v >= min_val})
+
+
+def _grid_search(candles: list[Candle], base_params: dict, adx_vals, zigzag_vals, rr_vals, cutoff, lot, contract_size, capital, min_trades, tag) -> list[dict]:
+    results = []
+    total = len(adx_vals) * len(zigzag_vals) * len(rr_vals)
+    for done, (adx_t, zz, rr) in enumerate(
+        ((a, z, r) for a in adx_vals for z in zigzag_vals for r in rr_vals), 1
+    ):
+        params = dict(base_params, adx_threshold=adx_t, zigzag_atr_mult=zz, rr=rr)
+        trades = run_backtest(candles, params)
+        recent = [t for t in trades if t.entry_dt >= cutoff]
+        stats = summarize_trades(recent, lot, contract_size, capital)
+        print(f"  [{tag} {done}/{total}] adx>={adx_t:g} zigzag={zz:g} rr={rr:g} -> trades={stats.get('trades', 0)}", flush=True)
+        if stats.get("trades", 0) >= min_trades:
+            results.append({"adx_threshold": adx_t, "zigzag_mult": zz, "rr": rr, **stats})
+    return results
+
+
 def run_optimization(candles: list[Candle], base_params: dict, days: int, lot: float, contract_size: float, capital: float, min_trades: int = 5) -> list[dict]:
-    """Grid-search adx_threshold / zigzag_mult / rr on the already-fetched
-    history and rank combinations by profit factor -- lets the data (not a
-    guess) decide which settings trade more often without breaking
-    profitability. Combos with fewer than `min_trades` in the report window
-    are dropped since their stats aren't meaningful."""
-    grid_adx = [15.0, 20.0, 25.0, 30.0]
-    grid_zigzag = [1.0, 1.5, 2.0]
-    grid_rr = [1.5, 2.0, 2.5, 3.0]
+    """Coarse grid-search adx_threshold / zigzag_mult / rr on the already-
+    fetched history, then a finer second pass around the coarse winner
+    (its immediate neighbours on each axis) to check whether a nearby,
+    untested combination does even better -- lets the data decide, rather
+    than a guess, and without the cost of a full fine grid everywhere.
+    Combos with fewer than `min_trades` in the report window are dropped
+    since their stats aren't meaningful."""
+    coarse_adx, coarse_zigzag, coarse_rr = [15.0, 20.0, 25.0, 30.0], [1.0, 1.5, 2.0], [1.5, 2.0, 2.5, 3.0]
     cutoff = candles[-1].dt - timedelta(days=days)
-    total = len(grid_adx) * len(grid_zigzag) * len(grid_rr)
 
-    results, done = [], 0
-    for adx_t in grid_adx:
-        for zz in grid_zigzag:
-            for rr in grid_rr:
-                params = dict(base_params, adx_threshold=adx_t, zigzag_atr_mult=zz, rr=rr)
-                trades = run_backtest(candles, params)
-                recent = [t for t in trades if t.entry_dt >= cutoff]
-                stats = summarize_trades(recent, lot, contract_size, capital)
-                done += 1
-                print(f"  [{done}/{total}] adx>={adx_t:g} zigzag={zz:g} rr={rr:g} -> trades={stats.get('trades', 0)}", flush=True)
-                if stats.get("trades", 0) >= min_trades:
-                    results.append({"adx_threshold": adx_t, "zigzag_mult": zz, "rr": rr, **stats})
+    coarse = _grid_search(candles, base_params, coarse_adx, coarse_zigzag, coarse_rr, cutoff, lot, contract_size, capital, min_trades, "coarse")
+    if not coarse:
+        return []
 
-    results.sort(key=lambda r: (r["profit_factor"] if r["profit_factor"] != float("inf") else 1e9, r["trades"]), reverse=True)
+    coarse.sort(key=_rank_key, reverse=True)
+    best = coarse[0]
+    fine_adx = _refine_grid(best["adx_threshold"], 2.5, min_val=10.0)
+    fine_zigzag = _refine_grid(best["zigzag_mult"], 0.2, min_val=0.5)
+    fine_rr = _refine_grid(best["rr"], 0.25, min_val=1.0)
+
+    print(f"\n  Refining around adx>={best['adx_threshold']:g} zigzag={best['zigzag_mult']:g} rr={best['rr']:g} ...")
+    fine = _grid_search(candles, base_params, fine_adx, fine_zigzag, fine_rr, cutoff, lot, contract_size, capital, min_trades, "fine")
+
+    merged = {(r["adx_threshold"], r["zigzag_mult"], r["rr"]): r for r in coarse + fine}
+    results = sorted(merged.values(), key=_rank_key, reverse=True)
     return results
 
 
@@ -839,14 +863,14 @@ def main() -> None:
 
     parser.add_argument("--days", type=int, default=30, help="Backtest report window in days (default: 30)")
     parser.add_argument("--adx-period", type=int, default=14, help="ADX period (default: 14)")
-    parser.add_argument("--adx-threshold", type=float, default=25.0, help="Minimum ADX to confirm a trend (default: 25)")
+    parser.add_argument("--adx-threshold", type=float, default=20.0, help="Minimum ADX to confirm a trend (default: 20)")
     parser.add_argument("--ma-fast", type=int, default=50, help="Fast MA period (default: 50)")
     parser.add_argument("--ma-slow", type=int, default=200, help="Slow MA period (default: 200)")
     parser.add_argument("--zigzag-atr-period", type=int, default=14, help="ATR period for ZigZag/stop-loss (default: 14)")
-    parser.add_argument("--zigzag-mult", type=float, default=1.5, help="ATR multiple for ZigZag pivot confirmation (default: 1.5)")
+    parser.add_argument("--zigzag-mult", type=float, default=1.0, help="ATR multiple for ZigZag pivot confirmation (default: 1.0)")
     parser.add_argument("--pullback-ma", type=int, default=50, help="MA period checked for the 15m pullback zone (default: 50)")
     parser.add_argument("--confirm-lookback", type=int, default=5, help="Bars used for the 5m break-of-range confirmation (default: 5)")
-    parser.add_argument("--rr", type=float, default=2.0, help="Reward:risk ratio for take-profit (default: 2.0)")
+    parser.add_argument("--rr", type=float, default=1.5, help="Reward:risk ratio for take-profit (default: 1.5)")
 
     parser.add_argument("--lot", type=float, default=0.01, help="Fixed lot size per trade (default: 0.01)")
     parser.add_argument("--contract-size", type=float, default=100000, help="Units per 1.0 lot (default: 100000)")
@@ -879,7 +903,7 @@ def main() -> None:
     if args.optimize:
         candles = fetch_candles(args, symbol=symbols[0] if symbols else None)
         print(f"Loaded {len(candles)} M5 candles ({candles[0].dt} -> {candles[-1].dt})")
-        print(f"\n============= OPTIMIZING ({4*3*4} combinations, this can take a few minutes) =============")
+        print("\n============= OPTIMIZING (coarse grid, then a finer pass around the best result -- this can take a while) =============")
         results = run_optimization(candles, params, args.days, args.lot, args.contract_size, args.capital, args.opt_min_trades)
         print_optimization_results(results, args.days, args.opt_min_trades)
         return
