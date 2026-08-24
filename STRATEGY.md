@@ -32,7 +32,7 @@
 - **هابط**: آخر حركة كسرت قاع سابق بإغلاق (BOS هابط) + قمم هابطة.
 - **عرضي / غير واضح** → قعود. ما تتداولش.
 
-> أداة: `python3 smc.py trend data_4h.csv --ema 50 --adx-period 14`
+> أداة: `python smc.py trend --mt5 XAUUSD --tf H4`
 > لازم ADX > 20، وإلا السوق عرضي.
 
 ### ✅ الشرط 2 — حدّد السيولة (وين الستوبات)
@@ -73,7 +73,7 @@
 
 POI في النص الغالط → اتركها. ما تشريش غالي وما تبيعش رخيص.
 
-> أداة: `python3 smc.py scan data.csv --swing 1` — تعطيك الـ CHoCH والـ Sweep
+> أداة: `python smc.py scan --mt5 XAUUSD --tf M15 --swing 1` — تعطيك الـ CHoCH والـ Sweep
 > والـ OB والـ FVG والـ Equilibrium وتقولك `Entry ready: True/False`.
 
 ---

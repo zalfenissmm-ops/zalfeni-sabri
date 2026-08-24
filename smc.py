@@ -2,13 +2,17 @@
 """
 SMC — Smart Money Concepts toolkit in a single file, no external libraries.
 
-Three commands:
+Four commands:
 
-    python3 smc.py trend    data.csv    # trend direction and strength
-    python3 smc.py scan     data.csv    # the SMC setup on the chart right now
-    python3 smc.py backtest data.csv    # walk the rules bar by bar over history
+    python3 smc.py trend    --mt5 XAUUSD --tf H4    # trend direction and strength
+    python3 smc.py scan     --mt5 XAUUSD --tf M15   # the SMC setup on the chart now
+    python3 smc.py backtest --mt5 XAUUSD --tf M15   # walk the rules bar by bar
+    python3 smc.py fetch    XAUUSD --out data.csv   # save MT5 candles to a CSV
 
-CSV needs a header row with columns: date,open,high,low,close
+Candles come straight out of a running MetaTrader 5 terminal with `--mt5 SYMBOL`
+(Windows, `pip install MetaTrader5`, terminal open and logged in), or from a CSV
+file passed as the first argument. A CSV needs a header row with the columns:
+date,open,high,low,close
 
 The backtester simulates a trader in the order a person actually works:
 
@@ -22,7 +26,7 @@ index that *confirms* it, so a signal at bar i never reads a candle after i,
 and a signal found at bar i can never fill before bar i+1. No lookahead.
 
 Layout of this file:
-    1. data          candles, CSV loading, date parsing
+    1. data          candles, CSV and MT5 loading, date parsing
     2. math          EMA, Wilder smoothing, ADX
     3. detectors     swings, structure (BOS/CHoCH), liquidity, FVG, order blocks
     4. trend         the `trend` command
@@ -37,7 +41,7 @@ import csv
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ============================================================== 1. data
 
@@ -94,6 +98,91 @@ def parse_date(text: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+MT5_TIMEFRAMES = (
+    "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30",
+    "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
+)
+
+
+def load_from_mt5(symbol: str, timeframe: str = "M15", bars: int = 5000) -> tuple[list[Candle], dict]:
+    """Pull closed candles straight out of a running MetaTrader 5 terminal.
+
+    Needs Windows, `pip install MetaTrader5`, and the terminal open and logged in.
+    Bar 0 is the candle still forming, so we start at 1 and take only closed bars —
+    a half-built candle would give the backtest a high and low it could not know.
+
+    Also returns the symbol's contract specs, so the backtest can price a trade
+    from the broker's own tick value instead of a guess.
+    """
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        raise ValueError(
+            "The MetaTrader5 package is not installed. Run:  pip install MetaTrader5\n"
+            "(Windows only — it talks to the MT5 terminal on the same machine.)"
+        )
+
+    name = timeframe.upper()
+    if name not in MT5_TIMEFRAMES:
+        raise ValueError(f"Unknown timeframe {timeframe!r}. Pick one of: {', '.join(MT5_TIMEFRAMES)}")
+
+    if not mt5.initialize():
+        raise ValueError(
+            f"Cannot reach the MT5 terminal ({mt5.last_error()}). "
+            "Open MetaTrader 5, log in to your account, and try again."
+        )
+    try:
+        if not mt5.symbol_select(symbol, True):
+            raise ValueError(
+                f"Symbol {symbol!r} not found. Check the exact spelling in the MT5 Market Watch "
+                "window — brokers add suffixes like XAUUSD.m or XAUUSDm."
+            )
+        info = mt5.symbol_info(symbol)
+        rates = mt5.copy_rates_from_pos(symbol, getattr(mt5, f"TIMEFRAME_{name}"), 1, bars)
+        if rates is None or len(rates) == 0:
+            raise ValueError(f"MT5 returned no bars for {symbol} {name} ({mt5.last_error()})")
+
+        spec = {}
+        if info is not None:
+            spec = {
+                "digits": info.digits,
+                "point": info.point,
+                "tick_size": info.trade_tick_size or info.point,
+                "tick_value": info.trade_tick_value,
+            }
+        candles = [
+            Candle(
+                date=datetime.fromtimestamp(int(r["time"]), timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                open=float(r["open"]),
+                high=float(r["high"]),
+                low=float(r["low"]),
+                close=float(r["close"]),
+            )
+            for r in rates
+        ]
+    finally:
+        mt5.shutdown()
+
+    if len(candles) < 2:
+        raise ValueError(f"MT5 only returned {len(candles)} candle(s) — ask for more with --bars")
+    return candles, spec
+
+
+def get_candles(args: argparse.Namespace) -> tuple[list[Candle], dict]:
+    """Candles come from MT5 when --mt5 is given, otherwise from a CSV file."""
+    if getattr(args, "mt5", None):
+        candles, spec = load_from_mt5(args.mt5, args.tf, args.bars)
+        print(f"Loaded {len(candles)} closed {args.tf.upper()} candles for {args.mt5} from MT5")
+        print(f"Range: {candles[0].date}  ->  {candles[-1].date}\n")
+        return candles, spec
+    if not args.csv_path:
+        raise ValueError(
+            "No data source. Either pass a CSV file, or pull it live from MetaTrader 5:\n"
+            "    python smc.py backtest --mt5 XAUUSD --tf M15"
+        )
+    return load_candles(args.csv_path), {}
 
 
 # ============================================================== 2. math
@@ -1178,7 +1267,8 @@ def export_trades(bt: Backtester, path: str) -> None:
 
 
 def cmd_trend(args: argparse.Namespace) -> None:
-    result = identify_trend(load_candles(args.csv_path), args.ema, args.adx_period, args.swing)
+    candles, _ = get_candles(args)
+    result = identify_trend(candles, args.ema, args.adx_period, args.swing)
     print(f"Direction : {result['direction']}")
     if result["adx"] is not None:
         print(f"Strength  : {result['strength']} (ADX={result['adx']:.2f})")
@@ -1189,7 +1279,8 @@ def cmd_trend(args: argparse.Namespace) -> None:
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
-    setup = find_latest_setup(load_candles(args.csv_path), args.swing, args.tolerance, args.impulse)
+    candles, _ = get_candles(args)
+    setup = find_latest_setup(candles, args.swing, args.tolerance, args.impulse)
     if setup is None:
         print("No CHoCH detected yet — not enough structure to evaluate a setup.")
         return
@@ -1207,8 +1298,43 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print(f"Suggested TP     : {setup['take_profit']:.5f}")
 
 
+def resolve_money(args: argparse.Namespace, spec: dict) -> Money:
+    """Price a point of movement. The broker's own tick value beats a guess, so
+    MT5 specs fill in whatever the command line left unset."""
+    pip_size, pip_value = args.pip_size, args.pip_value
+    if spec and spec.get("tick_size") and spec.get("tick_value"):
+        if pip_size is None:
+            pip_size = spec["tick_size"]
+        if pip_value is None:
+            pip_value = spec["tick_value"] * Money.base_lot  # tick_value is per 1.00 lot
+        print(
+            f"Contract specs from MT5: 1 tick = {spec['tick_size']} of price "
+            f"= ${spec['tick_value']:,.2f} per 1.00 lot\n"
+        )
+    return Money(
+        balance=args.balance,
+        lot=args.lot,
+        pip_value=1.0 if pip_value is None else pip_value,
+        pip_size=1.0 if pip_size is None else pip_size,
+        cost=args.cost,
+    )
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    candles, spec = load_from_mt5(args.symbol, args.tf, args.bars)
+    with open(args.out, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "open", "high", "low", "close"])
+        for c in candles:
+            writer.writerow([c.date, c.open, c.high, c.low, c.close])
+    print(f"Wrote {len(candles)} closed {args.tf.upper()} candles for {args.symbol} to {args.out}")
+    print(f"Range: {candles[0].date}  ->  {candles[-1].date}")
+    if spec:
+        print(f"Contract specs: digits={spec['digits']}  tick_size={spec['tick_size']}  tick_value={spec['tick_value']}")
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
-    candles = load_candles(args.csv_path)
+    candles, spec = get_candles(args)
     signal_config = SignalConfig(
         swing_window=args.swing,
         tolerance=args.tolerance,
@@ -1222,13 +1348,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         sl_buffer_pct=args.sl_buffer,
         require_pd=not args.no_pd_filter,
     )
-    money = Money(
-        balance=args.balance,
-        lot=args.lot,
-        pip_value=args.pip_value,
-        pip_size=args.pip_size,
-        cost=args.cost,
-    )
+    money = resolve_money(args, spec)
     risk = RiskRules(
         daily_stop_pct=args.daily_stop,
         weekly_stop_pct=args.weekly_stop,
@@ -1259,28 +1379,35 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     fmt = argparse.ArgumentDefaultsHelpFormatter
 
+    def add_source(parser: argparse.ArgumentParser) -> None:
+        """Candles come from a CSV file or straight from a running MT5 terminal."""
+        parser.add_argument("csv_path", nargs="?", help="CSV with columns: date,open,high,low,close")
+        parser.add_argument("--mt5", metavar="SYMBOL", help="Read candles live from MetaTrader 5, e.g. XAUUSD")
+        parser.add_argument("--tf", default="M15", help="MT5 timeframe: M1 M5 M15 M30 H1 H4 D1 ...")
+        parser.add_argument("--bars", type=int, default=5000, help="How many closed candles to pull from MT5")
+
     t = sub.add_parser("trend", help="Trend direction and strength", formatter_class=fmt)
-    t.add_argument("csv_path", help="CSV with columns: date,open,high,low,close")
+    add_source(t)
     t.add_argument("--ema", type=int, default=50, help="EMA period")
     t.add_argument("--adx-period", type=int, default=14, help="ADX period")
     t.add_argument("--swing", type=int, default=5, help="Swing detection window")
     t.set_defaults(func=cmd_trend)
 
     s = sub.add_parser("scan", help="The SMC setup on the chart right now", formatter_class=fmt)
-    s.add_argument("csv_path", help="CSV with columns: date,open,high,low,close")
+    add_source(s)
     s.add_argument("--swing", type=int, default=3, help="Swing detection window")
     s.add_argument("--tolerance", type=float, default=0.0015, help="Equal highs/lows tolerance")
     s.add_argument("--impulse", type=float, default=1.8, help="Impulse candle size multiplier")
     s.set_defaults(func=cmd_scan)
 
     b = sub.add_parser("backtest", help="Walk the rules bar by bar over history", formatter_class=fmt)
-    b.add_argument("csv_path", help="Entry-timeframe CSV: date,open,high,low,close")
+    add_source(b)
 
     money = b.add_argument_group("account")
     money.add_argument("--balance", type=float, default=100.0, help="Starting balance in USD")
     money.add_argument("--lot", type=float, default=0.01, help="Fixed lot size per trade")
-    money.add_argument("--pip-value", type=float, default=1.0, help="USD per pip at 0.01 lot")
-    money.add_argument("--pip-size", type=float, default=1.0, help="Price units in one pip")
+    money.add_argument("--pip-value", type=float, help="USD per pip at 0.01 lot (default: MT5 specs, else 1.0)")
+    money.add_argument("--pip-size", type=float, help="Price units in one pip (default: MT5 specs, else 1.0)")
     money.add_argument("--cost", type=float, default=0.0, help="USD per round turn (spread + commission)")
 
     rules = b.add_argument_group("strategy")
@@ -1311,6 +1438,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     b.add_argument("--export", help="Write the trade list to this CSV path")
     b.set_defaults(func=cmd_backtest)
+
+    f = sub.add_parser("fetch", help="Save MT5 candles to a CSV file", formatter_class=fmt)
+    f.add_argument("symbol", help="MT5 symbol exactly as it appears in Market Watch, e.g. XAUUSD")
+    f.add_argument("--tf", default="M15", help="MT5 timeframe: M1 M5 M15 M30 H1 H4 D1 ...")
+    f.add_argument("--bars", type=int, default=5000, help="How many closed candles to pull")
+    f.add_argument("--out", default="data.csv", help="Where to write the CSV")
+    f.set_defaults(func=cmd_fetch)
 
     return p
 

@@ -1,15 +1,44 @@
 # SMC — أدوات Smart Money Concepts
 
-ملف بايثون واحد `smc.py`، **بلا أي مكتبة خارجية**. يحتاج Python 3.10 أو أحدث.
+ملف بايثون واحد `smc.py`. يحتاج Python 3.10 أو أحدث.
+
+بالـ CSV يخدم **بلا أي مكتبة خارجية**. باش تجيب البيانات من MT5 مباشرةً تحتاج `pip install MetaTrader5` (Windows برك).
 
 القواعد الكاملة للاستراتيجية موجودة في **[STRATEGY.md](STRATEGY.md)** — اقراها قبل الكود.
 
-## ثلاث أوامر
+## أربع أوامر
 
 ```bash
-python3 smc.py trend    data.csv    # الاتجاه وقوّتو
-python3 smc.py scan     data.csv    # الإعداد الموجود في الشارت توّة
-python3 smc.py backtest data.csv    # يطبّق القواعد شمعة بشمعة على التاريخ
+python smc.py trend    --mt5 XAUUSD --tf H4     # الاتجاه وقوّتو
+python smc.py scan     --mt5 XAUUSD --tf M15    # الإعداد الموجود في الشارت توّة
+python smc.py backtest --mt5 XAUUSD --tf M15    # يطبّق القواعد شمعة بشمعة
+python smc.py fetch    XAUUSD --out data.csv    # يحفظ الشموع في ملف CSV
+```
+
+## البيانات: من MT5 مباشرةً
+
+ما تحتاجش تصدّر شي بيدك. حطّ `--mt5 SYMBOL` في أي أمر والبرنامج يجيب الشموع
+من الترمينال بروحو.
+
+**الشروط**: Windows، وMetaTrader 5 **مفتوح ومسجّل دخول**، ومكتبة MT5 منصّبة:
+
+```bash
+pip install MetaTrader5
+```
+
+**اسم الرمز** لازم يكون كيما هو بالضبط في نافذة **Market Watch** متاع MT5. برشا
+وسطاء يزيدو لاحقة: `XAUUSD.m` ولا `XAUUSDm` ولا `GOLD`. إذا كتبتو غالط البرنامج
+يقولك اللي ما لقاهش.
+
+البرنامج ياخذ **الشموع المغلقة برك** — الشمعة اللي ما زالت تتكوّن يتجاوزها، خاطر
+قمّتها وقاعها ما زالوش معروفين.
+
+### ولا من ملف CSV
+
+إذا حبّيت تخدم بلا MT5، أعطي الملف كأول وسيط:
+
+```bash
+python smc.py backtest data.csv
 ```
 
 ملف CSV لازم يكون فيه سطر عناوين بالأعمدة: `date,open,high,low,close`
@@ -25,7 +54,7 @@ python3 smc.py backtest data.csv    # يطبّق القواعد شمعة بشم�
 3. **ADX**: يقيس **قوّة** الترند ويفرّق بين ترند حقيقي وسوق عرضي.
 
 ```bash
-python3 smc.py trend data.csv --ema 50 --adx-period 14 --swing 5
+python smc.py trend --mt5 XAUUSD --tf H4 --ema 50 --adx-period 14 --swing 5
 ```
 
 ```
@@ -46,7 +75,7 @@ Swing structure: up
 هيكل السعر (BOS/CHoCH)، أوردر بلوك، فجوة سعرية (FVG)، ومنطقة العلاوة/الخصم.
 
 ```bash
-python3 smc.py scan data.csv --swing 1 --tolerance 0.0015 --impulse 1.8
+python smc.py scan --mt5 XAUUSD --tf M15 --swing 1 --tolerance 0.0015 --impulse 1.8
 ```
 
 ```
@@ -87,12 +116,12 @@ Suggested TP     : 37.96200
 ### الاستخدام
 
 ```bash
-python3 smc.py backtest data_15m.csv --balance 100 --lot 0.01 \
-    --pip-value 1 --pip-size 1 --export trades.csv
+python smc.py backtest --mt5 XAUUSD --tf M15 --bars 20000 \
+    --balance 100 --lot 0.01 --export trades.csv
 ```
 
-الملف هو إطار **الدخول** (15m). إطار الاتجاه (4H) يتبنى منّه بـ `--htf-mult 16`
-(16 شمعة 15 دقيقة = 4 ساعات). للـ 5m استعمل `--htf-mult 48`.
+الإطار اللي تعطيه هو إطار **الدخول** (M15). إطار الاتجاه (4H) يتبنى منّه بـ
+`--htf-mult 16` (16 شمعة 15 دقيقة = 4 ساعات). للـ M5 استعمل `--htf-mult 48`.
 
 ### نموذج الحساب
 
@@ -100,8 +129,11 @@ python3 smc.py backtest data_15m.csv --balance 100 --lot 0.01 \
 الربح/الخسارة = حركة السعر ÷ pip-size × pip-value × (lot ÷ 0.01)
 ```
 
-الافتراضي = حساب **100$**، لوت **0.01**، ونقطة وحدة تساوي **1$** (يعني حركة 1.0
-في السعر = 1$ — كيف الذهب). للفوركس بدّل `--pip-size 0.0001` و`--pip-value` حسب الزوج.
+كي تستعمل `--mt5`، البرنامج **يجيب مواصفات العقد من الوسيط متاعك** (tick size و
+tick value) ويحسب قيمة النقطة وحدو — ما تحتاجش تحزر. يطبعلك شنوّة لقى قبل النتائج.
+
+بالـ CSV (بلا MT5) الافتراضي = حساب **100$**، لوت **0.01**، وحركة 1.0 في السعر = **1$**
+(كيف الذهب). للفوركس بدّل `--pip-size 0.0001` و`--pip-value` حسب الزوج.
 
 ### أهم الخيارات
 
@@ -116,8 +148,9 @@ python3 smc.py backtest data_15m.csv --balance 100 --lot 0.01 \
 | `--partial-rr` / `--partial-pct` | 2.0 / 50 | الجني الجزئي ونقل الستوب للتعادل |
 | `--max-risk-pct` | 0 (مطفي) | يتجاوز الصفقات اللي مخاطرتها أكبر من هالنسبة |
 | `--cost` | 0 | السبريد + العمولة بالدولار للصفقة الكاملة |
+| `--bars` | 5000 | قدّاش شمعة يجيب من MT5 |
 
-`python3 smc.py backtest --help` يوريك الباقي.
+`python smc.py backtest --help` يوريك الباقي.
 
 ### قسمين مهمّين في التقرير
 
@@ -135,6 +168,9 @@ python3 smc.py backtest data_15m.csv --balance 100 --lot 0.01 \
   تقرّب من الواقع.
 - حدود الخسارة اليومية والأسبوعية تحتاج عمود `date` مقروء؛ إذا ما تقراش التواريخ
   البرنامج ينبّهك ويطفي الحدود هذي.
+- أوقات MT5 هي أوقات **سيرفر الوسيط**، موش التوقيت المحلّي متاعك.
+- قدّاش شمعة ينجّم يعطيك MT5 محدود بإعداد الترمينال: `Outils → Options → Graphiques
+  → Nombre max. de barres`. إذا `--bars 20000` رجّعلك أقل، زيد الرقم غادي.
 
 ---
 
@@ -144,14 +180,14 @@ python3 smc.py backtest data_15m.csv --balance 100 --lot 0.01 \
 
 | القسم | فيه شنو |
 |---|---|
-| 1. data | الشموع، قراءة CSV، قراءة التواريخ |
+| 1. data | الشموع، قراءة CSV و MT5، قراءة التواريخ |
 | 2. math | EMA، تنعيم Wilder، ADX |
 | 3. detectors | القمم، الهيكل (BOS/CHoCH)، السيولة، FVG، الأوردر بلوك |
 | 4. trend | أمر `trend` |
 | 5. scan | أمر `scan` |
 | 6. signals | الشروط الستة كإشارات بلا نظرة للمستقبل |
 | 7. backtest | الفلوس، قواعد المخاطرة، حلقة المتداول، التقرير |
-| 8. cli | قراءة الأوامر والخيارات |
+| 8. cli | قراءة الأوامر والخيارات (بما فيهم `fetch`) |
 
 ---
 
