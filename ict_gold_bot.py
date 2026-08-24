@@ -73,6 +73,7 @@ class Config:
     lot: float = 0.01
     contract_size: float = 100.0     # 1.00 lot = 100 oz -> 0.01 lot = $1 per $1 move
     spread: float = 0.20             # price units, charged once per round turn
+    auto_spread: bool = True         # replace it with the broker's live spread
     commission_per_lot: float = 0.0  # $ per lot, round turn
 
     # --- backtest window --------------------------------------------------
@@ -271,7 +272,14 @@ class MT5Feed:
 
         if self.cfg.broker_utc_offset is None:
             self.offset_hours = self._detect_offset()
-            print(f"[mt5] broker clock detected at UTC{self.offset_hours:+g}")
+            tick = mt5.symbol_info_tick(self.symbol)
+            server = datetime.fromtimestamp(tick.time, tz=timezone.utc) if tick else None
+            print(f"[mt5] broker clock detected at UTC{self.offset_hours:+g}"
+                  + (f"  (terminal shows {server:%Y-%m-%d %H:%M}, "
+                     f"real UTC is {datetime.now(timezone.utc):%Y-%m-%d %H:%M})"
+                     if server else ""))
+            print("[mt5] if that clock does not match your terminal's Market Watch, "
+                  "the kill zones will be shifted -- pass --broker-utc-offset <hours>")
         else:
             self.offset_hours = float(self.cfg.broker_utc_offset)
 
@@ -280,6 +288,16 @@ class MT5Feed:
             print(f"[mt5] {self.symbol}: contract={info.trade_contract_size:g} "
                   f"min_lot={info.volume_min:g} spread={info.spread} points, "
                   f"digits={info.digits}")
+            if self.cfg.contract_size != info.trade_contract_size:
+                print(f"[mt5] note: --contract-size is {self.cfg.contract_size:g} but this "
+                      f"broker uses {info.trade_contract_size:g}; the P/L per $1 of gold "
+                      "follows the value you passed.")
+            # the broker's own spread beats a hard-coded guess
+            live_spread = info.spread * info.point
+            if self.cfg.auto_spread and live_spread > 0:
+                self.cfg.spread = live_spread
+                print(f"[mt5] spread taken from the broker: ${live_spread:.3f} per round turn "
+                      "(override with --spread)")
         return self
 
     def __exit__(self, *exc) -> None:
@@ -336,6 +354,11 @@ class MT5Feed:
         ]
         print(f"[mt5] {timeframe:>3}: {len(candles):>6} candles  "
               f"{candles[0].time:%Y-%m-%d %H:%M} -> {candles[-1].time:%Y-%m-%d %H:%M} UTC")
+        short_by = (candles[0].time - start_utc).days
+        if short_by > 1:
+            print(f"[mt5] note: {timeframe} history starts {short_by} days later than asked "
+                  f"({start_utc:%Y-%m-%d}) -- open the {timeframe} chart and scroll back "
+                  "so the terminal downloads more.")
         return candles
 
 
@@ -1482,7 +1505,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--lot", type=float, default=0.01)
     g.add_argument("--contract-size", type=float, default=100.0,
                    help="ounces per 1.00 lot (0.01 lot x 100 = $1 per $1 move)")
-    g.add_argument("--spread", type=float, default=0.20, help="price units, per round turn")
+    g.add_argument("--spread", type=float, default=None,
+                   help="price units, per round turn (default: read from the broker; "
+                        "0.20 when replaying CSV)")
     g.add_argument("--commission", type=float, default=0.0, help="$ per lot, round turn")
 
     g = p.add_argument_group("risk (document section 6)")
@@ -1549,7 +1574,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
 
     return Config(
         symbol=args.symbol, balance=args.balance, lot=args.lot,
-        contract_size=args.contract_size, spread=args.spread,
+        contract_size=args.contract_size,
+        spread=0.20 if args.spread is None else args.spread,
+        auto_spread=args.spread is None,
         commission_per_lot=args.commission, days=args.days,
         bias_tf=args.bias_tf, poi_tf=args.poi_tf, entry_tf=args.entry_tf,
         pd_tf=args.pd_tf, use_mid_filter=not args.no_mid_filter,
@@ -1581,6 +1608,13 @@ def drop_forming_candles(data: dict[str, list[Candle]], now: datetime) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # a French/OEM Windows console cannot encode every character in the report
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     args = build_parser().parse_args(argv)
     cfg = config_from_args(args)
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
