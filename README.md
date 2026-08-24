@@ -1,29 +1,28 @@
 # SMC — أدوات Smart Money Concepts
 
-ملف بايثون واحد `smc.py`. يحتاج Python 3.10 أو أحدث.
-
-بالـ CSV يخدم **بلا أي مكتبة خارجية**. باش تجيب البيانات من MT5 مباشرةً تحتاج `pip install MetaTrader5` (Windows برك).
+ملف بايثون واحد `smc.py`، وأمر واحد. يحتاج Python 3.10 أو أحدث.
 
 القواعد الكاملة للاستراتيجية موجودة في **[STRATEGY.md](STRATEGY.md)** — اقراها قبل الكود.
 
-## أربع أوامر
+## أمر واحد
 
 ```bash
-python smc.py trend    --mt5 XAUUSD --tf H4     # الاتجاه وقوّتو
-python smc.py scan     --mt5 XAUUSD --tf M15    # الإعداد الموجود في الشارت توّة
-python smc.py backtest --mt5 XAUUSD --tf M15    # يطبّق القواعد شمعة بشمعة
-python smc.py fetch    XAUUSD --out data.csv    # يحفظ الشموع في ملف CSV
+python smc.py XAUUSD
 ```
 
-## البيانات: من MT5 مباشرةً
+هذا الكل. يجيب شموع M15 من MT5 ويعمل الباك تيست ويطبعلك التقرير.
 
-ما تحتاجش تصدّر شي بيدك. حطّ `--mt5 SYMBOL` في أي أمر والبرنامج يجيب الشموع
-من الترمينال بروحو.
+**الشروط**: Windows، وMetaTrader 5 **مفتوح ومسجّل دخول**. مكتبة MT5 تتنصّب وحدها
+أول مرّة.
 
-**الشروط**: Windows، وMetaTrader 5 **مفتوح ومسجّل دخول**، ومكتبة MT5 منصّبة:
+### الباقي اختياري
 
 ```bash
-pip install MetaTrader5
+python smc.py XAUUSD --tf M5 --bars 20000    # إطار وتاريخ مختلفين
+python smc.py data.csv                       # ملف CSV بدل MT5
+python smc.py trend XAUUSD --tf H4           # الاتجاه برك
+python smc.py scan  XAUUSD                   # الإعداد الموجود توّة برك
+python smc.py fetch XAUUSD --out data.csv    # يحفظ الشموع في CSV
 ```
 
 **اسم الرمز** لازم يكون كيما هو بالضبط في نافذة **Market Watch** متاع MT5. برشا
@@ -54,7 +53,7 @@ python smc.py backtest data.csv
 3. **ADX**: يقيس **قوّة** الترند ويفرّق بين ترند حقيقي وسوق عرضي.
 
 ```bash
-python smc.py trend --mt5 XAUUSD --tf H4 --ema 50 --adx-period 14 --swing 5
+python smc.py trend XAUUSD --tf H4 --ema 50 --adx-period 14 --swing 5
 ```
 
 ```
@@ -75,7 +74,7 @@ Swing structure: up
 هيكل السعر (BOS/CHoCH)، أوردر بلوك، فجوة سعرية (FVG)، ومنطقة العلاوة/الخصم.
 
 ```bash
-python smc.py scan --mt5 XAUUSD --tf M15 --swing 1 --tolerance 0.0015 --impulse 1.8
+python smc.py scan XAUUSD --swing 1 --tolerance 0.0015 --impulse 1.8
 ```
 
 ```
@@ -116,8 +115,7 @@ Suggested TP     : 37.96200
 ### الاستخدام
 
 ```bash
-python smc.py backtest --mt5 XAUUSD --tf M15 --bars 20000 \
-    --balance 100 --lot 0.01 --export trades.csv
+python smc.py XAUUSD --tf M15 --bars 20000 --balance 100 --lot 0.01 --export trades.csv
 ```
 
 الإطار اللي تعطيه هو إطار **الدخول** (M15). إطار الاتجاه (4H) يتبنى منّه بـ
@@ -129,7 +127,7 @@ python smc.py backtest --mt5 XAUUSD --tf M15 --bars 20000 \
 الربح/الخسارة = حركة السعر ÷ pip-size × pip-value × (lot ÷ 0.01)
 ```
 
-كي تستعمل `--mt5`، البرنامج **يجيب مواصفات العقد من الوسيط متاعك** (tick size و
+كي تجيب من MT5، البرنامج **يجيب مواصفات العقد من الوسيط متاعك** (tick size و
 tick value) ويحسب قيمة النقطة وحدو — ما تحتاجش تحزر. يطبعلك شنوّة لقى قبل النتائج.
 
 بالـ CSV (بلا MT5) الافتراضي = حساب **100$**، لوت **0.01**، وحركة 1.0 في السعر = **1$**

@@ -2,17 +2,22 @@
 """
 SMC — Smart Money Concepts toolkit in a single file, no external libraries.
 
-Four commands:
+The whole thing, one command:
 
-    python3 smc.py trend    --mt5 XAUUSD --tf H4    # trend direction and strength
-    python3 smc.py scan     --mt5 XAUUSD --tf M15   # the SMC setup on the chart now
-    python3 smc.py backtest --mt5 XAUUSD --tf M15   # walk the rules bar by bar
-    python3 smc.py fetch    XAUUSD --out data.csv   # save MT5 candles to a CSV
+    python smc.py XAUUSD
 
-Candles come straight out of a running MetaTrader 5 terminal with `--mt5 SYMBOL`
-(Windows, `pip install MetaTrader5`, terminal open and logged in), or from a CSV
-file passed as the first argument. A CSV needs a header row with the columns:
-date,open,high,low,close
+That backtests the strategy on MT5's own M15 candles. Everything else is
+optional detail on top of it:
+
+    python smc.py XAUUSD --tf M5 --bars 20000   # different timeframe / history
+    python smc.py data.csv                      # a CSV file instead of MT5
+    python smc.py trend XAUUSD --tf H4          # just the trend
+    python smc.py scan  XAUUSD                  # just the setup on the chart now
+    python smc.py fetch XAUUSD --out data.csv   # save the candles to a CSV
+
+MT5 mode needs Windows and the terminal open and logged in; the MetaTrader5
+package installs itself on first use. A CSV needs a header row with the
+columns: date,open,high,low,close
 
 The backtester simulates a trader in the order a person actually works:
 
@@ -38,6 +43,8 @@ Layout of this file:
 
 import argparse
 import csv
+import os
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -100,6 +107,41 @@ def parse_date(text: str) -> datetime | None:
     return None
 
 
+def _import_mt5():
+    """Import the MetaTrader5 package, installing it the first time if needed.
+    Asking someone to run a second command before the first one works is a step
+    this script can take for itself."""
+    try:
+        import MetaTrader5 as mt5
+
+        return mt5
+    except ImportError:
+        pass
+
+    print("First run: installing the MetaTrader5 package (one time only)...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "MetaTrader5"]
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        raise ValueError(
+            f"Could not install the MetaTrader5 package automatically ({e}).\n"
+            "Install it by hand with:  pip install MetaTrader5\n"
+            "Note it only exists for Windows — on Mac or Linux, export a CSV from "
+            "MT5 instead and pass the file."
+        )
+
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        raise ValueError(
+            "The MetaTrader5 package installed but will not import. It is Windows-only; "
+            "on Mac or Linux export a CSV from MT5 and pass the file instead."
+        )
+    print("Done.\n")
+    return mt5
+
+
 MT5_TIMEFRAMES = (
     "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30",
     "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
@@ -116,13 +158,7 @@ def load_from_mt5(symbol: str, timeframe: str = "M15", bars: int = 5000) -> tupl
     Also returns the symbol's contract specs, so the backtest can price a trade
     from the broker's own tick value instead of a guess.
     """
-    try:
-        import MetaTrader5 as mt5
-    except ImportError:
-        raise ValueError(
-            "The MetaTrader5 package is not installed. Run:  pip install MetaTrader5\n"
-            "(Windows only — it talks to the MT5 terminal on the same machine.)"
-        )
+    mt5 = _import_mt5()
 
     name = timeframe.upper()
     if name not in MT5_TIMEFRAMES:
@@ -170,19 +206,22 @@ def load_from_mt5(symbol: str, timeframe: str = "M15", bars: int = 5000) -> tupl
     return candles, spec
 
 
+def _looks_like_file(source: str) -> bool:
+    """`XAUUSD` is a symbol, `data.csv` is a file. Nobody should have to say which."""
+    return os.path.exists(source) or source.lower().endswith((".csv", ".txt", ".tsv"))
+
+
 def get_candles(args: argparse.Namespace) -> tuple[list[Candle], dict]:
-    """Candles come from MT5 when --mt5 is given, otherwise from a CSV file."""
-    if getattr(args, "mt5", None):
-        candles, spec = load_from_mt5(args.mt5, args.tf, args.bars)
-        print(f"Loaded {len(candles)} closed {args.tf.upper()} candles for {args.mt5} from MT5")
+    """Candles come from MT5 for a symbol, or from disk for a filename."""
+    source = getattr(args, "mt5", None) or args.csv_path
+    if source and not _looks_like_file(source):
+        candles, spec = load_from_mt5(source, args.tf, args.bars)
+        print(f"Loaded {len(candles)} closed {args.tf.upper()} candles for {source} from MT5")
         print(f"Range: {candles[0].date}  ->  {candles[-1].date}\n")
         return candles, spec
-    if not args.csv_path:
-        raise ValueError(
-            "No data source. Either pass a CSV file, or pull it live from MetaTrader 5:\n"
-            "    python smc.py backtest --mt5 XAUUSD --tf M15"
-        )
-    return load_candles(args.csv_path), {}
+    if not source:
+        raise ValueError("No data source. Give an MT5 symbol or a CSV file:\n    python smc.py XAUUSD")
+    return load_candles(source), {}
 
 
 # ============================================================== 2. math
@@ -1375,14 +1414,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="smc",
         description="Smart Money Concepts: trend, live setup scan, and backtest.",
+        epilog=(
+            "The short version:\n"
+            "  python smc.py XAUUSD          backtest MT5's own M15 candles\n"
+            "  python smc.py data.csv        the same, from a CSV file\n"
+            "Naming a command (trend / scan / backtest / fetch) is optional;\n"
+            "without one it backtests."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="command", required=True)
     fmt = argparse.ArgumentDefaultsHelpFormatter
 
     def add_source(parser: argparse.ArgumentParser) -> None:
         """Candles come from a CSV file or straight from a running MT5 terminal."""
-        parser.add_argument("csv_path", nargs="?", help="CSV with columns: date,open,high,low,close")
-        parser.add_argument("--mt5", metavar="SYMBOL", help="Read candles live from MetaTrader 5, e.g. XAUUSD")
+        parser.add_argument("csv_path", nargs="?", metavar="SYMBOL_OR_CSV",
+                            help="An MT5 symbol (XAUUSD) or a CSV file (data.csv)")
+        parser.add_argument("--mt5", metavar="SYMBOL", help="Same thing, spelled out explicitly")
         parser.add_argument("--tf", default="M15", help="MT5 timeframe: M1 M5 M15 M30 H1 H4 D1 ...")
         parser.add_argument("--bars", type=int, default=5000, help="How many closed candles to pull from MT5")
 
@@ -1449,8 +1497,19 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+COMMANDS = ("trend", "scan", "backtest", "fetch")
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    """`smc.py XAUUSD` means `smc.py backtest XAUUSD`. The thing people want most
+    should be the thing they type least."""
+    if not argv or argv[0] in COMMANDS or argv[0].startswith("-"):
+        return argv
+    return ["backtest", *argv]
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    args = build_parser().parse_args(normalize_argv(sys.argv[1:]))
     args.func(args)
 
 
