@@ -588,14 +588,27 @@ def evaluate_state(m5_so_far: list[Candle], h1_closed: list[Candle], m15_closed:
 # -------------------------------------------------------------- backtest --
 
 def run_backtest(m5_candles: list[Candle], params: dict) -> list[Trade]:
+    """Bar-by-bar backtest that fills like a real trader, not an omniscient
+    one: a signal confirmed on bar i's close can only be acted on starting
+    at bar i+1's open (a real trader can't react before the candle that
+    told them to actually finishes), so the entry fill is the NEXT bar's
+    open, not the signal bar's own close."""
     r15, r1h = Resampler(15), Resampler(60)
     cache = new_cache()
     trades: list[Trade] = []
     position: Trade | None = None
+    pending: dict | None = None  # signal confirmed on the previous bar, fills at this bar's open
 
     for i, cur in enumerate(m5_candles):
         r15.push(cur)
         r1h.push(cur)
+
+        if position is None and pending is not None:
+            position = Trade(
+                direction=pending["signal"], entry_dt=cur.dt, entry_price=cur.open,
+                stop_loss=pending["stop_loss"], take_profit=pending["take_profit"],
+            )
+            pending = None
 
         if position is not None:
             if position.direction == "LONG":
@@ -612,10 +625,7 @@ def run_backtest(m5_candles: list[Candle], params: dict) -> list[Trade]:
 
         state = evaluate_state(m5_candles[: i + 1], r1h.closed, r15.closed, cache, params)
         if state["signal"] in ("LONG", "SHORT"):
-            position = Trade(
-                direction=state["signal"], entry_dt=cur.dt, entry_price=state["entry"],
-                stop_loss=state["stop_loss"], take_profit=state["take_profit"],
-            )
+            pending = {"signal": state["signal"], "stop_loss": state["stop_loss"], "take_profit": state["take_profit"]}
 
     return trades
 
@@ -889,8 +899,8 @@ def main() -> None:
     parser.add_argument("--pullback-ma", type=int, default=50, help="MA period checked for the 15m pullback zone (default: 50)")
     parser.add_argument("--confirm-lookback", type=int, default=5, help="Bars used for the 5m break-of-range confirmation (default: 5)")
     parser.add_argument("--rr", type=float, default=1.5, help="Reward:risk ratio for take-profit (default: 1.5)")
-    parser.add_argument("--pivot-max-age", type=int, default=200, help="Ignore a ZigZag swing (for pullback/stop) older than this many 15m bars (default: 200 ~ 50h); 0 disables the limit")
-    parser.add_argument("--zone-atr-tolerance", type=float, default=0.25, help="ATR multiple of tolerance around MA/swing to count as 'touched' for the pullback zone (default: 0.25)")
+    parser.add_argument("--pivot-max-age", type=int, default=0, help="Ignore a ZigZag swing (for pullback/stop) older than this many 15m bars; 0 disables the limit (default: 0 -- disabled, this regressed real EURUSD results in testing)")
+    parser.add_argument("--zone-atr-tolerance", type=float, default=0.0, help="ATR multiple of tolerance around MA/swing to count as 'touched' for the pullback zone (default: 0.0 -- exact touch only; a nonzero tolerance regressed real EURUSD results in testing)")
 
     parser.add_argument("--lot", type=float, default=0.01, help="Fixed lot size per trade (default: 0.01)")
     parser.add_argument("--contract-size", type=float, default=100000, help="Units per 1.0 lot (default: 100000)")
