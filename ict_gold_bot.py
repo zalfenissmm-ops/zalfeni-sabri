@@ -51,6 +51,10 @@ from datetime import datetime, timedelta, timezone
 # 1. CONFIGURATION
 # ===========================================================================
 
+# Bumped whenever behaviour changes, and printed on every run: the fastest way
+# to tell whether the file in front of you is the one being talked about.
+VERSION = "1.4"
+
 TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
 
 # Kill zones from the document, in London local time (hours, fractional).
@@ -1799,6 +1803,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="ICT XAU/USD strategy: MetaTrader 5 data feed, rule engine, "
                     "and a 30-day backtest on a $1,000 / 0.01-lot account.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--version", action="version", version=f"ict_gold_bot {VERSION}")
     p.add_argument("mode", nargs="?", default="backtest",
                    choices=["backtest", "walkforward", "scan", "export", "download"],
                    help="backtest the last N days, walk-forward test it segment by "
@@ -1958,6 +1963,7 @@ def main(argv: list[str] | None = None) -> int:
     # so a flag typed on the command line still beats the preset
     parser = build_parser()
     args = parser.parse_args(argv)
+    print(f"[ict_gold_bot {VERSION}]  mode={args.mode}")
     if PRESETS[args.preset]:
         parser.set_defaults(**PRESETS[args.preset])
         args = parser.parse_args(argv)
