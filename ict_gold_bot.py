@@ -44,7 +44,7 @@ import sys
 import time
 from bisect import bisect_right
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 # ===========================================================================
@@ -113,6 +113,10 @@ class Config:
     ote_low: float = 0.618           # OTE band, document §2.6
     ote_high: float = 0.79
     require_poi: bool = True         # entry must be an OB/FVG inside the OTE band
+    sl_mode: str = "structure"       # "structure": behind the sweep/block (document)
+                                     # "atr": a fixed multiple of ATR
+    sl_atr: float = 1.0              # stop distance when sl_mode is "atr"
+    tp_atr: float = 1.0              # target distance when tp_mode is "atr"
     sl_buffer_atr: float = 0.5       # safety margin behind the sweep / block
     min_sl_atr: float = 1.0          # a stop tighter than 1 ATR is spread noise
     min_sl_distance: float = 1.00    # $, absolute floor under the stop distance
@@ -1162,18 +1166,27 @@ def _setup_for_direction(entry_candles: list[Candle], entry_atr: list[float], i:
         order_kind = "market" if bar.close >= entry_band[0] else "limit"
     tick(PLAN_STAGES[8])
 
-    # --- step 7: stop behind the sweep / the block ------------------------
-    buffer = cfg.sl_buffer_atr * atr
-    floor = max(cfg.min_sl_atr * atr, cfg.min_sl_distance)
-    if direction == "long":
-        sl = min(min(leg_low, entry_band[0]) - buffer, entry - floor)
+    # --- step 7: the stop ------------------------------------------------
+    # "structure" is the document's rule: behind the swept extreme or the block.
+    # "atr" places it at a fixed distance instead, for when the measured
+    # excursion after a signal -- not the structure -- is what should size it.
+    if cfg.sl_mode == "atr":
+        sl = entry - cfg.sl_atr * atr if direction == "long" else entry + cfg.sl_atr * atr
     else:
-        sl = max(max(leg_high, entry_band[1]) + buffer, entry + floor)
+        buffer = cfg.sl_buffer_atr * atr
+        floor = max(cfg.min_sl_atr * atr, cfg.min_sl_distance)
+        if direction == "long":
+            sl = min(min(leg_low, entry_band[0]) - buffer, entry - floor)
+        else:
+            sl = max(max(leg_high, entry_band[1]) + buffer, entry + floor)
 
-    # --- step 8: target = nearest opposite liquidity, RR must clear 1:2 ---
+    # --- step 8: the target ----------------------------------------------
     poi_view: TimeframeView = ctx["poi"]
-    tp = _liquidity_target(poi_view.pools, direction, entry,
-                           0.5 * max(poi_view.atr, atr), sl, cfg)
+    if cfg.tp_mode == "atr":
+        tp = entry + cfg.tp_atr * atr if direction == "long" else entry - cfg.tp_atr * atr
+    else:
+        tp = _liquidity_target(poi_view.pools, direction, entry,
+                               0.5 * max(poi_view.atr, atr), sl, cfg)
     if tp is None:
         return None
     rr = abs(tp - entry) / abs(entry - sl)
@@ -1230,6 +1243,9 @@ class Position:
     tp: float
     volume: float
     risk_price: float
+    filled_intrabar: bool = False   # a limit fill happens at an unknown moment
+                                    # inside its bar, so that bar's target is
+                                    # not safe to claim -- only its stop is
     realized: float = 0.0       # money already banked by a partial close
     closed_volume: float = 0.0
     breakeven_done: bool = False
@@ -1383,7 +1399,7 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
                 positions.append(Position(
                     setup=setup, entry=setup.entry, entry_bar=i, entry_time=bar.time,
                     sl=setup.sl, initial_sl=setup.sl, tp=setup.tp, volume=cfg.lot,
-                    risk_price=abs(setup.entry - setup.sl)))
+                    risk_price=abs(setup.entry - setup.sl), filled_intrabar=True))
                 orders_filled += 1
             elif i >= order.expires_bar:
                 orders_expired += 1
@@ -1397,6 +1413,11 @@ def run_backtest(data: dict[str, list[Candle]], cfg: Config,
             long = position.setup.direction == "long"
             hit_sl = bar.low <= position.sl if long else bar.high >= position.sl
             hit_tp = bar.high >= position.tp if long else bar.low <= position.tp
+            if position.filled_intrabar and position.entry_bar == i:
+                # the limit filled somewhere inside this bar; the extreme that
+                # would pay the target may well have printed before that, so
+                # only the stop is honoured here
+                hit_tp = False
 
             if hit_sl:      # stop is checked first — the pessimistic assumption
                 reason = "BE" if position.breakeven_done and \
@@ -1679,6 +1700,126 @@ def walk_forward(data: dict[str, list[Candle]], cfg: Config, start_utc: datetime
 
 
 # ===========================================================================
+# 8c. SIGNAL QUALITY — do the entries beat a coin flip at all?
+# ===========================================================================
+
+
+def analyse_signals(data: dict[str, list[Candle]], cfg: Config, start_utc: datetime,
+                    end_utc: datetime, horizons: tuple[int, ...] = (3, 6, 12, 24, 48)) -> None:
+    """Measure the entries themselves, with no stop, target or position sizing
+    in the way.
+
+    For every signal, how far does price run in the trade's favour before it
+    runs against it? Comparing that with random entries taken in the same
+    sessions separates two very different failures: a signal that predicts
+    nothing, and a signal that predicts something the exits are throwing away.
+    Only the second one is worth tuning."""
+    import random
+
+    entry = data[cfg.entry_tf]
+    atr = atr_series(entry, cfg.atr_period)
+    analyzers = {tf: TimeframeAnalyzer(tf, c, cfg) for tf, c in data.items()}
+    day_index = _day_index(entry)
+
+    # the RR and risk gates decide trade selection, not signal quality, so open
+    # them up: this asks what the pattern is worth, not what survives sizing
+    probe = replace(cfg, min_rr=0.0, risk_pct=10_000.0)
+
+    # measure from the price the trade would actually have been filled at, not
+    # from the signal bar's close: the plan enters on a retracement, so the two
+    # are different prices and only the fill is the strategy's real entry
+    signals: list[tuple[int, str, float]] = []
+    start_idx = bisect_right([c.time for c in entry], start_utc)
+    seen: set[tuple] = set()
+    for i in range(start_idx, len(entry)):
+        if entry[i].time >= end_utc:
+            break
+        ctx = build_context(entry, i, analyzers, day_index, probe)
+        setup = find_setup(entry, atr, i, ctx, probe, probe.balance)
+        if setup is None or setup.key in seen:
+            continue
+        seen.add(setup.key)
+        if setup.order_kind == "market":
+            signals.append((i + 1, setup.direction, entry[i + 1].close
+                            if i + 1 < len(entry) else setup.entry))
+            continue
+        for j in range(i + 1, min(i + 1 + cfg.order_expiry_bars, len(entry))):
+            filled = entry[j].low <= setup.entry if setup.direction == "long" \
+                else entry[j].high >= setup.entry
+            if filled:
+                signals.append((j, setup.direction, setup.entry))
+                break
+
+    if len(signals) < 20:
+        print(f"\nOnly {len(signals)} signals in this window -- too few to measure.")
+        return
+
+    # a fair control: same session hours, same number of entries, coin-flip side
+    rng = random.Random(20260824)
+    eligible = [i for i in range(start_idx, len(entry))
+                if entry[i].time < end_utc and active_session(entry[i].time, cfg.sessions)]
+    controls = [(k := rng.choice(eligible), rng.choice(("long", "short")), entry[k].close)
+                for _ in range(max(len(signals) * 5, 500))]
+
+    def excursions(items: list[tuple[int, str, float]], horizon: int) -> tuple[float, float, float]:
+        """Average best-case and worst-case move within `horizon` bars, in ATR,
+        plus how often the favourable move came first."""
+        mfe, mae, first = [], [], 0
+        for i, direction, base in items:
+            window = entry[i + 1: i + 1 + horizon]
+            if len(window) < horizon or atr[i] <= 0:
+                continue
+            if direction == "long":
+                up, down = max(c.high for c in window) - base, base - min(c.low for c in window)
+                hit_up = next((n for n, c in enumerate(window) if c.high >= base + atr[i]), None)
+                hit_dn = next((n for n, c in enumerate(window) if c.low <= base - atr[i]), None)
+            else:
+                up, down = base - min(c.low for c in window), max(c.high for c in window) - base
+                hit_up = next((n for n, c in enumerate(window) if c.low <= base - atr[i]), None)
+                hit_dn = next((n for n, c in enumerate(window) if c.high >= base + atr[i]), None)
+            mfe.append(up / atr[i])
+            mae.append(down / atr[i])
+            if hit_up is not None and (hit_dn is None or hit_up < hit_dn):
+                first += 1
+        n = len(mfe) or 1
+        return sum(mfe) / n, sum(mae) / n, first / n * 100
+
+    bar = "=" * 78
+    print()
+    print(bar)
+    print(f" SIGNAL QUALITY — {len(signals)} signals vs {len(controls)} random entries "
+          f"in the same sessions")
+    print(bar)
+    print(" Move within N bars, measured in ATR. 'first' = how often the trade went")
+    print(" 1 ATR the right way before it went 1 ATR the wrong way.")
+    print()
+    print(f" {'bars':>6} | {'signal MFE':>11}{'MAE':>8}{'first':>8} | "
+          f"{'random MFE':>11}{'MAE':>8}{'first':>8} | {'edge':>7}")
+    print("-" * 78)
+    verdicts = []
+    for h in horizons:
+        s_mfe, s_mae, s_first = excursions(signals, h)
+        r_mfe, r_mae, r_first = excursions(controls, h)
+        edge = s_first - r_first
+        verdicts.append(edge)
+        print(f" {h:>6} | {s_mfe:>11.2f}{s_mae:>8.2f}{s_first:>7.1f}% | "
+              f"{r_mfe:>11.2f}{r_mae:>8.2f}{r_first:>7.1f}% | {edge:>+6.1f}%")
+    print("-" * 78)
+
+    best = max(verdicts)
+    if best < 2:
+        print(" VERDICT: the signals behave like random entries. No exit rule, stop or")
+        print("          target can rescue that -- the pattern itself has to change.")
+    elif best < 5:
+        print(f" VERDICT: a small edge ({best:+.1f}% over random). Real but thin: costs and")
+        print("          spread can eat it, so exits have to be efficient to keep any of it.")
+    else:
+        print(f" VERDICT: the signals do beat random by {best:+.1f}%. If the backtest still")
+        print("          loses, the exits are throwing the edge away, not the entries.")
+    print(bar)
+
+
+# ===========================================================================
 # 9. LIVE SCAN — the same rules applied to the newest closed bar
 # ===========================================================================
 
@@ -1781,6 +1922,24 @@ PRESETS: dict[str, dict] = {
         "max_consecutive_losses": 4, "max_open": 3,
         "sessions": "london,newyork,london_close",
     },
+    # Built from measurement rather than from tuning profit. `signals` showed
+    # that of the document's filters, premium/discount is the one carrying a
+    # persistent edge (~+11% over random at every horizon), while the entries
+    # without it are indistinguishable from coin flips. The same measurement
+    # showed the favourable move arriving early and small -- around 1 ATR --
+    # with the adverse move overtaking it on longer holds, so the stop and the
+    # target are set there and the trade is given a day at most.
+    #
+    # NOTE: this deliberately breaks the document's 1:2 minimum. At 1:1 the
+    # measured hit rate carries the expectancy instead; forcing 1:2 means
+    # waiting for a move the data says does not reliably come.
+    "measured": {
+        "bias_mode": "both", "no_poi": True, "no_mid_filter": True, "pd_tf": "H4",
+        "sl_mode": "atr", "sl_atr": 1.0, "tp_mode": "atr", "tp_atr": 1.0,
+        "min_rr": 0.0, "breakeven_r": 0.0, "order_expiry_bars": 6,
+        "max_hold_bars": 24, "max_consecutive_losses": 4, "max_open": 1,
+        "sessions": "london,newyork,london_close",
+    },
 }
 
 # What is actually known about each preset, from testing rather than hope.
@@ -1791,11 +1950,14 @@ PRESET_NOTES = {
                 "on 90 days of the same symbol -- fitted, not validated",
     "frequent": "reaches ~4 trades a day, but its profit came from 3 trades out of "
                 "85 and it lost money in the second half -- not validated",
+    "measured": "entry filter and exit distances chosen from measured signal behaviour "
+                "rather than from tuning profit (+107 over 30 days, 72% win rate). "
+                "Still fitted on one month -- walkforward it before believing it",
 }
 
 # Nothing here has been shown to hold up out of sample. Run `walkforward`
 # before trusting any of it.
-UNPROVEN = {"balanced", "frequent"}
+UNPROVEN = {"balanced", "frequent", "measured"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1805,7 +1967,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--version", action="version", version=f"ict_gold_bot {VERSION}")
     p.add_argument("mode", nargs="?", default="backtest",
-                   choices=["backtest", "walkforward", "scan", "export", "download"],
+                   choices=["backtest", "walkforward", "signals", "scan", "export",
+                            "download"],
                    help="backtest the last N days, walk-forward test it segment by "
                         "segment, scan live data now, export the candles a backtest "
                         "needs, or download the deepest history this broker serves")
@@ -1865,8 +2028,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "document); 'both' hunts sweeps on either side")
     g.add_argument("--no-poi", action="store_true",
                    help="allow an OTE entry without an order block / FVG")
-    g.add_argument("--tp-mode", choices=["nearest", "first-valid"], default="nearest",
-                   help="'nearest' follows the document: nearest pool, skip if RR < min")
+    g.add_argument("--tp-mode", choices=["nearest", "first-valid", "atr"], default="nearest",
+                   help="'nearest' follows the document (nearest liquidity pool, skip if "
+                        "RR < min); 'atr' targets a fixed multiple of ATR instead")
+    g.add_argument("--tp-atr", type=float, default=1.0,
+                   help="target distance in ATR when --tp-mode atr")
+    g.add_argument("--sl-mode", choices=["structure", "atr"], default="structure",
+                   help="'structure' puts the stop behind the sweep (the document); "
+                        "'atr' uses a fixed multiple of ATR")
+    g.add_argument("--sl-atr", type=float, default=1.0,
+                   help="stop distance in ATR when --sl-mode atr")
     g.add_argument("--sweep-lookback", type=int, default=72,
                    help="entry-TF bars searched backwards for a liquidity sweep")
     g.add_argument("--choch-max-bars", type=int, default=24,
@@ -1932,7 +2103,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         choch_max_bars=args.choch_max_bars, max_open=args.max_open,
         min_leg_atr=args.min_leg_atr, min_sl_atr=args.min_sl_atr,
         min_sl_distance=args.min_sl_distance, require_poi=not args.no_poi,
-        tp_mode=args.tp_mode, order_expiry_bars=args.order_expiry_bars,
+        tp_mode=args.tp_mode, tp_atr=args.tp_atr, sl_mode=args.sl_mode,
+        sl_atr=args.sl_atr, order_expiry_bars=args.order_expiry_bars,
         max_hold_bars=args.max_hold_bars, breakeven_r=args.breakeven_r,
         partial_r=args.partial_r, partial_fraction=args.partial_fraction,
         sessions=sessions,
@@ -2010,6 +2182,10 @@ def main(argv: list[str] | None = None) -> int:
     # the window ends at the last closed entry-timeframe bar we actually have
     end_utc = data[cfg.entry_tf][-1].time + timedelta(minutes=TF_MINUTES[cfg.entry_tf])
     start_utc = end_utc - timedelta(days=cfg.days)
+
+    if args.mode == "signals":
+        analyse_signals(data, cfg, start_utc, end_utc)
+        return 0
 
     if args.mode == "walkforward":
         if args.compare:
