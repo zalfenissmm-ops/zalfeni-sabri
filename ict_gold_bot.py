@@ -327,13 +327,35 @@ class MT5Feed:
 
     def _detect_offset(self) -> float:
         """MT5 stamps candles in broker server time. Compare the latest tick's
-        clock with real UTC to learn the offset (usually +2 or +3 for gold)."""
+        clock with real UTC to learn the offset (whole hours in practice --
+        gold brokers run EET/EEST, so +2 in winter and +3 in summer).
+
+        The tick only carries this information while it is fresh: over a
+        weekend or a market break it is the last price of the session, and the
+        gap it shows is age, not time zone. A residual far from a whole hour is
+        exactly that case, so it is reported instead of silently believed."""
         tick = self.mt5.symbol_info_tick(self.symbol)
         if tick is None or not tick.time:
+            print("[mt5] no tick to read the server clock from -- assuming UTC+0; "
+                  "pass --broker-utc-offset if that is wrong")
             return 0.0
         server_now = datetime.fromtimestamp(tick.time, tz=timezone.utc)
         delta_h = (server_now - datetime.now(timezone.utc)).total_seconds() / 3600.0
-        return round(delta_h * 2) / 2  # snap to the nearest half hour
+        offset = float(round(delta_h))
+        if not -12 <= offset <= 14:
+            # no time zone is that far out: the tick is old, not exotic
+            print(f"[mt5] WARNING: the last tick is {abs(delta_h):.0f} hours from now, so the "
+                  "market is closed and its clock says nothing about the time zone. "
+                  "Assuming UTC+0 -- pass --broker-utc-offset <hours> to set it "
+                  "(gold brokers are usually +2 in winter, +3 in summer).")
+            return 0.0
+        drift_minutes = abs(delta_h - offset) * 60
+        if drift_minutes > 15:
+            print(f"[mt5] WARNING: the last tick is {drift_minutes:.0f} minutes off a whole "
+                  "hour, so it may be stale. The detected offset "
+                  f"UTC{offset:+g} may be wrong -- check your terminal's clock and pass "
+                  "--broker-utc-offset if it disagrees.")
+        return offset
 
     def _prime_history(self, timeframe: str, start_utc: datetime) -> None:
         """MT5 only hands over candles the terminal has already downloaded --
@@ -388,6 +410,65 @@ class MT5Feed:
         return candles
 
 
+    # how far back one request should reach per timeframe, sized so each chunk
+    # comes back with a few thousand bars rather than hitting the terminal's cap
+    CHUNK_DAYS = {"M1": 5, "M5": 25, "M15": 75, "M30": 150,
+                  "H1": 300, "H4": 1200, "D1": 7000}
+
+    def fetch_max(self, timeframe: str, max_days: int = 7300,
+                  known: list[Candle] | None = None) -> list[Candle]:
+        """Pull as much history as this broker will serve, walking backwards in
+        chunks until requests stop returning anything new. Each request also
+        makes the terminal download that stretch, so the archive deepens as the
+        walk goes on."""
+        mt5 = self.mt5
+        tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}")
+        off = timedelta(hours=self.offset_hours)
+        span = timedelta(days=self.CHUNK_DAYS.get(timeframe, 100))
+        floor = datetime.now(timezone.utc) - timedelta(days=max_days)
+
+        collected: dict[int, tuple] = {}
+        if known:                                   # keep what an earlier run saved
+            for c in known:
+                collected[int(c.time.timestamp())] = (c.open, c.high, c.low, c.close, c.volume)
+
+        cursor = datetime.now(timezone.utc) + timedelta(days=1)
+        empty_rounds = 0
+        while cursor > floor and empty_rounds < 3:
+            window_start = max(cursor - span, floor)
+            rates = mt5.copy_rates_range(self.symbol, tf_const,
+                                         window_start + off, cursor + off)
+            if rates is None or len(rates) == 0:
+                empty_rounds += 1
+                time.sleep(1.0)                     # the terminal may still be downloading
+                if empty_rounds < 3:
+                    continue
+                break
+
+            added = 0
+            oldest_ts = None
+            for r in rates:
+                ts = int(r["time"])
+                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
+                real = ts - int(self.offset_hours * 3600)
+                if real not in collected:
+                    collected[real] = (float(r["open"]), float(r["high"]),
+                                       float(r["low"]), float(r["close"]),
+                                       float(r["tick_volume"]))
+                    added += 1
+
+            empty_rounds = 0 if added else empty_rounds + 1
+            oldest_real = datetime.fromtimestamp(oldest_ts, tz=timezone.utc) - off
+            print(f"\r[mt5] {timeframe:>3}: {len(collected):>7} bars, "
+                  f"back to {oldest_real:%Y-%m-%d}   ", end="", flush=True)
+            # step the window past the oldest bar we just saw
+            cursor = min(oldest_real, cursor - timedelta(hours=1))
+
+        print()
+        return [Candle(datetime.fromtimestamp(ts, tz=timezone.utc), *v)
+                for ts, v in sorted(collected.items())]
+
+
 def load_csv(path: str) -> list[Candle]:
     candles = []
     with open(path, newline="") as f:
@@ -411,6 +492,28 @@ def save_csv(path: str, candles: list[Candle]) -> None:
         for c in candles:
             w.writerow([c.time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
                         c.open, c.high, c.low, c.close, c.volume])
+
+
+def download_history(cfg: Config, timeframes: list[str], max_days: int) -> None:
+    """Build the deepest candle archive this broker allows, merging into
+    whatever earlier runs already saved. Safe to stop and re-run."""
+    os.makedirs(cfg.csv_dir, exist_ok=True)
+    print(f"Downloading {cfg.symbol} into {cfg.csv_dir}{os.sep} "
+          f"({', '.join(timeframes)}, up to {max_days} days back)")
+    print("If this stops early, the terminal is capping stored bars: "
+          "MT5 -> Tools -> Options -> Charts -> 'Max bars in chart' -> Unlimited,\n"
+          "then run this again -- it resumes from what is already saved.\n")
+
+    with MT5Feed(cfg) as feed:
+        for tf in timeframes:
+            path = os.path.join(cfg.csv_dir, f"{cfg.symbol}_{tf}.csv")
+            known = load_csv(path) if os.path.exists(path) else []
+            before = len(known)
+            candles = feed.fetch_max(tf, max_days, known)
+            save_csv(path, candles)
+            span = ((candles[-1].time - candles[0].time).days if candles else 0)
+            print(f"[out] {tf:>3}: {len(candles):>7} bars ({len(candles) - before:+} new) "
+                  f"covering {span} days -> {path}")
 
 
 def load_dataset(cfg: Config, end_utc: datetime) -> dict[str, list[Candle]]:
@@ -1559,8 +1662,10 @@ def build_parser() -> argparse.ArgumentParser:
                     "and a 30-day backtest on a $1,000 / 0.01-lot account.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("mode", nargs="?", default="backtest",
-                   choices=["backtest", "scan", "export"],
-                   help="backtest the last N days, scan live data now, or export candles to CSV")
+                   choices=["backtest", "scan", "export", "download"],
+                   help="backtest the last N days, scan live data now, export the "
+                        "candles a backtest needs, or download the deepest history "
+                        "this broker will serve")
     p.add_argument("--preset", choices=list(PRESETS), default="document",
                    help="'document' follows the ICT plan literally (few trades); "
                         "'balanced' trades both sides for ~2.5 setups a day; "
@@ -1572,6 +1677,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--csv-dir", default="data", help="folder for exported candles")
     g.add_argument("--symbol", default="XAUUSD")
     g.add_argument("--days", type=int, default=30, help="length of the backtest window")
+    g.add_argument("--timeframes", default="M1,M5,M15,H1,H4,D1",
+                   help="download mode: which timeframes to archive")
+    g.add_argument("--max-days", type=int, default=7300,
+                   help="download mode: how far back to try (default ~20 years)")
     g.add_argument("--broker-utc-offset", type=float, default=None,
                    help="broker server clock vs UTC (default: auto-detect)")
     g.add_argument("--mt5-login", type=int, default=None)
@@ -1716,6 +1825,16 @@ def main(argv: list[str] | None = None) -> int:
                  if args.preset in UNPROVEN else ""))
     cfg = config_from_args(args)
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+    if args.mode == "download":
+        cfg.source = "mt5"
+        tfs = [t.strip().upper() for t in args.timeframes.split(",") if t.strip()]
+        unknown = [t for t in tfs if t not in TF_MINUTES]
+        if unknown:
+            raise SystemExit(f"Unknown timeframe(s): {', '.join(unknown)}. "
+                             f"Choose from: {', '.join(TF_MINUTES)}")
+        download_history(cfg, tfs, args.max_days)
+        return 0
 
     if args.mode == "export":
         cfg.source = "mt5"
