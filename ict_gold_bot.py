@@ -516,16 +516,57 @@ def download_history(cfg: Config, timeframes: list[str], max_days: int) -> None:
                   f"covering {span} days -> {path}")
 
 
+def check_session_clock(candles: list[Candle], timeframe: str,
+                        offset_used: float | None) -> None:
+    """Cross-check the broker clock against the candles themselves.
+
+    Gold stops trading for the weekend at a fixed instant in real UTC -- 21:00
+    in summer, 22:00 in winter -- so once the timestamps are converted, the
+    weekly gap has to land there. If it does not, the offset is wrong and every
+    kill zone is shifted by the same amount. This beats reading the server's
+    clock off a tick: it works on a Sunday, it works on a CSV, and it is
+    measured from the data being traded rather than from a live connection."""
+    if TF_MINUTES[timeframe] > 60 or len(candles) < 2:
+        return
+    step = timedelta(minutes=TF_MINUTES[timeframe])
+    closes = [a.time + step for a, b in zip(candles, candles[1:])
+              if b.time - a.time > timedelta(hours=24)]
+    if len(closes) < 2:
+        return                                   # not enough weekends to judge
+
+    hours = sorted(c.hour + c.minute / 60 for c in closes)
+    observed = hours[len(hours) // 2]
+    expected = 21.0 if is_bst(closes[-1]) else 22.0
+    drift = observed - expected
+    if drift > 12:
+        drift -= 24
+    elif drift < -12:
+        drift += 24
+
+    if abs(drift) <= 1.5:
+        print(f"[clock] weekly close lands at {int(observed):02d}:{int(observed % 1 * 60):02d} "
+              f"UTC -- matches the real gold close, the broker clock is right")
+        return
+    suggestion = ("" if offset_used is None
+                  else f" -- re-run with --broker-utc-offset {offset_used + drift:g}")
+    print(f"[clock] WARNING: the weekly close lands at "
+          f"{int(observed):02d}:{int(observed % 1 * 60):02d} UTC but gold closes at "
+          f"{expected:02.0f}:00. The broker offset looks wrong by {drift:+.0f}h, which "
+          f"shifts every kill zone by the same amount{suggestion}.")
+
+
 def load_dataset(cfg: Config, end_utc: datetime) -> dict[str, list[Candle]]:
     """Every timeframe the strategy needs, warmed up before the test window."""
     start_utc = end_utc - timedelta(days=cfg.days)
     data: dict[str, list[Candle]] = {}
 
+    used_offset = cfg.broker_utc_offset
     if cfg.source == "mt5":
         with MT5Feed(cfg) as feed:
             for tf in cfg.timeframes:
                 warm = timedelta(days=WARMUP_DAYS.get(tf, 30))
                 data[tf] = feed.fetch(tf, start_utc - warm, end_utc)
+            used_offset = feed.offset_hours
     else:
         for tf in cfg.timeframes:
             path = os.path.join(cfg.csv_dir, f"{cfg.symbol}_{tf}.csv")
@@ -539,6 +580,8 @@ def load_dataset(cfg: Config, end_utc: datetime) -> dict[str, list[Candle]]:
     for tf, candles in data.items():
         if len(candles) < 50:
             raise SystemExit(f"Only {len(candles)} {tf} candles — not enough history.")
+
+    check_session_clock(data[cfg.entry_tf], cfg.entry_tf, used_offset)
     return data
 
 
