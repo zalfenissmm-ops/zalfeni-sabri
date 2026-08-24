@@ -41,6 +41,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
@@ -334,10 +335,33 @@ class MT5Feed:
         delta_h = (server_now - datetime.now(timezone.utc)).total_seconds() / 3600.0
         return round(delta_h * 2) / 2  # snap to the nearest half hour
 
+    def _prime_history(self, timeframe: str, start_utc: datetime) -> None:
+        """MT5 only hands over candles the terminal has already downloaded --
+        which is why history normally means opening a chart and scrolling back.
+        Asking for bars at progressively older dates makes the terminal request
+        them from the server, so the download happens by itself."""
+        mt5 = self.mt5
+        tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}")
+        off = timedelta(hours=self.offset_hours)
+        target = start_utc + off
+        for attempt in range(8):
+            rates = mt5.copy_rates_from(self.symbol, tf_const, target, 10)
+            if rates is not None and len(rates) > 0:
+                oldest = datetime.fromtimestamp(int(rates[0]["time"]), tz=timezone.utc)
+                if oldest <= target + timedelta(days=2):
+                    return                      # the terminal reaches far enough back
+            if attempt == 0:
+                print(f"[mt5] {timeframe}: asking the terminal to download history "
+                      f"back to {start_utc:%Y-%m-%d}...")
+            # each round trip pulls another block; give the terminal time to store it
+            mt5.copy_rates_from(self.symbol, tf_const, target, 20000)
+            time.sleep(1.0)
+
     def fetch(self, timeframe: str, start_utc: datetime, end_utc: datetime) -> list[Candle]:
         mt5 = self.mt5
         tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}")
         off = timedelta(hours=self.offset_hours)
+        self._prime_history(timeframe, start_utc)
         rates = mt5.copy_rates_range(self.symbol, tf_const, start_utc + off, end_utc + off)
         if rates is None or len(rates) == 0:
             raise SystemExit(
@@ -360,8 +384,7 @@ class MT5Feed:
         short_by = (candles[0].time - start_utc).days
         if short_by > 1:
             print(f"[mt5] note: {timeframe} history starts {short_by} days later than asked "
-                  f"({start_utc:%Y-%m-%d}) -- open the {timeframe} chart and scroll back "
-                  "so the terminal downloads more.")
+                  f"({start_utc:%Y-%m-%d}) -- this broker does not serve more than that.")
         return candles
 
 
@@ -1617,6 +1640,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--blackout-minutes", type=int, default=30)
 
     g = p.add_argument_group("output")
+    g.add_argument("--save-data", action="store_true",
+                   help="also write the downloaded candles to --csv-dir, so later "
+                        "runs can replay them without MetaTrader 5")
     g.add_argument("--verbose", action="store_true", help="print the signal funnel")
     g.add_argument("--csv-out", default=None, help="write the trade list to this CSV")
     return p
@@ -1702,6 +1728,13 @@ def main(argv: list[str] | None = None) -> int:
 
     data = load_dataset(cfg, now)
     drop_forming_candles(data, now)
+
+    if args.save_data and cfg.source == "mt5":
+        for tf, candles in data.items():
+            path = os.path.join(cfg.csv_dir, f"{cfg.symbol}_{tf}.csv")
+            save_csv(path, candles)
+        print(f"[out] candles saved to {cfg.csv_dir}{os.sep} "
+              f"(replay them with --source csv --csv-dir {cfg.csv_dir})")
 
     if args.mode == "scan":
         scan_now(data, cfg)

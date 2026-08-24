@@ -1,8 +1,9 @@
 @echo off
 rem ===================================================================
 rem  ICT Gold Bot - one-click launcher for Windows.
-rem  Double-click this file. It finds Python, installs what is missing,
-rem  and runs the 30-day backtest on live MetaTrader 5 data.
+rem  Double-click this file. It finds Python, installs what is missing, makes
+rem  the MT5 terminal download 90 days of history on its own, saves a copy of
+rem  the candles in data\, and runs the backtest.
 rem  You can also pass your own arguments:  run.bat scan
 rem ===================================================================
 setlocal
@@ -52,10 +53,13 @@ if not exist "ict_gold_bot.py" (
     exit /b 1
 )
 
-rem --- run: your arguments if you passed any, otherwise the 30-day backtest ---
+rem --- run: your arguments if you passed any, otherwise the full default run ---
+rem     The default pulls 90 days from MetaTrader 5 (the terminal downloads the
+rem     history by itself), keeps a copy in data\, and backtests the balanced
+rem     preset. Nothing to click in MT5, nothing to scroll.
 echo.
 if "%~1"=="" (
-    %PY% ict_gold_bot.py backtest --days 30 --verbose
+    %PY% ict_gold_bot.py backtest --preset balanced --days 90 --save-data --verbose
 ) else (
     %PY% ict_gold_bot.py %*
 )
