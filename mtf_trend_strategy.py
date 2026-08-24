@@ -720,53 +720,104 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 # --------------------------------------------------------------- fetch ---
 
-def fetch_candles(args) -> list[Candle]:
+def fetch_candles(args, symbol: str | None = None) -> list[Candle]:
     if args.mt5:
-        return fetch_mt5(args.symbol, args.history_days, args.login, args.password, args.server, args.path)
+        return fetch_mt5(symbol or args.symbol, args.history_days, args.login, args.password, args.server, args.path)
     if args.yfinance:
-        return fetch_yfinance(args.symbol, args.history_days)
+        return fetch_yfinance(symbol or args.symbol, args.history_days)
     return load_csv(args.csv_path)
 
 
 # --------------------------------------------------------------- live ----
 
-def live_loop(args, params: dict, telegram_token: str | None, telegram_chat_id: str | None) -> None:
-    print(f"\n============= LIVE MONITORING (every {args.interval} min, Ctrl+C to stop) =============")
-    last_signal = None
-    cache = new_cache()
+def live_loop(args, symbols: list[str], params: dict, telegram_token: str | None, telegram_chat_id: str | None) -> None:
+    """Watches one symbol, or several in rotation each tick (CSV mode has
+    no symbol concept, so `symbols` is empty and this runs a single
+    unlabeled pass instead)."""
+    label = ", ".join(symbols) if symbols else "data"
+    print(f"\n============= LIVE MONITORING: {label} (every {args.interval} min, Ctrl+C to stop) =============")
+    iter_symbols = symbols or [None]
+    last_signal = {s: None for s in iter_symbols}
+    caches = {s: new_cache() for s in iter_symbols}
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            candles = fetch_candles(args)
-            r15, r1h = build_resamplers(candles)
-            state = evaluate_state(candles, r1h.closed, r15.closed, cache, params)
-        except (ValueError, RuntimeError, FileNotFoundError) as e:
-            print(f"[{now}] Fetch/analysis error: {e}")
-            time.sleep(args.interval * 60)
-            continue
+        for sym in iter_symbols:
+            tag = f"{sym}: " if sym else ""
+            try:
+                candles = fetch_candles(args, symbol=sym)
+                r15, r1h = build_resamplers(candles)
+                state = evaluate_state(candles, r1h.closed, r15.closed, caches[sym], params)
+            except (ValueError, RuntimeError, FileNotFoundError) as e:
+                print(f"[{now}] {tag}Fetch/analysis error: {e}")
+                continue
 
-        print(f"\n[{now}]")
-        print_phase_report(state)
+            print(f"\n[{now}] {tag}".rstrip())
+            print_phase_report(state)
 
-        signal = state["signal"]
-        if signal in ("LONG", "SHORT") and signal != last_signal:
-            text = (
-                f"TRADE: {signal}\n"
-                f"Entry: {state['entry']:.5f}\n"
-                f"Stop Loss: {state['stop_loss']:.5f}\n"
-                f"Take Profit: {state['take_profit']:.5f}"
-            )
-            print(f"[{now}] >>> NEW TRADE — {signal} entry={state['entry']:.5f} sl={state['stop_loss']:.5f} tp={state['take_profit']:.5f}")
-            if telegram_token and telegram_chat_id:
-                send_telegram(telegram_token, telegram_chat_id, text)
+            signal = state["signal"]
+            if signal in ("LONG", "SHORT") and signal != last_signal[sym]:
+                text = (
+                    f"{sym + ' ' if sym else ''}TRADE: {signal}\n"
+                    f"Entry: {state['entry']:.5f}\nStop Loss: {state['stop_loss']:.5f}\nTake Profit: {state['take_profit']:.5f}"
+                )
+                print(f"[{now}] {tag}>>> NEW TRADE — {signal} entry={state['entry']:.5f} sl={state['stop_loss']:.5f} tp={state['take_profit']:.5f}")
+                if telegram_token and telegram_chat_id:
+                    send_telegram(telegram_token, telegram_chat_id, text)
+                else:
+                    print("  [Telegram] not configured (--telegram-token/--telegram-chat-id) -- skipped")
             else:
-                print("  [Telegram] not configured (--telegram-token/--telegram-chat-id) -- skipped")
-        else:
-            print(f"[{now}] No new trade (signal: {signal})")
+                print(f"[{now}] {tag}No new trade (signal: {signal})")
+            last_signal[sym] = signal
 
-        last_signal = signal
         time.sleep(args.interval * 60)
+
+
+# --------------------------------------------------------- optimization --
+
+def run_optimization(candles: list[Candle], base_params: dict, days: int, lot: float, contract_size: float, capital: float, min_trades: int = 5) -> list[dict]:
+    """Grid-search adx_threshold / zigzag_mult / rr on the already-fetched
+    history and rank combinations by profit factor -- lets the data (not a
+    guess) decide which settings trade more often without breaking
+    profitability. Combos with fewer than `min_trades` in the report window
+    are dropped since their stats aren't meaningful."""
+    grid_adx = [15.0, 20.0, 25.0, 30.0]
+    grid_zigzag = [1.0, 1.5, 2.0]
+    grid_rr = [1.5, 2.0, 2.5, 3.0]
+    cutoff = candles[-1].dt - timedelta(days=days)
+    total = len(grid_adx) * len(grid_zigzag) * len(grid_rr)
+
+    results, done = [], 0
+    for adx_t in grid_adx:
+        for zz in grid_zigzag:
+            for rr in grid_rr:
+                params = dict(base_params, adx_threshold=adx_t, zigzag_atr_mult=zz, rr=rr)
+                trades = run_backtest(candles, params)
+                recent = [t for t in trades if t.entry_dt >= cutoff]
+                stats = summarize_trades(recent, lot, contract_size, capital)
+                done += 1
+                print(f"  [{done}/{total}] adx>={adx_t:g} zigzag={zz:g} rr={rr:g} -> trades={stats.get('trades', 0)}", flush=True)
+                if stats.get("trades", 0) >= min_trades:
+                    results.append({"adx_threshold": adx_t, "zigzag_mult": zz, "rr": rr, **stats})
+
+    results.sort(key=lambda r: (r["profit_factor"] if r["profit_factor"] != float("inf") else 1e9, r["trades"]), reverse=True)
+    return results
+
+
+def print_optimization_results(results: list[dict], days: int, min_trades: int) -> None:
+    print(f"\n=== Optimization results (last {days} days, min {min_trades} trades) ===")
+    if not results:
+        print(f"No combination reached {min_trades} trades in this window. Try --history-days with more data, or lower the bar by editing min_trades.")
+        return
+
+    print(f"{'ADX>=':>6} {'ZigZag':>7} {'RR':>5} {'Trades':>7} {'Win%':>7} {'PF':>7} {'PnL':>10}")
+    for r in results[:15]:
+        pf = "inf" if r["profit_factor"] == float("inf") else f"{r['profit_factor']:.2f}"
+        print(f"{r['adx_threshold']:>6.0f} {r['zigzag_mult']:>7.1f} {r['rr']:>5.1f} {r['trades']:>7} {r['win_rate']:>6.1f}% {pf:>7} {r['total_pnl']:>+10.2f}")
+
+    best = results[0]
+    print(f"\nBest by profit factor: --adx-threshold {best['adx_threshold']:g} --zigzag-mult {best['zigzag_mult']:g} --rr {best['rr']:g}")
+    print("Re-run without --optimize using those flags to get the normal backtest + live analysis with them.")
 
 
 # ---------------------------------------------------------------- main ---
@@ -776,7 +827,9 @@ def main() -> None:
     parser.add_argument("csv_path", nargs="?", help="Path to a 5-minute OHLC CSV: date,open,high,low,close")
     parser.add_argument("--mt5", action="store_true", help="Fetch M5 candles live from a running MT5 terminal")
     parser.add_argument("--yfinance", action="store_true", help="Fetch M5 candles from Yahoo Finance")
-    parser.add_argument("--symbol", help="Symbol (required with --mt5/--yfinance)")
+    parser.add_argument("--symbol", help="Symbol, or a comma-separated list to scan several at once, e.g. EURUSD,GBPUSD,XAUUSD (required with --mt5/--yfinance)")
+    parser.add_argument("--optimize", action="store_true", help="Grid-search adx-threshold/zigzag-mult/rr on the fetched history instead of running once with the given values (single symbol only)")
+    parser.add_argument("--opt-min-trades", type=int, default=5, help="--optimize: minimum trades in the report window for a combination to be shown (default: 5)")
     parser.add_argument("--history-days", type=int, default=90, help="How many days of M5 history to fetch (default: 90, gives warm-up + report window)")
 
     parser.add_argument("--login", type=int, help="MT5 account login")
@@ -813,8 +866,9 @@ def main() -> None:
     if not args.mt5 and not args.yfinance and not args.csv_path:
         parser.error("provide a csv_path, or use --mt5/--yfinance --symbol ...")
 
-    candles = fetch_candles(args)
-    print(f"Loaded {len(candles)} M5 candles ({candles[0].dt} -> {candles[-1].dt})")
+    symbols = [s.strip() for s in args.symbol.split(",")] if (args.mt5 or args.yfinance) and args.symbol else []
+    if args.optimize and len(symbols) > 1:
+        parser.error("--optimize works on a single symbol at a time -- pass just one --symbol")
 
     params = dict(
         adx_period=args.adx_period, adx_threshold=args.adx_threshold, ma_fast=args.ma_fast, ma_slow=args.ma_slow,
@@ -822,26 +876,39 @@ def main() -> None:
         confirmation_lookback=args.confirm_lookback, rr=args.rr,
     )
 
-    print("\n============= BACKTEST =============")
-    all_trades = run_backtest(candles, params)
-    cutoff = candles[-1].dt - timedelta(days=args.days)
-    recent_trades = [t for t in all_trades if t.entry_dt >= cutoff]
-    print(f"Trades in last {args.days} days: {len(recent_trades)} (of {len(all_trades)} total over {len(candles)} M5 candles fetched)")
-    stats = summarize_trades(recent_trades, args.lot, args.contract_size, args.capital)
-    print_summary(stats, f"last {args.days} days", args.capital)
-    print_trade_tables(recent_trades, args.pip_size)
-
-    print("\n============= CURRENT ANALYSIS =============")
-    r15, r1h = build_resamplers(candles)
-    cache = new_cache()
-    state = evaluate_state(candles, r1h.closed, r15.closed, cache, params)
-    print_phase_report(state)
+    if args.optimize:
+        candles = fetch_candles(args, symbol=symbols[0] if symbols else None)
+        print(f"Loaded {len(candles)} M5 candles ({candles[0].dt} -> {candles[-1].dt})")
+        print(f"\n============= OPTIMIZING ({4*3*4} combinations, this can take a few minutes) =============")
+        results = run_optimization(candles, params, args.days, args.lot, args.contract_size, args.capital, args.opt_min_trades)
+        print_optimization_results(results, args.days, args.opt_min_trades)
+        return
 
     telegram_token = args.telegram_token or os.environ.get("TELEGRAM_BOT_TOKEN")
     telegram_chat_id = args.telegram_chat_id or os.environ.get("TELEGRAM_CHAT_ID")
 
+    for sym in (symbols or [None]):
+        header = f" -- {sym}" if sym else ""
+        candles = fetch_candles(args, symbol=sym)
+        print(f"\nLoaded {len(candles)} M5 candles{header} ({candles[0].dt} -> {candles[-1].dt})")
+
+        print(f"\n============= BACKTEST{header} =============")
+        all_trades = run_backtest(candles, params)
+        cutoff = candles[-1].dt - timedelta(days=args.days)
+        recent_trades = [t for t in all_trades if t.entry_dt >= cutoff]
+        print(f"Trades in last {args.days} days: {len(recent_trades)} (of {len(all_trades)} total over {len(candles)} M5 candles fetched)")
+        stats = summarize_trades(recent_trades, args.lot, args.contract_size, args.capital)
+        print_summary(stats, f"last {args.days} days", args.capital)
+        print_trade_tables(recent_trades, args.pip_size)
+
+        print(f"\n============= CURRENT ANALYSIS{header} =============")
+        r15, r1h = build_resamplers(candles)
+        cache = new_cache()
+        state = evaluate_state(candles, r1h.closed, r15.closed, cache, params)
+        print_phase_report(state)
+
     if args.live:
-        live_loop(args, params, telegram_token, telegram_chat_id)
+        live_loop(args, symbols, params, telegram_token, telegram_chat_id)
 
 
 if __name__ == "__main__":
