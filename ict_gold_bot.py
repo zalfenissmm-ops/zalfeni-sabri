@@ -1,0 +1,1619 @@
+#!/usr/bin/env python3
+"""
+ICT Gold Bot — XAU/USD strategy: live MetaTrader 5 data, the ICT rule set,
+and a 30-day backtest on a $1,000 account trading a fixed 0.01 lot.
+
+Everything lives in this one file, in three stages:
+
+  1. DATA      Real candles pulled straight from a running MetaTrader 5
+               terminal (D1 / H4 / H1 / M5), or replayed from CSVs that an
+               earlier `export` run saved.
+  2. STRATEGY  The trading plan from the ICT document, encoded step by step:
+               daily bias -> liquidity target -> kill zone -> liquidity sweep
+               -> CHoCH + displacement -> OB/FVG inside OTE -> SL/TP -> trade
+               management.
+  3. BACKTEST  A walk-forward, bar-by-bar replay of the last 30 days with no
+               look-ahead: every decision is taken on a closed M5 bar and can
+               only be executed by later bars.
+
+Account model: 0.01 lot of XAU/USD = 1 troy ounce, so a $1.00 move in gold is
+$1.00 of P/L — the "point value = 1 dollar" the account is sized around.
+
+Note on the document's step 10 (trade journal): it is deliberately not
+implemented. Journalling is a manual record-keeping habit, not an executable
+market rule; the backtest's trade table below is its automated equivalent.
+
+Usage
+    python3 ict_gold_bot.py backtest                      # live MT5 data, 30 days
+    python3 ict_gold_bot.py backtest --days 30 --verbose
+    python3 ict_gold_bot.py export --csv-dir data         # save MT5 candles to CSV
+    python3 ict_gold_bot.py backtest --source csv --csv-dir data
+    python3 ict_gold_bot.py scan                          # setup on live data right now
+
+Live data needs the MetaTrader5 package and a running terminal
+(`pip install MetaTrader5`; Windows, or Linux under Wine). The CSV source
+needs nothing but the standard library.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+from bisect import bisect_right
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+
+# ===========================================================================
+# 1. CONFIGURATION
+# ===========================================================================
+
+TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+
+# Kill zones from the document, in London local time (hours, fractional).
+KILL_ZONES = {
+    "asia": (0.0, 7.0),           # accumulation range, reference only
+    "london": (7.0, 10.0),        # London open — Judas swing window
+    "newyork": (12.0, 15.0),      # NY overlap — highest liquidity
+    "london_close": (15.0, 17.0),
+}
+
+# How much history each timeframe needs *before* the backtest window starts,
+# so that structure, swings and ATR are already warmed up on day one.
+WARMUP_DAYS = {"D1": 240, "H4": 90, "H1": 45, "M15": 12, "M5": 7}
+
+
+@dataclass
+class Config:
+    # --- instrument & account -------------------------------------------
+    symbol: str = "XAUUSD"
+    balance: float = 1000.0
+    lot: float = 0.01
+    contract_size: float = 100.0     # 1.00 lot = 100 oz -> 0.01 lot = $1 per $1 move
+    spread: float = 0.20             # price units, charged once per round turn
+    commission_per_lot: float = 0.0  # $ per lot, round turn
+
+    # --- backtest window --------------------------------------------------
+    days: int = 30
+
+    # --- timeframe ladder (document §3, top-down analysis) ----------------
+    bias_tf: str = "D1"              # long-term bias + dealing range
+    mid_tf: str = "H4"               # mid-term bias alignment
+    poi_tf: str = "H1"               # liquidity pools used as targets
+    entry_tf: str = "M5"             # sweep / CHoCH / entry timing
+    pd_tf: str = "H4"                # range whose 50% splits premium/discount
+    use_mid_filter: bool = True
+    use_pd_filter: bool = True
+
+    # --- risk & capital (document §6) -------------------------------------
+    risk_pct: float = 1.0            # max % of balance a single trade may risk
+    min_rr: float = 2.0              # never enter below 1:2
+    max_consecutive_losses: int = 2  # stop for the day after 2 losses in a row
+    max_daily_loss_pct: float = 3.0  # daily loss ceiling
+
+    # --- ICT parameters ---------------------------------------------------
+    swing_window_htf: int = 2        # fractal window on D1/H4/H1
+    swing_window_entry: int = 2      # fractal window on the entry timeframe
+    atr_period: int = 14
+    equal_level_atr: float = 0.15    # equal-highs/lows tolerance, in ATR
+    displacement_atr: float = 1.2    # body size that counts as displacement
+    sweep_lookback: int = 72         # entry-TF bars searched for a sweep (6h on M5)
+    choch_max_bars: int = 24         # CHoCH must follow the sweep within N bars
+    min_leg_atr: float = 1.5         # impulse leg must be at least this big
+    ote_low: float = 0.618           # OTE band, document §2.6
+    ote_high: float = 0.79
+    require_poi: bool = True         # entry must be an OB/FVG inside the OTE band
+    sl_buffer_atr: float = 0.5       # safety margin behind the sweep / block
+    min_sl_atr: float = 1.0          # a stop tighter than 1 ATR is spread noise
+    min_sl_distance: float = 1.00    # $, absolute floor under the stop distance
+    max_sweep_candidates: int = 6    # how many recent sweeps to test for a CHoCH
+    tp_mode: str = "nearest"         # "nearest" (per document) or "first-valid"
+
+    # --- orders & management (document §5, steps 7 and 9) ------------------
+    order_expiry_bars: int = 24      # a limit order lives 2 hours on M5
+    max_hold_bars: int = 288         # flatten after one trading day (0 = off)
+    breakeven_r: float = 1.0         # move SL to entry at +1R (0 = off)
+    partial_r: float = 0.0           # partial profit at +xR (0 = off)
+    partial_fraction: float = 0.5
+
+    # --- sessions & news --------------------------------------------------
+    sessions: tuple[str, ...] = ("london", "newyork")
+    blackouts: list[tuple[datetime, datetime]] = field(default_factory=list)
+
+    # --- data feed --------------------------------------------------------
+    source: str = "mt5"
+    csv_dir: str = "data"
+    broker_utc_offset: float | None = None   # None = auto-detect from the terminal
+    mt5_login: int | None = None
+    mt5_password: str | None = None
+    mt5_server: str | None = None
+    mt5_path: str | None = None
+
+    @property
+    def value_per_unit(self) -> float:
+        """Account currency gained per 1.00 of gold price, at the configured lot."""
+        return self.lot * self.contract_size
+
+    @property
+    def timeframes(self) -> list[str]:
+        tfs = [self.bias_tf, self.poi_tf, self.entry_tf]
+        if self.use_pd_filter:
+            tfs.append(self.pd_tf)
+        if self.use_mid_filter:
+            tfs.insert(1, self.mid_tf)
+        seen, ordered = set(), []
+        for tf in tfs:
+            if tf not in seen:
+                seen.add(tf)
+                ordered.append(tf)
+        return ordered
+
+
+# ===========================================================================
+# 2. TIME HELPERS  (kill zones are London local time — document §4)
+# ===========================================================================
+
+
+def _last_sunday(year: int, month: int) -> datetime:
+    """00:00 UTC of the last Sunday in the given month."""
+    day = 31
+    while True:
+        try:
+            d = datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            day -= 1
+            continue
+        return d - timedelta(days=(d.weekday() + 1) % 7)
+
+
+def is_bst(dt_utc: datetime) -> bool:
+    """British Summer Time: 01:00 UTC last Sunday of March -> 01:00 UTC last
+    Sunday of October. Computed here so the file needs no tz database."""
+    start = _last_sunday(dt_utc.year, 3) + timedelta(hours=1)
+    end = _last_sunday(dt_utc.year, 10) + timedelta(hours=1)
+    return start <= dt_utc < end
+
+
+def to_london(dt_utc: datetime) -> datetime:
+    return dt_utc + timedelta(hours=1 if is_bst(dt_utc) else 0)
+
+
+def london_hour(dt_utc: datetime) -> float:
+    lon = to_london(dt_utc)
+    return lon.hour + lon.minute / 60.0
+
+
+def london_day(dt_utc: datetime) -> datetime:
+    """Midnight London (as a UTC instant) of the day this timestamp falls in."""
+    lon = to_london(dt_utc)
+    midnight = lon.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(hours=1 if is_bst(dt_utc) else 0)
+
+
+def active_session(dt_utc: datetime, names: tuple[str, ...]) -> str | None:
+    h = london_hour(dt_utc)
+    for name in names:
+        lo, hi = KILL_ZONES[name]
+        if lo <= h < hi:
+            return name
+    return None
+
+
+def in_blackout(dt_utc: datetime, blackouts: list[tuple[datetime, datetime]]) -> bool:
+    return any(start <= dt_utc < end for start, end in blackouts)
+
+
+# ===========================================================================
+# 3. DATA LAYER — real candles from MetaTrader 5, or from exported CSV
+# ===========================================================================
+
+
+@dataclass(slots=True)
+class Candle:
+    time: datetime      # UTC, bar OPEN time
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+
+    @property
+    def body(self) -> float:
+        return abs(self.close - self.open)
+
+    @property
+    def range(self) -> float:
+        return self.high - self.low
+
+    @property
+    def bullish(self) -> bool:
+        return self.close >= self.open
+
+
+class MT5Feed:
+    """Live feed. Talks to a running MetaTrader 5 terminal through the official
+    MetaTrader5 python package and returns candles stamped in real UTC."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.mt5 = None
+        self.offset_hours = cfg.broker_utc_offset or 0.0
+        self.symbol = cfg.symbol
+
+    def __enter__(self) -> "MT5Feed":
+        try:
+            import MetaTrader5 as mt5
+        except ImportError:
+            raise SystemExit(
+                "MetaTrader5 package not installed.\n"
+                "  Windows / Wine:  pip install MetaTrader5   (needs a running MT5 terminal)\n"
+                "  Anywhere else :  export the candles once on a machine that has MT5\n"
+                "                   (python3 ict_gold_bot.py export --csv-dir data)\n"
+                "                   then run with --source csv --csv-dir data"
+            )
+        self.mt5 = mt5
+
+        kwargs = {}
+        if self.cfg.mt5_path:
+            kwargs["path"] = self.cfg.mt5_path
+        if self.cfg.mt5_login:
+            kwargs.update(login=int(self.cfg.mt5_login),
+                          password=self.cfg.mt5_password or "",
+                          server=self.cfg.mt5_server or "")
+        if not mt5.initialize(**kwargs):
+            raise SystemExit(f"MT5 initialize() failed: {mt5.last_error()}")
+
+        self.symbol = self._resolve_symbol()
+        if not mt5.symbol_select(self.symbol, True):
+            raise SystemExit(f"Cannot select symbol {self.symbol}: {mt5.last_error()}")
+
+        if self.cfg.broker_utc_offset is None:
+            self.offset_hours = self._detect_offset()
+            print(f"[mt5] broker clock detected at UTC{self.offset_hours:+g}")
+        else:
+            self.offset_hours = float(self.cfg.broker_utc_offset)
+
+        info = mt5.symbol_info(self.symbol)
+        if info is not None:
+            print(f"[mt5] {self.symbol}: contract={info.trade_contract_size:g} "
+                  f"min_lot={info.volume_min:g} spread={info.spread} points, "
+                  f"digits={info.digits}")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.mt5 is not None:
+            self.mt5.shutdown()
+
+    def _resolve_symbol(self) -> str:
+        """Brokers name gold differently (XAUUSD, XAUUSD.m, GOLD...). Take the
+        configured name if it exists, otherwise show what is available."""
+        mt5 = self.mt5
+        if mt5.symbol_info(self.cfg.symbol) is not None:
+            return self.cfg.symbol
+        candidates = [s.name for s in (mt5.symbols_get() or [])
+                      if "XAU" in s.name.upper() or "GOLD" in s.name.upper()]
+        if len(candidates) == 1:
+            print(f"[mt5] '{self.cfg.symbol}' not found, using '{candidates[0]}'")
+            return candidates[0]
+        raise SystemExit(
+            f"Symbol '{self.cfg.symbol}' not found on this broker.\n"
+            f"Gold-like symbols available: {', '.join(candidates) or '(none)'}\n"
+            "Re-run with --symbol <name>."
+        )
+
+    def _detect_offset(self) -> float:
+        """MT5 stamps candles in broker server time. Compare the latest tick's
+        clock with real UTC to learn the offset (usually +2 or +3 for gold)."""
+        tick = self.mt5.symbol_info_tick(self.symbol)
+        if tick is None or not tick.time:
+            return 0.0
+        server_now = datetime.fromtimestamp(tick.time, tz=timezone.utc)
+        delta_h = (server_now - datetime.now(timezone.utc)).total_seconds() / 3600.0
+        return round(delta_h * 2) / 2  # snap to the nearest half hour
+
+    def fetch(self, timeframe: str, start_utc: datetime, end_utc: datetime) -> list[Candle]:
+        mt5 = self.mt5
+        tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}")
+        off = timedelta(hours=self.offset_hours)
+        rates = mt5.copy_rates_range(self.symbol, tf_const, start_utc + off, end_utc + off)
+        if rates is None or len(rates) == 0:
+            raise SystemExit(
+                f"MT5 returned no {timeframe} data for {self.symbol} "
+                f"({start_utc:%Y-%m-%d} -> {end_utc:%Y-%m-%d}): {mt5.last_error()}\n"
+                "Open the symbol's chart on that timeframe once so the terminal "
+                "downloads its history, then retry."
+            )
+        candles = [
+            Candle(
+                time=datetime.fromtimestamp(int(r["time"]), tz=timezone.utc) - off,
+                open=float(r["open"]), high=float(r["high"]),
+                low=float(r["low"]), close=float(r["close"]),
+                volume=float(r["tick_volume"]),
+            )
+            for r in rates
+        ]
+        print(f"[mt5] {timeframe:>3}: {len(candles):>6} candles  "
+              f"{candles[0].time:%Y-%m-%d %H:%M} -> {candles[-1].time:%Y-%m-%d %H:%M} UTC")
+        return candles
+
+
+def load_csv(path: str) -> list[Candle]:
+    candles = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            candles.append(Candle(
+                time=datetime.fromisoformat(row["time"]).replace(tzinfo=timezone.utc)
+                if "+" not in row["time"] else datetime.fromisoformat(row["time"]),
+                open=float(row["open"]), high=float(row["high"]),
+                low=float(row["low"]), close=float(row["close"]),
+                volume=float(row.get("volume") or 0),
+            ))
+    candles.sort(key=lambda c: c.time)
+    return candles
+
+
+def save_csv(path: str, candles: list[Candle]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "open", "high", "low", "close", "volume"])
+        for c in candles:
+            w.writerow([c.time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                        c.open, c.high, c.low, c.close, c.volume])
+
+
+def load_dataset(cfg: Config, end_utc: datetime) -> dict[str, list[Candle]]:
+    """Every timeframe the strategy needs, warmed up before the test window."""
+    start_utc = end_utc - timedelta(days=cfg.days)
+    data: dict[str, list[Candle]] = {}
+
+    if cfg.source == "mt5":
+        with MT5Feed(cfg) as feed:
+            for tf in cfg.timeframes:
+                warm = timedelta(days=WARMUP_DAYS.get(tf, 30))
+                data[tf] = feed.fetch(tf, start_utc - warm, end_utc)
+    else:
+        for tf in cfg.timeframes:
+            path = os.path.join(cfg.csv_dir, f"{cfg.symbol}_{tf}.csv")
+            if not os.path.exists(path):
+                raise SystemExit(f"Missing {path}. Run `export --csv-dir {cfg.csv_dir}` "
+                                 "on a machine with MetaTrader 5 first.")
+            data[tf] = load_csv(path)
+            print(f"[csv] {tf:>3}: {len(data[tf]):>6} candles  "
+                  f"{data[tf][0].time:%Y-%m-%d %H:%M} -> {data[tf][-1].time:%Y-%m-%d %H:%M} UTC")
+
+    for tf, candles in data.items():
+        if len(candles) < 50:
+            raise SystemExit(f"Only {len(candles)} {tf} candles — not enough history.")
+    return data
+
+
+# ===========================================================================
+# 4. ICT PRIMITIVES  (document §2 — the vocabulary the plan is written in)
+# ===========================================================================
+
+
+@dataclass(slots=True)
+class Swing:
+    index: int
+    price: float
+    kind: str           # "high" | "low"
+    # a fractal is only *known* `window` bars later; every caller adds that
+    # delay itself so nothing is ever read from the future
+
+
+@dataclass(slots=True)
+class StructureEvent:
+    index: int
+    type: str           # "BOS" | "CHoCH"
+    direction: str      # "up" | "down"
+    level: float
+
+
+@dataclass(slots=True)
+class Zone:
+    """An order block or a fair value gap — a price band price may return to."""
+    index: int
+    kind: str           # "bullish_ob" | "bearish_ob" | "bullish_fvg" | "bearish_fvg"
+    bottom: float
+    top: float
+
+    @property
+    def bullish(self) -> bool:
+        return self.kind.startswith("bullish")
+
+
+@dataclass(slots=True)
+class Pool:
+    """Resting liquidity: equal highs/lows, or a single untouched swing."""
+    level: float
+    kind: str           # "high" (buy-side) | "low" (sell-side)
+    index: int
+    equal: bool = False
+
+
+def atr_series(candles: list[Candle], period: int) -> list[float]:
+    """Wilder's ATR, forward-filled so index i is always usable."""
+    if not candles:
+        return []
+    trs = [candles[0].range]
+    for prev, cur in zip(candles, candles[1:]):
+        trs.append(max(cur.high - cur.low,
+                       abs(cur.high - prev.close),
+                       abs(cur.low - prev.close)))
+    out = [trs[0]] * len(trs)
+    if len(trs) <= period:
+        running = sum(trs) / len(trs)
+        return [running] * len(trs)
+    seed = sum(trs[:period]) / period
+    out[period - 1] = seed
+    for i in range(period, len(trs)):
+        out[i] = (out[i - 1] * (period - 1) + trs[i]) / period
+    for i in range(period - 1):
+        out[i] = seed
+    return out
+
+
+def swing_points(candles: list[Candle], window: int) -> list[Swing]:
+    """Fractal swing highs/lows — the bar is the extreme of the `window` bars
+    on each side of it (document §2.1)."""
+    swings: list[Swing] = []
+    for i in range(window, len(candles) - window):
+        seg = candles[i - window: i + window + 1]
+        if candles[i].high == max(c.high for c in seg):
+            swings.append(Swing(i, candles[i].high, "high"))
+        if candles[i].low == min(c.low for c in seg):
+            swings.append(Swing(i, candles[i].low, "low"))
+    swings.sort(key=lambda s: s.index)
+    return swings
+
+
+def structure_events(candles: list[Candle], swings: list[Swing], window: int) -> list[StructureEvent]:
+    """Walk forward tracking the last *confirmed* swing high/low. A close beyond
+    it continues the bias (BOS) or flips it (CHoCH) — document §2.1."""
+    highs = [s for s in swings if s.kind == "high"]
+    lows = [s for s in swings if s.kind == "low"]
+    events: list[StructureEvent] = []
+    bias: str | None = None
+    hi_ptr = lo_ptr = 0
+    active_high = active_low = None
+
+    for i, candle in enumerate(candles):
+        # a fractal only becomes visible `window` bars after it printed
+        while hi_ptr < len(highs) and highs[hi_ptr].index + window <= i:
+            active_high = highs[hi_ptr]
+            hi_ptr += 1
+        while lo_ptr < len(lows) and lows[lo_ptr].index + window <= i:
+            active_low = lows[lo_ptr]
+            lo_ptr += 1
+
+        if active_high is not None and candle.close > active_high.price:
+            events.append(StructureEvent(i, "BOS" if bias == "up" else "CHoCH",
+                                         "up", active_high.price))
+            bias, active_high = "up", None
+        if active_low is not None and candle.close < active_low.price:
+            events.append(StructureEvent(i, "BOS" if bias == "down" else "CHoCH",
+                                         "down", active_low.price))
+            bias, active_low = "down", None
+
+    return events
+
+
+def dealing_range(swings: list[Swing]) -> tuple[float, float] | None:
+    """The most recent swing high and swing low — the range whose 50% splits
+    premium from discount (document §2.5)."""
+    last_high = next((s.price for s in reversed(swings) if s.kind == "high"), None)
+    last_low = next((s.price for s in reversed(swings) if s.kind == "low"), None)
+    if last_high is None or last_low is None or last_high <= last_low:
+        return None
+    return last_low, last_high
+
+
+def liquidity_pools(candles: list[Candle], swings: list[Swing], tolerance: float) -> list[Pool]:
+    """Buy-side liquidity above equal highs, sell-side below equal lows, plus
+    the untouched single swings around them (document §2.2)."""
+    pools: list[Pool] = []
+    # running extremes to the right of each bar: a level is still "resting"
+    # liquidity only while nothing after it has traded through
+    n = len(candles)
+    suffix_max = [float("-inf")] * (n + 1)
+    suffix_min = [float("inf")] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_max[i] = max(suffix_max[i + 1], candles[i].high)
+        suffix_min[i] = min(suffix_min[i + 1], candles[i].low)
+
+    for kind in ("high", "low"):
+        points = [s for s in swings if s.kind == kind]
+        for a, b in zip(points, points[1:]):
+            if abs(a.price - b.price) <= tolerance:
+                level = max(a.price, b.price) if kind == "high" else min(a.price, b.price)
+                pools.append(Pool(level, kind, b.index, equal=True))
+        for s in points:
+            # a swing still counts as liquidity until price trades through it
+            if kind == "high" and suffix_max[s.index + 1] <= s.price:
+                pools.append(Pool(s.price, kind, s.index))
+            elif kind == "low" and suffix_min[s.index + 1] >= s.price:
+                pools.append(Pool(s.price, kind, s.index))
+    pools.sort(key=lambda p: p.index)
+    return pools
+
+
+def fair_value_gaps(candles: list[Candle], start: int = 0) -> list[Zone]:
+    """Three-candle imbalance: candle 1 and candle 3 do not overlap
+    (document §2.3). Indexed on the middle candle."""
+    gaps: list[Zone] = []
+    for i in range(max(start, 0), len(candles) - 2):
+        c1, c3 = candles[i], candles[i + 2]
+        if c1.high < c3.low:
+            gaps.append(Zone(i + 1, "bullish_fvg", c1.high, c3.low))
+        elif c1.low > c3.high:
+            gaps.append(Zone(i + 1, "bearish_fvg", c3.high, c1.low))
+    return gaps
+
+
+def order_blocks(candles: list[Candle], atr: list[float], mult: float,
+                 start: int = 0) -> list[Zone]:
+    """Last opposite candle before a displacement move (document §2.4)."""
+    blocks: list[Zone] = []
+    for i in range(max(start, 1), len(candles)):
+        candle = candles[i]
+        if candle.body <= mult * atr[i]:
+            continue
+        bearish_impulse = candle.close < candle.open
+        for j in range(i - 1, max(i - 12, -1), -1):
+            prev = candles[j]
+            if bearish_impulse and prev.bullish:
+                blocks.append(Zone(j, "bearish_ob", prev.low, prev.high))
+                break
+            if not bearish_impulse and not prev.bullish:
+                blocks.append(Zone(j, "bullish_ob", prev.low, prev.high))
+                break
+    return blocks
+
+
+def has_displacement(candles: list[Candle], atr: list[float], lo: int, hi: int,
+                     mult: float) -> bool:
+    """A strong one-way move — a body above `mult` x ATR, or the consecutive
+    FVGs such a move leaves behind (document §2.9)."""
+    for i in range(max(lo, 0), min(hi + 1, len(candles))):
+        if candles[i].body > mult * atr[i]:
+            return True
+    window = candles[max(lo - 1, 0): hi + 2]
+    return bool(fair_value_gaps(window))
+
+
+def ote_band(low: float, high: float, direction: str,
+             ote_low: float, ote_high: float) -> tuple[float, float]:
+    """Optimal Trade Entry: the 61.8%–79% retracement of the impulse leg
+    (document §2.6). Returned as (bottom, top)."""
+    span = high - low
+    if direction == "long":                 # retracing down from the leg high
+        return high - ote_high * span, high - ote_low * span
+    return low + ote_low * span, low + ote_high * span
+
+
+def overlap(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float] | None:
+    bottom, top = max(a[0], b[0]), min(a[1], b[1])
+    return (bottom, top) if top > bottom else None
+
+
+
+# ===========================================================================
+# 5. TOP-DOWN CONTEXT  (document §3 — bias flows from the big timeframe down)
+# ===========================================================================
+
+
+@dataclass
+class TimeframeView:
+    bias: str | None = None                    # "up" | "down" | None
+    range_low: float | None = None
+    range_high: float | None = None
+    equilibrium: float | None = None
+    pools: list[Pool] = field(default_factory=list)
+    atr: float = 0.0
+    last_close: float = 0.0
+    prev_high: float | None = None             # previous completed candle
+    prev_low: float | None = None
+
+
+class TimeframeAnalyzer:
+    """Higher-timeframe structure for a walk-forward run. Only candles that
+    have already *closed* at the decision time are ever visible, and the
+    analysis is recomputed only when a new candle closes."""
+
+    def __init__(self, timeframe: str, candles: list[Candle], cfg: Config):
+        self.tf = timeframe
+        self.candles = candles
+        self.cfg = cfg
+        step = timedelta(minutes=TF_MINUTES[timeframe])
+        self.close_times = [c.time + step for c in candles]
+        self._cached_n = -1
+        self._cached_view = TimeframeView()
+
+    def closed_count(self, now_utc: datetime) -> int:
+        """How many candles are fully closed at `now_utc`."""
+        return bisect_right(self.close_times, now_utc)
+
+    def view(self, now_utc: datetime) -> TimeframeView:
+        n = self.closed_count(now_utc)
+        if n == self._cached_n:
+            return self._cached_view
+        self._cached_n = n
+        self._cached_view = self._compute(n)
+        return self._cached_view
+
+    def _compute(self, n: int) -> TimeframeView:
+        cfg = self.cfg
+        if n < 30:
+            return TimeframeView()
+        candles = self.candles[:n]
+        atr = atr_series(candles, cfg.atr_period)
+        swings = swing_points(candles, cfg.swing_window_htf)
+        events = structure_events(candles, swings, cfg.swing_window_htf)
+
+        view = TimeframeView(
+            bias=events[-1].direction if events else None,
+            pools=liquidity_pools(candles, swings, cfg.equal_level_atr * atr[-1]),
+            atr=atr[-1],
+            last_close=candles[-1].close,
+            prev_high=candles[-1].high,
+            prev_low=candles[-1].low,
+        )
+        rng = dealing_range(swings)
+        if rng:
+            view.range_low, view.range_high = rng
+            view.equilibrium = (rng[0] + rng[1]) / 2
+        return view
+
+
+# ===========================================================================
+# 6. THE SETUP FINDER — document §5, one function per step of the plan
+# ===========================================================================
+
+
+# The document's pre-trade checklist (§8), in the order the plan checks it.
+PLAN_STAGES = [
+    "1  inside a kill zone",
+    "2  higher-timeframe bias aligned",
+    "3  price in the right half (premium/discount)",
+    "4  liquidity swept",
+    "5  sweep still valid",
+    "6  CHoCH with displacement",
+    "7  impulse leg large enough",
+    "8  order block / FVG inside the OTE band",
+    "9  entry still reachable",
+    "10 reward:risk at or above the minimum",
+    "11 risk within the % cap",
+]
+
+
+@dataclass
+class Setup:
+    direction: str          # "long" | "short"
+    entry: float
+    sl: float
+    tp: float
+    rr: float
+    risk_usd: float
+    order_kind: str         # "limit" | "market"
+    session: str
+    judas: bool
+    swept: str              # what liquidity was taken: swing / asia / prev_day
+    poi: str                # which POI the entry sits in
+    sweep_bar: int          # absolute index on the entry timeframe
+    choch_bar: int
+    time: datetime
+
+    @property
+    def key(self) -> tuple:
+        return (self.direction, self.sweep_bar, self.choch_bar)
+
+
+def _sweep_candidates(win: list[Candle], k: int, direction: str, cfg: Config,
+                      ctx: dict) -> list[tuple[float, int, str]]:
+    """Liquidity levels a sweep could be run against, each with the earliest
+    bar at which that level was already known (document §5, step 2)."""
+    kind = "low" if direction == "long" else "high"
+    out: list[tuple[float, int, str]] = []
+
+    for s in swing_points(win[: k + 1], cfg.swing_window_entry):
+        if s.kind == kind:
+            out.append((s.price, s.index + cfg.swing_window_entry + 1, "swing"))
+
+    asia = ctx.get("asia_range")
+    if asia and ctx.get("asia_known_from") is not None:
+        level = asia[0] if kind == "low" else asia[1]
+        out.append((level, ctx["asia_known_from"], "asia"))
+
+    prev_day = ctx.get("prev_day_range")
+    if prev_day and ctx.get("day_known_from") is not None:
+        level = prev_day[0] if kind == "low" else prev_day[1]
+        out.append((level, ctx["day_known_from"], "prev_day"))
+
+    return out
+
+
+def _find_sweeps(win: list[Candle], k: int, direction: str, cfg: Config,
+                 ctx: dict) -> list[tuple[int, float, str]]:
+    """Step 4 — wicks through resting liquidity that close back inside
+    (document §2.2 Liquidity Sweep), most recent first. More than one is
+    returned because the sweep that matters is the one the CHoCH follows,
+    which is not always the very latest wick."""
+    kind = "low" if direction == "long" else "high"
+    earliest = max(0, k - cfg.sweep_lookback + 1)
+    found: dict[int, tuple[float, str]] = {}
+
+    for level, known_from, label in _sweep_candidates(win, k, direction, cfg, ctx):
+        for j in range(max(earliest, known_from), k + 1):
+            c = win[j]
+            hit = (c.low < level and c.close > level) if kind == "low" \
+                else (c.high > level and c.close < level)
+            if not hit:
+                continue
+            # a level from the day's reference ranges beats an ordinary swing
+            if j not in found or (label != "swing" and found[j][1] == "swing"):
+                found[j] = (level, label)
+    return [(j, lvl, lbl) for j, (lvl, lbl) in sorted(found.items(), reverse=True)]
+
+
+def _find_choch(win: list[Candle], atr: list[float], sweep_bar: int, k: int,
+                direction: str, cfg: Config) -> int | None:
+    """Step 5 — after the sweep, price must break structure the other way and
+    do it with displacement (document §2.1 CHoCH + §2.9 Displacement)."""
+    swings = swing_points(win[: k + 1], cfg.swing_window_entry)
+    kind = "high" if direction == "long" else "low"
+    w = cfg.swing_window_entry
+    refs = [s for s in swings if s.kind == kind and s.index <= sweep_bar]
+    if not refs:
+        return None
+
+    last_bar = min(k, sweep_bar + cfg.choch_max_bars)
+    for m in range(sweep_bar + 1, last_bar + 1):
+        visible = [s for s in refs if s.index + w <= m]
+        if not visible:
+            continue
+        level = visible[-1].price
+        broke = win[m].close > level if direction == "long" else win[m].close < level
+        if broke and has_displacement(win, atr, sweep_bar, m, cfg.displacement_atr):
+            return m
+    return None
+
+
+def _find_poi(win: list[Candle], atr: list[float], lo: int, k: int, direction: str,
+              band: tuple[float, float], cfg: Config) -> tuple[Zone, tuple[float, float]] | None:
+    """Step 6 — the order block or fair value gap that overlaps the OTE band.
+    The biggest overlap wins (documents §2.3, §2.4, §2.6)."""
+    want = "bullish" if direction == "long" else "bearish"
+    zones = [z for z in order_blocks(win[: k + 1], atr, cfg.displacement_atr, start=lo)
+             if z.kind.startswith(want) and z.index >= lo]
+    zones += [z for z in fair_value_gaps(win[: k + 1], start=lo)
+              if z.kind.startswith(want) and z.index >= lo]
+
+    best = None
+    for zone in zones:
+        ov = overlap((zone.bottom, zone.top), band)
+        if ov and (best is None or (ov[1] - ov[0]) > (best[1][1] - best[1][0])):
+            best = (zone, ov)
+    return best
+
+
+def _liquidity_target(pools: list[Pool], direction: str, entry: float,
+                      min_distance: float, sl: float, cfg: Config) -> float | None:
+    """Step 8 — the target is the nearest opposite liquidity pool, and the
+    trade is only taken if that target pays at least 1:2 (document §5)."""
+    if direction == "long":
+        levels = sorted({p.level for p in pools
+                         if p.kind == "high" and p.level > entry + min_distance})
+    else:
+        levels = sorted({p.level for p in pools
+                         if p.kind == "low" and p.level < entry - min_distance},
+                        reverse=True)
+    if not levels:
+        return None
+
+    risk = abs(entry - sl)
+    if cfg.tp_mode == "nearest":
+        nearest = levels[0]
+        return nearest if abs(nearest - entry) / risk >= cfg.min_rr else None
+    for level in levels:
+        if abs(level - entry) / risk >= cfg.min_rr:
+            return level
+    return None
+
+
+def find_setup(entry_candles: list[Candle], entry_atr: list[float], i: int,
+               ctx: dict, cfg: Config, balance: float,
+               funnel: Counter | None = None) -> Setup | None:
+    """The document's trading plan, steps 1-8, evaluated on the close of bar
+    `i`. Returns a ready-to-place order, or None with the reason counted in
+    the funnel. Nothing after bar `i` is ever read."""
+    def tick(stage: str) -> None:
+        if funnel is not None:
+            funnel[stage] += 1
+
+    bar = entry_candles[i]
+    tick("0  bars evaluated")
+
+    # --- step 3: kill zone (document §4) ---------------------------------
+    session = active_session(bar.time, cfg.sessions)
+    if session is None or in_blackout(bar.time, cfg.blackouts):
+        return None
+    tick(PLAN_STAGES[0])
+
+    # --- step 1: bias from the higher timeframes (document §3) -----------
+    bias_view: TimeframeView = ctx["bias"]
+    if bias_view.bias is None:
+        return None
+    direction = "long" if bias_view.bias == "up" else "short"
+
+    mid_view: TimeframeView | None = ctx.get("mid")
+    if cfg.use_mid_filter and mid_view is not None:
+        if mid_view.bias is not None and mid_view.bias != bias_view.bias:
+            return None
+    tick(PLAN_STAGES[1])
+
+    # --- step 1b: premium / discount of the most recent dealing range -----
+    # (document §2.5: buy the discount half, sell the premium half)
+    pd_view: TimeframeView = ctx.get("pd") or bias_view
+    if cfg.use_pd_filter:
+        if pd_view.equilibrium is None:
+            return None
+        in_zone = bar.close < pd_view.equilibrium if direction == "long" \
+            else bar.close > pd_view.equilibrium
+        if not in_zone:
+            return None
+    tick(PLAN_STAGES[2])
+
+    # --- window of entry-timeframe bars this decision may look at ---------
+    lo = max(0, i - cfg.sweep_lookback - 3 * cfg.swing_window_entry - 5)
+    win = entry_candles[lo: i + 1]
+    atr_win = entry_atr[lo: i + 1]
+    k = i - lo
+    atr = atr_win[k]
+    if atr <= 0:
+        return None
+
+    local_ctx = dict(ctx)
+    for key in ("asia_known_from", "day_known_from"):
+        if ctx.get(key) is not None:
+            local_ctx[key] = max(0, ctx[key] - lo)
+
+    # --- step 4: liquidity sweep -----------------------------------------
+    sweeps = _find_sweeps(win, k, direction, cfg, local_ctx)
+    if not sweeps:
+        return None
+    tick(PLAN_STAGES[3])
+
+    # --- step 5: the sweep must still hold, then break structure back ----
+    sweep_bar = choch_bar = -1
+    swept_what = ""
+    any_valid = False
+    for cand_bar, _level, label in sweeps[: cfg.max_sweep_candidates]:
+        # if price traded back through the sweep extreme the setup is dead
+        if direction == "long":
+            if min(c.low for c in win[cand_bar: k + 1]) < win[cand_bar].low:
+                continue
+        elif max(c.high for c in win[cand_bar: k + 1]) > win[cand_bar].high:
+            continue
+        any_valid = True
+        found = _find_choch(win, atr_win, cand_bar, k, direction, cfg)
+        if found is not None:
+            sweep_bar, choch_bar, swept_what = cand_bar, found, label
+            break
+    if any_valid:
+        tick(PLAN_STAGES[4])
+    if choch_bar < 0:
+        return None
+    tick(PLAN_STAGES[5])
+
+    # --- step 6: OTE band of the impulse leg ------------------------------
+    leg_low = min(c.low for c in win[sweep_bar: k + 1])
+    leg_high = max(c.high for c in win[sweep_bar: k + 1])
+    if leg_high - leg_low < cfg.min_leg_atr * atr:
+        return None
+    band = ote_band(leg_low, leg_high, direction, cfg.ote_low, cfg.ote_high)
+    tick(PLAN_STAGES[6])
+
+    poi_hit = _find_poi(win, atr_win, sweep_bar, k, direction, band, cfg)
+    if poi_hit is None:
+        if cfg.require_poi:
+            return None
+        zone_label, entry_band = "ote-only", band
+    else:
+        zone, ov = poi_hit
+        zone_label, entry_band = zone.kind, ov
+    tick(PLAN_STAGES[7])
+
+    entry = (entry_band[0] + entry_band[1]) / 2
+
+    # price must still be on the right side of the zone for a retracement entry
+    if direction == "long":
+        if bar.close < entry_band[0]:
+            return None
+        order_kind = "market" if bar.close <= entry_band[1] else "limit"
+    else:
+        if bar.close > entry_band[1]:
+            return None
+        order_kind = "market" if bar.close >= entry_band[0] else "limit"
+    tick(PLAN_STAGES[8])
+
+    # --- step 7: stop behind the sweep / the block ------------------------
+    buffer = cfg.sl_buffer_atr * atr
+    floor = max(cfg.min_sl_atr * atr, cfg.min_sl_distance)
+    if direction == "long":
+        sl = min(min(leg_low, entry_band[0]) - buffer, entry - floor)
+    else:
+        sl = max(max(leg_high, entry_band[1]) + buffer, entry + floor)
+
+    # --- step 8: target = nearest opposite liquidity, RR must clear 1:2 ---
+    poi_view: TimeframeView = ctx["poi"]
+    tp = _liquidity_target(poi_view.pools, direction, entry,
+                           0.5 * max(poi_view.atr, atr), sl, cfg)
+    if tp is None:
+        return None
+    rr = abs(tp - entry) / abs(entry - sl)
+    tick(PLAN_STAGES[9])
+
+    # --- risk cap: the lot is fixed, so an oversized stop is a no-trade ---
+    risk_usd = abs(entry - sl) * cfg.value_per_unit
+    if risk_usd > cfg.risk_pct / 100.0 * balance:
+        return None
+    tick(PLAN_STAGES[10])
+
+    judas = swept_what in ("asia", "prev_day") and session == "london"
+    return Setup(direction=direction, entry=entry, sl=sl, tp=tp, rr=rr,
+                 risk_usd=risk_usd, order_kind=order_kind, session=session,
+                 judas=judas, swept=swept_what, poi=zone_label,
+                 sweep_bar=lo + sweep_bar, choch_bar=lo + choch_bar, time=bar.time)
+
+
+# ===========================================================================
+# 7. BACKTEST ENGINE — $1,000 account, fixed 0.01 lot, walk-forward
+# ===========================================================================
+
+
+@dataclass
+class Trade:
+    direction: str
+    entry_time: datetime
+    entry: float
+    sl: float
+    tp: float
+    exit_time: datetime
+    exit: float
+    reason: str             # SL | TP | BE | TIME | END
+    pnl: float
+    r_multiple: float
+    balance: float
+    risk_usd: float
+    rr_planned: float
+    session: str
+    swept: str
+    poi: str
+    judas: bool
+    bars_held: int
+
+
+@dataclass
+class Position:
+    setup: Setup
+    entry: float
+    entry_bar: int
+    entry_time: datetime
+    sl: float
+    initial_sl: float
+    tp: float
+    volume: float
+    risk_price: float
+    realized: float = 0.0       # money already banked by a partial close
+    closed_volume: float = 0.0
+    breakeven_done: bool = False
+    partial_done: bool = False
+
+
+@dataclass
+class PendingOrder:
+    setup: Setup
+    expires_bar: int
+
+
+@dataclass
+class DayState:
+    day: datetime | None = None
+    pnl: float = 0.0
+    consecutive_losses: int = 0
+    start_balance: float = 0.0
+    blocked: bool = False
+
+
+@dataclass
+class BacktestResult:
+    trades: list[Trade]
+    equity: list[tuple[datetime, float]]
+    funnel: Counter
+    orders_placed: int
+    orders_filled: int
+    orders_expired: int
+    start: datetime
+    end: datetime
+    cfg: Config
+
+
+def _day_index(entry: list[Candle]) -> dict[datetime, dict]:
+    """Per London day: where the day starts on the entry timeframe, and the
+    Asia accumulation range the Judas swing runs (document §4)."""
+    index: dict[datetime, dict] = {}
+    for i, candle in enumerate(entry):
+        day = london_day(candle.time)
+        rec = index.setdefault(day, {"start_idx": i, "asia_low": None,
+                                     "asia_high": None, "asia_end_idx": None})
+        if london_hour(candle.time) < KILL_ZONES["asia"][1]:
+            rec["asia_low"] = candle.low if rec["asia_low"] is None else min(rec["asia_low"], candle.low)
+            rec["asia_high"] = candle.high if rec["asia_high"] is None else max(rec["asia_high"], candle.high)
+        elif rec["asia_end_idx"] is None:
+            rec["asia_end_idx"] = i
+    return index
+
+
+def build_context(entry: list[Candle], i: int, analyzers: dict[str, TimeframeAnalyzer],
+                  day_index: dict[datetime, dict], cfg: Config) -> dict:
+    """Everything the setup finder is allowed to know at the close of bar i."""
+    now = entry[i].time + timedelta(minutes=TF_MINUTES[cfg.entry_tf])
+    ctx: dict = {
+        "bias": analyzers[cfg.bias_tf].view(now),
+        "poi": analyzers[cfg.poi_tf].view(now),
+    }
+    # the premium/discount and mid-bias references fall back to the bias
+    # timeframe when their own timeframe was not loaded
+    pd_analyzer = analyzers.get(cfg.pd_tf) or analyzers[cfg.bias_tf]
+    ctx["pd"] = pd_analyzer.view(now)
+    if cfg.use_mid_filter and cfg.mid_tf in analyzers:
+        ctx["mid"] = analyzers[cfg.mid_tf].view(now)
+
+    bias_view: TimeframeView = ctx["bias"]
+    if bias_view.prev_low is not None:
+        ctx["prev_day_range"] = (bias_view.prev_low, bias_view.prev_high)
+
+    day = day_index.get(london_day(entry[i].time))
+    if day:
+        ctx["day_known_from"] = day["start_idx"]
+        if day["asia_low"] is not None and day["asia_end_idx"] is not None \
+                and i >= day["asia_end_idx"]:
+            ctx["asia_range"] = (day["asia_low"], day["asia_high"])
+            ctx["asia_known_from"] = day["asia_end_idx"]
+    return ctx
+
+
+def run_backtest(data: dict[str, list[Candle]], cfg: Config,
+                 start_utc: datetime, end_utc: datetime) -> BacktestResult:
+    entry = data[cfg.entry_tf]
+    entry_atr = atr_series(entry, cfg.atr_period)
+    analyzers = {tf: TimeframeAnalyzer(tf, candles, cfg) for tf, candles in data.items()}
+    day_index = _day_index(entry)
+
+    balance = cfg.balance
+    trades: list[Trade] = []
+    equity: list[tuple[datetime, float]] = [(start_utc, balance)]
+    funnel: Counter = Counter()
+    position: Position | None = None
+    pending: PendingOrder | None = None
+    day = DayState(start_balance=balance)
+    last_setup_key: tuple | None = None
+    orders_placed = orders_filled = orders_expired = 0
+
+    def unit_value(volume: float) -> float:
+        return volume * cfg.contract_size
+
+    def close_position(pos: Position, price: float, when: datetime, bar_idx: int,
+                       reason: str) -> Trade:
+        nonlocal balance
+        volume = pos.volume - pos.closed_volume
+        sign = 1.0 if pos.setup.direction == "long" else -1.0
+        gross = pos.realized + sign * (price - pos.entry) * unit_value(volume)
+        costs = cfg.spread * unit_value(pos.volume) + cfg.commission_per_lot * pos.volume
+        pnl = gross - costs
+        balance += pnl
+        risk_usd = pos.risk_price * unit_value(pos.volume)
+        trade = Trade(
+            direction=pos.setup.direction, entry_time=pos.entry_time, entry=pos.entry,
+            sl=pos.initial_sl, tp=pos.tp, exit_time=when, exit=price, reason=reason,
+            pnl=pnl, r_multiple=pnl / risk_usd if risk_usd else 0.0, balance=balance,
+            risk_usd=risk_usd, rr_planned=pos.setup.rr, session=pos.setup.session,
+            swept=pos.setup.swept, poi=pos.setup.poi, judas=pos.setup.judas,
+            bars_held=bar_idx - pos.entry_bar,
+        )
+        trades.append(trade)
+        equity.append((when, balance))
+        return trade
+
+    start_idx = bisect_right([c.time for c in entry], start_utc)
+    if start_idx >= len(entry):
+        raise SystemExit(f"No {cfg.entry_tf} candles inside the test window "
+                         f"({start_utc:%Y-%m-%d} -> {end_utc:%Y-%m-%d}).")
+    i = start_idx
+    for i in range(start_idx, len(entry)):
+        bar = entry[i]
+        if bar.time >= end_utc:
+            break
+
+        # --- new London day: risk counters reset (document §6) ------------
+        today = london_day(bar.time)
+        if day.day != today:
+            day = DayState(day=today, start_balance=balance)
+
+        # --- fill a resting order ----------------------------------------
+        if position is None and pending is not None:
+            setup = pending.setup
+            if setup.order_kind == "market":
+                position = Position(
+                    setup=setup, entry=bar.open, entry_bar=i, entry_time=bar.time,
+                    sl=setup.sl, initial_sl=setup.sl, tp=setup.tp, volume=cfg.lot,
+                    risk_price=abs(bar.open - setup.sl))
+                pending = None
+                orders_filled += 1
+            else:
+                touched = bar.low <= setup.entry if setup.direction == "long" \
+                    else bar.high >= setup.entry
+                if touched:
+                    position = Position(
+                        setup=setup, entry=setup.entry, entry_bar=i, entry_time=bar.time,
+                        sl=setup.sl, initial_sl=setup.sl, tp=setup.tp, volume=cfg.lot,
+                        risk_price=abs(setup.entry - setup.sl))
+                    pending = None
+                    orders_filled += 1
+                elif i >= pending.expires_bar:
+                    pending = None
+                    orders_expired += 1
+
+        # --- manage an open trade (document §5, step 9) -------------------
+        if position is not None:
+            long = position.setup.direction == "long"
+            hit_sl = bar.low <= position.sl if long else bar.high >= position.sl
+            hit_tp = bar.high >= position.tp if long else bar.low <= position.tp
+
+            if hit_sl:      # stop is checked first — the pessimistic assumption
+                reason = "BE" if position.breakeven_done and \
+                    abs(position.sl - position.entry) < 1e-9 else "SL"
+                trade = close_position(position, position.sl, bar.time, i, reason)
+                position = None
+            elif hit_tp:
+                trade = close_position(position, position.tp, bar.time, i, "TP")
+                position = None
+            elif cfg.max_hold_bars and i - position.entry_bar >= cfg.max_hold_bars:
+                trade = close_position(position, bar.close, bar.time, i, "TIME")
+                position = None
+            else:
+                trade = None
+                risk = position.risk_price
+                reach = (bar.high - position.entry) if long else (position.entry - bar.low)
+                if cfg.partial_r > 0 and not position.partial_done and reach >= cfg.partial_r * risk:
+                    volume = position.volume * cfg.partial_fraction
+                    level = position.entry + (risk * cfg.partial_r) * (1 if long else -1)
+                    sign = 1.0 if long else -1.0
+                    position.realized += sign * (level - position.entry) * unit_value(volume)
+                    position.closed_volume += volume
+                    position.partial_done = True
+                if cfg.breakeven_r > 0 and not position.breakeven_done \
+                        and reach >= cfg.breakeven_r * risk:
+                    position.sl = position.entry
+                    position.breakeven_done = True
+
+            if trade is not None:
+                day.pnl += trade.pnl
+                day.consecutive_losses = day.consecutive_losses + 1 if trade.pnl < 0 else 0
+                if day.consecutive_losses >= cfg.max_consecutive_losses:
+                    day.blocked = True
+                if day.pnl <= -cfg.max_daily_loss_pct / 100.0 * day.start_balance:
+                    day.blocked = True
+
+        # --- look for the next setup on this closed bar -------------------
+        if position is None and pending is None and not day.blocked:
+            ctx = build_context(entry, i, analyzers, day_index, cfg)
+            setup = find_setup(entry, entry_atr, i, ctx, cfg, balance, funnel)
+            if setup is not None and setup.key != last_setup_key:
+                pending = PendingOrder(setup, expires_bar=i + cfg.order_expiry_bars)
+                last_setup_key = setup.key
+                orders_placed += 1
+
+    if position is not None:                       # still open at the last bar
+        last = entry[min(len(entry) - 1, i)]
+        close_position(position, last.close, last.time, i, "END")
+
+    return BacktestResult(trades=trades, equity=equity, funnel=funnel,
+                          orders_placed=orders_placed, orders_filled=orders_filled,
+                          orders_expired=orders_expired, start=start_utc,
+                          end=end_utc, cfg=cfg)
+
+
+# ===========================================================================
+# 8. REPORTING
+# ===========================================================================
+
+
+def max_drawdown(equity: list[tuple[datetime, float]]) -> tuple[float, float]:
+    peak = equity[0][1]
+    worst_abs = worst_pct = 0.0
+    for _, value in equity:
+        peak = max(peak, value)
+        drop = peak - value
+        if drop > worst_abs:
+            worst_abs = drop
+            worst_pct = drop / peak * 100.0 if peak else 0.0
+    return worst_abs, worst_pct
+
+
+def _streaks(trades: list[Trade]) -> tuple[int, int]:
+    best = worst = cur_w = cur_l = 0
+    for t in trades:
+        if t.pnl > 0:
+            cur_w, cur_l = cur_w + 1, 0
+        else:
+            cur_l, cur_w = cur_l + 1, 0
+        best, worst = max(best, cur_w), max(worst, cur_l)
+    return best, worst
+
+
+def print_report(result: BacktestResult, verbose: bool = False) -> None:
+    cfg = result.cfg
+    trades = result.trades
+    bar = "=" * 78
+
+    print()
+    print(bar)
+    print(f" ICT GOLD BACKTEST — {cfg.symbol}   "
+          f"{result.start:%Y-%m-%d} -> {result.end:%Y-%m-%d}  ({cfg.days} days)")
+    print(bar)
+    print(f" Account      : ${cfg.balance:,.2f}   lot {cfg.lot:g} "
+          f"(${cfg.value_per_unit:.2f} per $1.00 of gold)")
+    print(f" Risk rules   : {cfg.risk_pct:g}% max per trade, min RR 1:{cfg.min_rr:g}, "
+          f"stop after {cfg.max_consecutive_losses} losses/day, "
+          f"daily cap {cfg.max_daily_loss_pct:g}%")
+    print(f" Timeframes   : bias {cfg.bias_tf}"
+          f"{' + ' + cfg.mid_tf if cfg.use_mid_filter else ''}"
+          f" | liquidity {cfg.poi_tf} | entry {cfg.entry_tf}")
+    print(f" Kill zones   : {', '.join(cfg.sessions)} (London time)")
+    print(f" Costs        : spread ${cfg.spread:.2f}/round turn"
+          + (f", commission ${cfg.commission_per_lot:g}/lot" if cfg.commission_per_lot else ""))
+    print(bar)
+
+    if not trades:
+        print(" No trades were taken in this window.")
+        _print_funnel(result)
+        return
+
+    print(f"{'#':>3} {'entry (UTC)':<17}{'dir':<6}{'sess':<9}{'entry':>9}{'SL':>9}"
+          f"{'TP':>9}{'exit':>9}{'why':>5}{'R':>7}{'P/L $':>9}{'bal $':>10}")
+    print("-" * 78)
+    for n, t in enumerate(trades, 1):
+        print(f"{n:>3} {t.entry_time:%Y-%m-%d %H:%M} "
+              f"{t.direction:<6}{t.session:<9}{t.entry:>9.2f}{t.sl:>9.2f}{t.tp:>9.2f}"
+              f"{t.exit:>9.2f}{t.reason:>5}{t.r_multiple:>7.2f}{t.pnl:>9.2f}{t.balance:>10.2f}")
+    print("-" * 78)
+
+    wins = [t for t in trades if t.pnl > 0]
+    losses = [t for t in trades if t.pnl <= 0]
+    gross_win = sum(t.pnl for t in wins)
+    gross_loss = -sum(t.pnl for t in losses)
+    net = sum(t.pnl for t in trades)
+    dd_abs, dd_pct = max_drawdown(result.equity)
+    best_streak, worst_streak = _streaks(trades)
+    final = cfg.balance + net
+
+    print(" RESULTS")
+    print(f"   Trades           : {len(trades)}   "
+          f"(wins {len(wins)} / losses {len(losses)})")
+    print(f"   Win rate         : {len(wins) / len(trades) * 100:.1f}%")
+    print(f"   Net P/L          : ${net:+,.2f}   ({net / cfg.balance * 100:+.2f}% of start)")
+    print(f"   Final balance    : ${final:,.2f}")
+    print(f"   Gross profit     : ${gross_win:,.2f}    gross loss: ${gross_loss:,.2f}")
+    print(f"   Profit factor    : "
+          + (f"{gross_win / gross_loss:.2f}" if gross_loss else "n/a (no losses)"))
+    print(f"   Expectancy       : {sum(t.r_multiple for t in trades) / len(trades):+.2f} R "
+          f"(${net / len(trades):+.2f}) per trade")
+    print(f"   Avg risk / trade : ${sum(t.risk_usd for t in trades) / len(trades):.2f} "
+          f"({sum(t.risk_usd for t in trades) / len(trades) / cfg.balance * 100:.2f}% of start)")
+    print(f"   Best / worst     : ${max(t.pnl for t in trades):+,.2f} / "
+          f"${min(t.pnl for t in trades):+,.2f}")
+    print(f"   Max drawdown     : ${dd_abs:,.2f} ({dd_pct:.2f}%)")
+    print(f"   Longest streak   : {best_streak} wins / {worst_streak} losses")
+    print(f"   Avg hold         : {sum(t.bars_held for t in trades) / len(trades):.0f} "
+          f"{cfg.entry_tf} bars    avg planned RR: "
+          f"1:{sum(t.rr_planned for t in trades) / len(trades):.2f}")
+
+    by_reason = Counter(t.reason for t in trades)
+    print(f"   Exits            : " + ", ".join(f"{k} {v}" for k, v in by_reason.most_common()))
+    for label, key in (("By direction     ", "direction"), ("By kill zone     ", "session"),
+                       ("By liquidity     ", "swept")):
+        groups: dict[str, list[Trade]] = {}
+        for t in trades:
+            groups.setdefault(getattr(t, key), []).append(t)
+        parts = [f"{name} {len(g)}t ${sum(x.pnl for x in g):+.2f}"
+                 for name, g in sorted(groups.items())]
+        print(f"   {label}: " + ", ".join(parts))
+
+    judas = [t for t in trades if t.judas]
+    if judas:
+        print(f"   Judas swings     : {len(judas)} trades, "
+              f"${sum(t.pnl for t in judas):+,.2f}")
+    print(bar)
+    _print_funnel(result, verbose)
+
+
+def _print_funnel(result: BacktestResult, verbose: bool = True) -> None:
+    if not verbose:
+        return
+    print(f" SIGNAL FUNNEL — how many {result.cfg.entry_tf} bars survived each step of the plan")
+    width = max(len(s) for s in PLAN_STAGES) + 2
+    print(f"   {'0  bars evaluated':<{width}} {result.funnel['0  bars evaluated']:>7}")
+    for stage in PLAN_STAGES:
+        print(f"   {stage:<{width}} {result.funnel[stage]:>7}")
+    print(f"   {'-> orders placed':<{width}} {result.orders_placed:>7}")
+    print(f"   {'-> orders filled':<{width}} {result.orders_filled:>7}")
+    print(f"   {'-> expired unfilled':<{width}} {result.orders_expired:>7}")
+    print("=" * 78)
+
+
+def write_trades_csv(path: str, trades: list[Trade]) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["entry_time", "exit_time", "direction", "session", "swept", "poi",
+                    "judas", "entry", "sl", "tp", "exit", "reason", "rr_planned",
+                    "risk_usd", "r_multiple", "pnl", "balance", "bars_held"])
+        for t in trades:
+            w.writerow([t.entry_time.isoformat(), t.exit_time.isoformat(), t.direction,
+                        t.session, t.swept, t.poi, int(t.judas), f"{t.entry:.2f}",
+                        f"{t.sl:.2f}", f"{t.tp:.2f}", f"{t.exit:.2f}", t.reason,
+                        f"{t.rr_planned:.2f}", f"{t.risk_usd:.2f}", f"{t.r_multiple:.3f}",
+                        f"{t.pnl:.2f}", f"{t.balance:.2f}", t.bars_held])
+    print(f"[out] {len(trades)} trades written to {path}")
+
+
+# ===========================================================================
+# 9. LIVE SCAN — the same rules applied to the newest closed bar
+# ===========================================================================
+
+
+def scan_now(data: dict[str, list[Candle]], cfg: Config) -> None:
+    entry = data[cfg.entry_tf]
+    entry_atr = atr_series(entry, cfg.atr_period)
+    analyzers = {tf: TimeframeAnalyzer(tf, candles, cfg) for tf, candles in data.items()}
+    day_index = _day_index(entry)
+
+    i = len(entry) - 1
+    bar = entry[i]
+    ctx = build_context(entry, i, analyzers, day_index, cfg)
+    funnel: Counter = Counter()
+    setup = find_setup(entry, entry_atr, i, ctx, cfg, cfg.balance, funnel)
+
+    bias_view: TimeframeView = ctx["bias"]
+    poi_view: TimeframeView = ctx["poi"]
+    session = active_session(bar.time, cfg.sessions)
+
+    print()
+    print("=" * 78)
+    print(f" LIVE SCAN — {cfg.symbol} on the {cfg.entry_tf} close of "
+          f"{bar.time:%Y-%m-%d %H:%M} UTC ({to_london(bar.time):%H:%M} London)")
+    print("=" * 78)
+    print(f" Price            : {bar.close:.2f}")
+    print(f" {cfg.bias_tf} bias          : {bias_view.bias or 'undefined'}")
+    if ctx.get("mid"):
+        print(f" {cfg.mid_tf} bias          : {ctx['mid'].bias or 'undefined'}")
+    pd_view: TimeframeView = ctx.get("pd") or bias_view
+    if pd_view.equilibrium:
+        zone = "premium" if bar.close > pd_view.equilibrium else "discount"
+        print(f" {cfg.pd_tf} range         : {pd_view.range_low:.2f} - {pd_view.range_high:.2f}"
+              f"   equilibrium {pd_view.equilibrium:.2f}  ->  price in {zone}")
+    print(f" Kill zone        : {session or 'outside ' + '/'.join(cfg.sessions)}")
+    if ctx.get("asia_range"):
+        print(f" Asia range today : {ctx['asia_range'][0]:.2f} - {ctx['asia_range'][1]:.2f}")
+    if ctx.get("prev_day_range"):
+        print(f" Previous {cfg.bias_tf}      : {ctx['prev_day_range'][0]:.2f} - "
+              f"{ctx['prev_day_range'][1]:.2f}")
+
+    above = sorted({p.level for p in poi_view.pools if p.level > bar.close})[:3]
+    below = sorted({p.level for p in poi_view.pools if p.level < bar.close}, reverse=True)[:3]
+    print(f" Buy-side pools   : {', '.join(f'{x:.2f}' for x in above) or '-'}")
+    print(f" Sell-side pools  : {', '.join(f'{x:.2f}' for x in below) or '-'}")
+    print("-" * 78)
+
+    if setup is None:
+        print(" No valid setup on this bar — pre-trade checklist (document §8):")
+        for stage in PLAN_STAGES:
+            print(f"   [{'x' if funnel[stage] else ' '}] {stage}")
+        print(" The first unticked box is what this setup is still waiting for.")
+    else:
+        print(f" SETUP: {setup.direction.upper()}  ({setup.order_kind} order)")
+        print(f"   Entry          : {setup.entry:.2f}")
+        print(f"   Stop loss      : {setup.sl:.2f}   "
+              f"(risk ${setup.risk_usd:.2f} at {cfg.lot:g} lot)")
+        print(f"   Take profit    : {setup.tp:.2f}   (RR 1:{setup.rr:.2f})")
+        print(f"   Liquidity taken: {setup.swept}"
+              + ("  [Judas swing]" if setup.judas else ""))
+        print(f"   Entry zone     : {setup.poi} inside the "
+              f"{cfg.ote_low:.3f}-{cfg.ote_high:.2f} OTE band")
+        print(f"   Kill zone      : {setup.session}")
+    print("=" * 78)
+
+
+# ===========================================================================
+# 10. CLI
+# ===========================================================================
+
+
+def parse_blackouts(raw: str | None, minutes: int) -> list[tuple[datetime, datetime]]:
+    """News blackout windows (document §7): --blackout 2026-08-01T12:30,..."""
+    if not raw:
+        return []
+    windows = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        when = datetime.fromisoformat(item).replace(tzinfo=timezone.utc)
+        windows.append((when - timedelta(minutes=minutes), when + timedelta(minutes=minutes)))
+    return windows
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="ICT XAU/USD strategy: MetaTrader 5 data feed, rule engine, "
+                    "and a 30-day backtest on a $1,000 / 0.01-lot account.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("mode", nargs="?", default="backtest",
+                   choices=["backtest", "scan", "export"],
+                   help="backtest the last N days, scan live data now, or export candles to CSV")
+
+    g = p.add_argument_group("data")
+    g.add_argument("--source", choices=["mt5", "csv"], default="mt5")
+    g.add_argument("--csv-dir", default="data", help="folder for exported candles")
+    g.add_argument("--symbol", default="XAUUSD")
+    g.add_argument("--days", type=int, default=30, help="length of the backtest window")
+    g.add_argument("--broker-utc-offset", type=float, default=None,
+                   help="broker server clock vs UTC (default: auto-detect)")
+    g.add_argument("--mt5-login", type=int, default=None)
+    g.add_argument("--mt5-password", default=None)
+    g.add_argument("--mt5-server", default=None)
+    g.add_argument("--mt5-path", default=None, help="path to terminal64.exe")
+
+    g = p.add_argument_group("account")
+    g.add_argument("--balance", type=float, default=1000.0)
+    g.add_argument("--lot", type=float, default=0.01)
+    g.add_argument("--contract-size", type=float, default=100.0,
+                   help="ounces per 1.00 lot (0.01 lot x 100 = $1 per $1 move)")
+    g.add_argument("--spread", type=float, default=0.20, help="price units, per round turn")
+    g.add_argument("--commission", type=float, default=0.0, help="$ per lot, round turn")
+
+    g = p.add_argument_group("risk (document section 6)")
+    g.add_argument("--risk-pct", type=float, default=1.0)
+    g.add_argument("--min-rr", type=float, default=2.0)
+    g.add_argument("--max-consecutive-losses", type=int, default=2)
+    g.add_argument("--max-daily-loss-pct", type=float, default=3.0)
+
+    g = p.add_argument_group("strategy")
+    g.add_argument("--sessions", default="london,newyork",
+                   help="kill zones to trade: " + ",".join(KILL_ZONES))
+    g.add_argument("--entry-tf", default="M5", choices=["M5", "M15", "M30"])
+    g.add_argument("--poi-tf", default="H1", choices=["M30", "H1", "H4"])
+    g.add_argument("--bias-tf", default="D1", choices=["H4", "D1"])
+    g.add_argument("--pd-tf", default="H4", choices=["H1", "H4", "D1"],
+                   help="timeframe whose dealing range defines premium/discount "
+                        "(D1 is the strictest reading of the document)")
+    g.add_argument("--no-mid-filter", action="store_true",
+                   help="drop the H4 bias-alignment filter")
+    g.add_argument("--no-pd-filter", action="store_true",
+                   help="drop the premium/discount filter (OTE still applies)")
+    g.add_argument("--no-poi", action="store_true",
+                   help="allow an OTE entry without an order block / FVG")
+    g.add_argument("--tp-mode", choices=["nearest", "first-valid"], default="nearest",
+                   help="'nearest' follows the document: nearest pool, skip if RR < min")
+    g.add_argument("--sweep-lookback", type=int, default=72,
+                   help="entry-TF bars searched backwards for a liquidity sweep")
+    g.add_argument("--choch-max-bars", type=int, default=24,
+                   help="the CHoCH must follow the sweep within this many bars")
+    g.add_argument("--displacement-atr", type=float, default=1.2)
+    g.add_argument("--min-leg-atr", type=float, default=1.5,
+                   help="minimum impulse-leg size, in entry-TF ATR")
+    g.add_argument("--min-sl-atr", type=float, default=1.0,
+                   help="minimum stop distance in ATR (a tighter stop is spread noise)")
+    g.add_argument("--min-sl-distance", type=float, default=1.0,
+                   help="absolute floor under the stop distance, in dollars")
+    g.add_argument("--order-expiry-bars", type=int, default=24)
+    g.add_argument("--max-hold-bars", type=int, default=288, help="0 = hold until SL/TP")
+    g.add_argument("--breakeven-r", type=float, default=1.0, help="0 = never move the stop")
+    g.add_argument("--partial-r", type=float, default=0.0,
+                   help="take partial profit at xR (needs lot >= 2x the broker minimum)")
+    g.add_argument("--partial-fraction", type=float, default=0.5)
+    g.add_argument("--blackout", default=None,
+                   help="comma-separated UTC news times, e.g. 2026-08-01T12:30")
+    g.add_argument("--blackout-minutes", type=int, default=30)
+
+    g = p.add_argument_group("output")
+    g.add_argument("--verbose", action="store_true", help="print the signal funnel")
+    g.add_argument("--csv-out", default=None, help="write the trade list to this CSV")
+    return p
+
+
+def config_from_args(args: argparse.Namespace) -> Config:
+    sessions = tuple(s.strip() for s in args.sessions.split(",") if s.strip())
+    unknown = [s for s in sessions if s not in KILL_ZONES]
+    if unknown:
+        raise SystemExit(f"Unknown kill zone(s): {', '.join(unknown)}. "
+                         f"Choose from: {', '.join(KILL_ZONES)}")
+    if args.partial_r > 0 and args.lot < 0.02:
+        raise SystemExit(
+            f"--partial-r needs a lot of at least 0.02: a partial close of {args.lot:g} "
+            "would leave less than the 0.01 broker minimum. Run without --partial-r, "
+            "or size up.")
+
+    return Config(
+        symbol=args.symbol, balance=args.balance, lot=args.lot,
+        contract_size=args.contract_size, spread=args.spread,
+        commission_per_lot=args.commission, days=args.days,
+        bias_tf=args.bias_tf, poi_tf=args.poi_tf, entry_tf=args.entry_tf,
+        pd_tf=args.pd_tf, use_mid_filter=not args.no_mid_filter,
+        use_pd_filter=not args.no_pd_filter,
+        risk_pct=args.risk_pct, min_rr=args.min_rr,
+        max_consecutive_losses=args.max_consecutive_losses,
+        max_daily_loss_pct=args.max_daily_loss_pct,
+        displacement_atr=args.displacement_atr, sweep_lookback=args.sweep_lookback,
+        choch_max_bars=args.choch_max_bars,
+        min_leg_atr=args.min_leg_atr, min_sl_atr=args.min_sl_atr,
+        min_sl_distance=args.min_sl_distance, require_poi=not args.no_poi,
+        tp_mode=args.tp_mode, order_expiry_bars=args.order_expiry_bars,
+        max_hold_bars=args.max_hold_bars, breakeven_r=args.breakeven_r,
+        partial_r=args.partial_r, partial_fraction=args.partial_fraction,
+        sessions=sessions,
+        blackouts=parse_blackouts(args.blackout, args.blackout_minutes),
+        source=args.source, csv_dir=args.csv_dir,
+        broker_utc_offset=args.broker_utc_offset, mt5_login=args.mt5_login,
+        mt5_password=args.mt5_password, mt5_server=args.mt5_server,
+        mt5_path=args.mt5_path,
+    )
+
+
+def drop_forming_candles(data: dict[str, list[Candle]], now: datetime) -> None:
+    """A backtest may only ever see finished candles."""
+    for tf, candles in data.items():
+        step = timedelta(minutes=TF_MINUTES[tf])
+        data[tf] = [c for c in candles if c.time + step <= now]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg = config_from_args(args)
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+    if args.mode == "export":
+        cfg.source = "mt5"
+        data = load_dataset(cfg, now)
+        for tf, candles in data.items():
+            path = os.path.join(cfg.csv_dir, f"{cfg.symbol}_{tf}.csv")
+            save_csv(path, candles)
+            print(f"[out] {len(candles):>6} {tf} candles -> {path}")
+        return 0
+
+    data = load_dataset(cfg, now)
+    drop_forming_candles(data, now)
+
+    if args.mode == "scan":
+        scan_now(data, cfg)
+        return 0
+
+    # the window ends at the last closed entry-timeframe bar we actually have
+    end_utc = data[cfg.entry_tf][-1].time + timedelta(minutes=TF_MINUTES[cfg.entry_tf])
+    start_utc = end_utc - timedelta(days=cfg.days)
+    result = run_backtest(data, cfg, start_utc, end_utc)
+    print_report(result, verbose=args.verbose)
+    if args.csv_out:
+        write_trades_csv(args.csv_out, result.trades)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
