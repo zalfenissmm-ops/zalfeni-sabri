@@ -53,7 +53,7 @@ from datetime import datetime, timedelta, timezone
 
 # Bumped whenever behaviour changes, and printed on every run: the fastest way
 # to tell whether the file in front of you is the one being talked about.
-VERSION = "1.4"
+VERSION = "1.5"
 
 TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
 
