@@ -41,6 +41,8 @@ Layout of this file:
     8. cli           argument parsing
 """
 
+VERSION = "1.1"
+
 import argparse
 import csv
 import os
@@ -1423,6 +1425,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"smc {VERSION}")
     sub = p.add_subparsers(dest="command", required=True)
     fmt = argparse.ArgumentDefaultsHelpFormatter
 
