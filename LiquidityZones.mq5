@@ -41,7 +41,7 @@ input double            InpToleranceATR  = 0.25;   // Cluster tolerance (x ATR)
 input int               InpATRPeriod     = 14;     // ATR period
 input int               InpLookbackBars  = 500;    // Bars to scan
 input int               InpMinTouches    = 1;      // Minimum touches per zone
-input int               InpMaxZones      = 12;     // Max zones drawn (best score first)
+input int               InpMaxZones      = 20;     // Max zones drawn (best score first)
 input double            InpMinScore      = 0.0;    // Minimum score to draw (0-100)
 //--- reference levels ----------------------------------------------
 input group             "Reference levels"
@@ -65,6 +65,13 @@ input bool              InpFillZones     = true;   // Fill zone rectangles
 input bool              InpShowLabels    = true;   // Show zone labels
 input int               InpLabelFontSize = 8;      // Label font size
 input int               InpExtendBars    = 10;     // Extend zones to the right (bars)
+//--- sweeps --------------------------------------------------------
+input group             "Liquidity sweeps"
+input bool              InpShowSweeps    = true;   // Mark every liquidity sweep (stop hunt)
+input int               InpMaxSweeps     = 40;     // Max sweep markers drawn (newest first)
+input bool              InpShowSweepLines= true;   // Draw the level each sweep took
+input color             InpSweepHighColor= clrOrangeRed;    // Buy-side sweep (highs taken)
+input color             InpSweepLowColor = clrDeepSkyBlue;  // Sell-side sweep (lows taken)
 //--- alerts --------------------------------------------------------
 input group             "Alerts"
 input bool              InpAlertOnSweep  = true;   // Alert when a zone gets swept
@@ -100,12 +107,23 @@ struct LiquidityZone
    string            tags;
   };
 
+struct SweepEvent
+  {
+   int               bar;      // the candle that grabbed the liquidity
+   int               fromBar;  // the swing whose level was taken
+   double            level;    // the level that was swept
+   double            extreme;  // wick extreme of the sweep candle
+   bool              isHigh;   // true = buy-side (highs taken), false = sell-side
+  };
+
 //--- globals -------------------------------------------------------
 double         BufAbove[];
 double         BufBelow[];
 int            g_atrHandle  = INVALID_HANDLE;
 LiquidityZone  g_zones[];
 int            g_zoneCount  = 0;
+SweepEvent     g_sweeps[];
+int            g_sweepCount = 0;
 double         g_atr        = 0.0;
 double         g_tolerance  = 0.0;
 datetime       g_lastBar    = 0;
@@ -306,8 +324,12 @@ int CollectSwings(const double &price[], const int rates_total, const int from,
       points[count].price = price[i];
       count++;
      }
+   return(count);   // in bar order — clustering sorts by price separately
+  }
 
-   //--- insertion sort by price (swing counts are small)
+//+------------------------------------------------------------------+
+void SortSwingsByPrice(SwingPoint &points[], const int count)
+  {
    for(int i = 1; i < count; i++)
      {
       SwingPoint key = points[i];
@@ -319,7 +341,69 @@ int CollectSwings(const double &price[], const int rates_total, const int from,
         }
       points[j + 1] = key;
      }
-   return(count);
+  }
+
+//+------------------------------------------------------------------+
+void AddSweep(const int bar, const int fromBar, const double level, const double extreme, const bool isHigh)
+  {
+   ArrayResize(g_sweeps, g_sweepCount + 1);
+   g_sweeps[g_sweepCount].bar     = bar;
+   g_sweeps[g_sweepCount].fromBar = fromBar;
+   g_sweeps[g_sweepCount].level   = level;
+   g_sweeps[g_sweepCount].extreme = extreme;
+   g_sweeps[g_sweepCount].isHigh  = isHigh;
+   g_sweepCount++;
+  }
+
+//+------------------------------------------------------------------+
+//| Every stop hunt, not just the ones inside a drawn zone: a candle  |
+//| whose wick takes the last confirmed swing and closes back inside. |
+//| A level exceeded on the close is a break, not a sweep, and either |
+//| way that level is consumed and no longer armed.                   |
+//+------------------------------------------------------------------+
+void DetectSweeps(const double &high[], const double &low[], const double &close[],
+                  const int rates_total, const int from)
+  {
+   g_sweepCount = 0;
+   ArrayFree(g_sweeps);
+   if(!InpShowSweeps)
+      return;
+
+   SwingPoint highs[], lows[];
+   int nHighs = CollectSwings(high, rates_total, from, true, highs);
+   int nLows  = CollectSwings(low, rates_total, from, false, lows);
+
+   int    w   = (int)MathMax(1, InpSwingWindow);
+   double eps = _Point * 0.5;
+   int    hp = 0, lp = 0;      // next swing waiting to be confirmed
+   int    armedHigh = -1, armedLow = -1;
+
+   for(int i = from; i < rates_total; i++)
+     {
+      while(hp < nHighs && highs[hp].bar + w <= i)
+        {
+         armedHigh = hp;
+         hp++;
+        }
+      while(lp < nLows && lows[lp].bar + w <= i)
+        {
+         armedLow = lp;
+         lp++;
+        }
+
+      if(armedHigh >= 0 && high[i] > highs[armedHigh].price + eps)
+        {
+         if(close[i] < highs[armedHigh].price)
+            AddSweep(i, highs[armedHigh].bar, highs[armedHigh].price, high[i], true);
+         armedHigh = -1;
+        }
+      if(armedLow >= 0 && low[i] < lows[armedLow].price - eps)
+        {
+         if(close[i] > lows[armedLow].price)
+            AddSweep(i, lows[armedLow].bar, lows[armedLow].price, low[i], false);
+         armedLow = -1;
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -426,6 +510,7 @@ void BuildSide(const bool isHigh, const double &price[], const double &high[], c
    int total = CollectSwings(price, rates_total, from, isHigh, points);
    if(total <= 0)
       return;
+   SortSwingsByPrice(points, total);
 
    double pad = g_tolerance * 0.5;
    int    i   = 0;
@@ -516,6 +601,7 @@ void RebuildZones(const datetime &time[], const double &high[], const double &lo
    BuildSide(true,  high, high, low, close, tick_volume, rates_total, from, refs, refCount, avgVolume);
    BuildSide(false, low,  high, low, close, tick_volume, rates_total, from, refs, refCount, avgVolume);
    SortZonesByScore();
+   DetectSweeps(high, low, close, rates_total, from);
   }
 
 //+------------------------------------------------------------------+
@@ -540,7 +626,6 @@ string StatusName(const int status)
 //+------------------------------------------------------------------+
 void DrawZones(const datetime &time[], const int rates_total)
   {
-   ObjectsDeleteAll(0, PREFIX);
    datetime rightEdge = time[rates_total - 1] + (datetime)(PeriodSeconds() * (int)MathMax(1, InpExtendBars));
 
    int drawn = 0;
@@ -594,6 +679,60 @@ void DrawZones(const datetime &time[], const int rates_total)
            }
         }
      }
+  }
+
+//+------------------------------------------------------------------+
+//| One arrow per stop hunt, plus the level it took                   |
+//+------------------------------------------------------------------+
+void DrawSweeps(const datetime &time[], const int rates_total)
+  {
+   if(!InpShowSweeps)
+      return;
+
+   double pad   = (g_atr > 0.0) ? g_atr * 0.15 : _Point * 10;
+   int    drawn = 0;
+   for(int s = g_sweepCount - 1; s >= 0 && drawn < InpMaxSweeps; s--)
+     {
+      SweepEvent sweep = g_sweeps[s];
+      color clr  = sweep.isHigh ? InpSweepHighColor : InpSweepLowColor;
+      string tag = PREFIX + "S" + IntegerToString(s);
+      drawn++;
+
+      string arrow = tag + "_arw";
+      double at    = sweep.isHigh ? sweep.extreme + pad : sweep.extreme - pad;
+      if(ObjectCreate(0, arrow, sweep.isHigh ? OBJ_ARROW_DOWN : OBJ_ARROW_UP, 0, time[sweep.bar], at))
+        {
+         ObjectSetInteger(0, arrow, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, arrow, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, arrow, OBJPROP_ANCHOR, sweep.isHigh ? ANCHOR_BOTTOM : ANCHOR_TOP);
+         ObjectSetInteger(0, arrow, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, arrow, OBJPROP_HIDDEN, true);
+         ObjectSetString(0, arrow, OBJPROP_TOOLTIP,
+                         StringFormat("%s liquidity swept at %s",
+                                      sweep.isHigh ? "Buy-side" : "Sell-side",
+                                      DoubleToString(sweep.level, _Digits)));
+        }
+
+      if(!InpShowSweepLines)
+         continue;
+      string line = tag + "_lvl";
+      if(ObjectCreate(0, line, OBJ_TREND, 0, time[sweep.fromBar], sweep.level, time[sweep.bar], sweep.level))
+        {
+         ObjectSetInteger(0, line, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, line, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, line, OBJPROP_RAY_RIGHT, false);
+         ObjectSetInteger(0, line, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, line, OBJPROP_HIDDEN, true);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+void Redraw(const datetime &time[], const int rates_total)
+  {
+   ObjectsDeleteAll(0, PREFIX);
+   DrawZones(time, rates_total);
+   DrawSweeps(time, rates_total);
    ChartRedraw();
   }
 
@@ -692,12 +831,12 @@ int OnCalculate(const int rates_total,
      {
       g_lastBar = time[rates_total - 1];
       RebuildZones(time, high, low, close, tick_volume, rates_total);
-      DrawZones(time, rates_total);
+      Redraw(time, rates_total);
      }
    else if(CheckLiveSweep(high, low, time, rates_total))
      {
       SortZonesByScore();
-      DrawZones(time, rates_total);
+      Redraw(time, rates_total);
      }
 
    PublishTargets(close[rates_total - 1], rates_total);
