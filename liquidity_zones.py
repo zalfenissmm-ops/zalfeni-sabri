@@ -184,9 +184,9 @@ def round_number_bonus(level: float) -> tuple[float, str | None]:
     """Psychological levels (…00 / …50) collect pending orders on their own."""
     if level <= 0:
         return 0.0, None
-    step = 10 ** math.floor(math.log10(level) - 2)
+    step = 10 ** math.floor(math.log10(level) - 3)
     for size, points, tag in ((step * 10, 8.0, "major-round"), (step * 5, 4.0, "round")):
-        if abs(level - round(level / size) * size) <= size * 0.1:
+        if abs(level - round(level / size) * size) <= size * 0.05:
             return points, tag
     return 0.0, None
 

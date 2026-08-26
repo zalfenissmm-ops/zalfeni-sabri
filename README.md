@@ -119,12 +119,12 @@ ATR(14)           : 1.36046  (cluster tolerance = 0.34012)
 Reference levels  : PDH=103.72440  PDL=94.46890  Asia High=111.99240  Asia Low=103.74000
 
 Liquidity zones (top 5 by score):
-  below low      94.46890 (94.46890-94.54780)  touches=2  untapped score= 59.9  -4.54% (-3.3 ATR)  [EQL, PDL, round]
-  above high    111.99240 (111.99240-111.99240)  touches=1  untapped score= 52.4  +13.17% (+9.6 ATR)  [Asia High]
-  above high    110.35800 (110.05720-110.35800)  touches=2  broken   score=  7.5  +11.52% (+8.4 ATR)  [EQH, major-round]
+  above high    111.99240 (111.99240-111.99240)  touches=1  untapped score= 61.1  +13.17% (+9.6 ATR)  [Asia High, major-round]
+  below low      94.46890 (94.46890-94.54780)  touches=2  untapped score= 55.6  -4.54% (-3.3 ATR)  [EQL, PDL]
+  above high    110.35800 (110.05720-110.35800)  touches=2  broken   score=  5.3  +11.52% (+8.4 ATR)  [EQH]
 
 Targets:
-  Nearest untapped below: below low      94.46890 (...)  touches=2  untapped score= 59.9  [EQL, PDL, round]
+  Nearest untapped below: below low      94.46890 (...)  touches=2  untapped score= 55.6  [EQL, PDL]
 ```
 
 ### كيف تستخدمها عمليًا
@@ -135,3 +135,64 @@ Targets:
 3. الدخول لا يكون *عند* المنطقة، بل بعد أن تُستهدف (`swept`) ثم يتغيّر الهيكل —
    وهذا ما يكتشفه `smc_strategy.py` عبر CHoCH + Order Block.
 4. الستوب يوضع خلف طرف المنطقة الممسوحة، لا داخلها.
+
+---
+
+## مؤشر MT5 — LiquidityZones.mq5
+
+نفس المنهج فوق، لكن **مؤشر MQL5 يرسم مناطق السيولة على شارت ميتاتريدر 5 مباشرة**.
+
+### التركيب
+
+1. انسخ `LiquidityZones.mq5` إلى مجلد `MQL5\Indicators` عندك
+   (من الميتاتريدر: File → Open Data Folder → MQL5 → Indicators).
+2. افتح الملف في MetaEditor واضغط **Compile** (F7).
+3. من نافذة Navigator اسحب المؤشر على الشارت.
+
+### شنو يرسم
+
+- **مستطيل + خط** لكل منطقة سيولة. الخط هو **طرف التجمّع** (أعلى قمة/أدنى قاع)،
+  والمستطيل هو جيب الأوامر اللي واقفة **خلف** الطرف (يمتدّ نصف السماحية بعده).
+- **أحمر (Tomato)** = سيولة فوق السعر (ستوبات الشراء / Buy-side).
+  **أزرق (DodgerBlue)** = سيولة تحت السعر (ستوبات البيع / Sell-side).
+  **رمادي متقطّع** = منطقة اتاخدت خلاص (swept أو broken).
+- **لِيبل** على يمين كل منطقة فيه: النوع والوسوم (EQH / PDH / Asia High / 00 …)،
+  عدد اللمسات، الدرجة من 100، والحالة.
+
+### الإعدادات المهمة
+
+| الإعداد | الافتراضي | شنو يعمل |
+|---|---|---|
+| `InpSwingWindow` | 3 | نافذة القمم/القيعان — أصغر = مستويات أكثر وأقرب |
+| `InpToleranceATR` | 0.25 | عرض التجمّع بوحدات ATR (يتكيّف مع تذبذب الزوج) |
+| `InpLookbackBars` | 500 | عدد الشمعات المفحوصة |
+| `InpMinTouches` | 1 | خلّيه 2 باش ما يرسم غير القمم/القيعان المتساوية |
+| `InpMaxZones` | 12 | عدد المناطق المرسومة (الأعلى درجة أولاً) |
+| `InpMinScore` | 0 | فلترة بالدرجة — 50 مثلاً يخلّي القوي برك |
+| `InpShowSwept` / `InpShowBroken` | true / false | إظهار السيولة المستهلَكة |
+| `InpUsePrevDay` / `InpUsePrevWeek` / `InpUseSessions` | true | المستويات المرجعية اللي تزيد الدرجة |
+| `InpAsiaStart` … `InpNewYorkEnd` | 0/8/8/13/13/22 | ساعات الجلسات **بتوقيت السيرفر** (عدّلها حسب بروكرك) |
+| `InpAlertOnSweep` | true | تنبيه لحظي أول ما السعر ياخد منطقة غير مستهدفة |
+
+### للاستخدام من إكسبيرت (EA)
+
+المؤشر ينشر مستويين جاهزين للقراءة بـ `iCustom`:
+
+```mql5
+int handle = iCustom(_Symbol, _Period, "LiquidityZones");
+double above[], below[];
+CopyBuffer(handle, 0, 0, 1, above);   // أقرب سيولة غير مستهدفة فوق السعر
+CopyBuffer(handle, 1, 0, 1, below);   // أقرب سيولة غير مستهدفة تحت السعر
+```
+
+القيمة `EMPTY_VALUE` معناها ما فماش منطقة غير مستهدفة في تلك الجهة.
+
+### طريقة القراءة على الشارت
+
+1. شغّله على الفريم الكبير (H4/D1) باش تشوف بركة السيولة الكبرى، وخلّيه على فريم
+   التنفيذ باش تشوف السيولة القريبة.
+2. المناطق **الملوّنة (untapped)** هي الأهداف. الرمادية راحت — ما تلاحقهاش.
+3. أقوى إعداد: منطقة درجتها عالية + عليها وسم مرجعي (PDH/PDL أو Asia High/Low)
+   + ما اتلمستش. السعر عادةً يمشي ياخدها قبل ما يرجع في اتجاهه.
+4. لمّا يجيك تنبيه sweep: السيولة اتشفطت — استنّى تغيّر الهيكل (CHoCH) وادخل عكس
+   الشمعة اللي شفطت، والستوب خلف ذيلها.
