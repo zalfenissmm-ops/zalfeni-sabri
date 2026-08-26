@@ -12,6 +12,7 @@ Usage:
     python3 trend_identifier.py data.csv [--ema 50] [--adx-period 14] [--swing 5]
 
 CSV must have a header row with columns: date,open,high,low,close
+(an optional `volume` column is read when present)
 """
 
 import argparse
@@ -27,6 +28,7 @@ class Candle:
     high: float
     low: float
     close: float
+    volume: float | None = None
 
 
 def load_candles(path: str) -> list[Candle]:
@@ -34,6 +36,7 @@ def load_candles(path: str) -> list[Candle]:
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            raw_volume = (row.get("volume") or "").strip()
             candles.append(
                 Candle(
                     date=row["date"],
@@ -41,6 +44,7 @@ def load_candles(path: str) -> list[Candle]:
                     high=float(row["high"]),
                     low=float(row["low"]),
                     close=float(row["close"]),
+                    volume=float(raw_volume) if raw_volume else None,
                 )
             )
     if len(candles) < 2:
