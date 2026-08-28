@@ -1,0 +1,32 @@
+{
+  "symbols": ["EURUSD"],
+  "volume": 0.05,
+  "timeframe": "M1",
+
+  "target_profit_min_usd": 1.0,
+  "target_profit_max_usd": 3.0,
+  "atr_target_fraction": 0.5,
+  "commission_per_lot_usd": 7.0,
+
+  "stop_loss_ratio": 1.0,
+  "max_loss_per_trade_usd": 3.0,
+  "daily_loss_limit_usd": 20.0,
+  "daily_profit_target_usd": 30.0,
+
+  "max_spread_points": 15,
+  "max_spread_to_target_ratio": 0.35,
+  "max_target_atr_multiple": 2.0,
+
+  "max_open_positions": 2,
+  "max_positions_per_symbol": 1,
+  "max_hold_seconds": 900,
+  "breakeven_at_fraction": 0.6,
+  "cooldown_seconds": 30,
+  "max_trades_per_day": 40,
+
+  "poll_seconds": 1.0,
+  "magic": 20260828,
+  "blackout_windows": ["23:56-00:06"],
+  "journal_path": "trades.csv",
+  "log_path": "bot.log"
+}
