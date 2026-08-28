@@ -64,14 +64,20 @@ def build_plan(
         raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
     target_usd = choose_target_usd(cfg, spec, volume, atr_price)
-    # The round-turn commission is paid out of the same move, so aim past it.
-    gross_target = target_usd + cfg.commission_per_lot_usd * volume
+    commission = cfg.commission_per_lot_usd * volume
+    # Commission is paid on winners and losers alike, so it is added to the
+    # distance price must travel to pay the target, and subtracted from the
+    # distance allowed before the stop - both figures below are then net.
+    gross_target = target_usd + commission
     risk_usd = min(target_usd * cfg.stop_loss_ratio, cfg.max_loss_per_trade_usd)
-    if risk_usd <= 0:
-        return None, "risk budget is zero"
+    if risk_usd <= commission:
+        return None, (
+            f"commission (${commission:.2f}) leaves nothing of the ${risk_usd:.2f} "
+            "risk budget - raise `max_loss_per_trade_usd`"
+        )
 
     target_points = points_for_money(spec, volume, gross_target)
-    stop_points = points_for_money(spec, volume, risk_usd)
+    stop_points = points_for_money(spec, volume, risk_usd - commission)
 
     spread_points = (ask - bid) / spec.point
     if spread_points > cfg.max_spread_points:
@@ -101,10 +107,11 @@ def build_plan(
             "- lower `volume` or raise `target_profit_min_usd`"
         )
     stop_points = max(stop_points, float(min_distance))
-    if money_for_points(spec, volume, stop_points) > cfg.max_loss_per_trade_usd:
+    net_risk = money_for_points(spec, volume, stop_points) + commission
+    if net_risk > cfg.max_loss_per_trade_usd:
         return None, (
-            f"broker's {min_distance}p minimum stop would risk more than "
-            f"${cfg.max_loss_per_trade_usd:.2f}"
+            f"broker's {min_distance}p minimum stop would risk ${net_risk:.2f}, over the "
+            f"${cfg.max_loss_per_trade_usd:.2f} cap"
         )
 
     entry = ask if side == "buy" else bid
@@ -123,7 +130,7 @@ def build_plan(
             tp=spec.round_price(tp),
             volume=volume,
             target_usd=target_usd,
-            risk_usd=money_for_points(spec, volume, stop_points),
+            risk_usd=net_risk,
             target_points=target_points,
             stop_points=stop_points,
         ),

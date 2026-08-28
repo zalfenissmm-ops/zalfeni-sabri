@@ -37,6 +37,9 @@ class Engine:
         self._idle_symbols: set[str] = set()
         self._seen_day = ""
         self._failures = 0
+        self._started_at = time.time()
+        self._closes_this_run = 0
+        self._last_heartbeat = 0.0
 
     # --- lifecycle -------------------------------------------------------
 
@@ -130,21 +133,22 @@ class Engine:
         # time stop above closes one. Re-read before looking for entries so a
         # fresh exit arms its cooldown and cannot be re-entered on this pass.
         self._record_closes(self.risk.refresh(now))
-        positions = self.broker.positions()
 
         blocked = self.risk.day_blocked(now)
         if blocked:
             self._say_once("day", f"Not opening trades: {blocked}")
+            self._heartbeat(now)
             return
         self._quiet_reasons.pop("day", None)
 
         for symbol in self.cfg.symbols:
             try:
-                self.consider(symbol, positions, now)
+                self.consider(symbol, now)
             except BrokerError:
                 raise
             except Exception:
                 log.exception("Failed while evaluating %s", symbol)
+        self._heartbeat(now)
 
     def _record_closes(self, trades) -> None:
         if self.risk.state.day != self._seen_day:
@@ -155,6 +159,7 @@ class Engine:
             if key in self._seen_closes:
                 continue
             self._seen_closes.add(key)
+            self._closes_this_run += 1
             log.info(
                 "CLOSED %s #%s  %+.2f USD  |  day %+.2f USD over %d trade(s)",
                 trade.symbol, trade.ticket, trade.profit,
@@ -223,7 +228,10 @@ class Engine:
 
     # --- looking for a new entry -----------------------------------------
 
-    def consider(self, symbol: str, positions: list[Position], now: float) -> None:
+    def consider(self, symbol: str, now: float) -> None:
+        # Read the book per symbol rather than once per cycle: an entry taken
+        # earlier in this same pass has to count against the caps below.
+        positions = self.broker.positions()
         blocked = self.risk.symbol_blocked(symbol, positions, now)
         if blocked:
             self._say_once(f"risk:{symbol}", f"{symbol}: {blocked}")
@@ -265,6 +273,15 @@ class Engine:
             )
             return
 
+        in_play = self.risk.open_risk(positions)
+        if in_play + plan.risk_usd > self.cfg.max_total_risk_usd:
+            self._say_once(
+                f"exposure:{symbol}",
+                f"{symbol}: ${in_play:.2f} already at stake, adding ${plan.risk_usd:.2f} "
+                f"would pass the ${self.cfg.max_total_risk_usd:.2f} ceiling",
+            )
+            return
+
         self._quiet_reasons.clear()
         self.open_trade(symbol, spec, plan, signal.reason)
 
@@ -287,6 +304,25 @@ class Engine:
             "open", symbol=symbol, side=plan.side, volume=plan.volume,
             price=round(result.price, spec.digits), sl=plan.sl, tp=plan.tp,
             target_usd=round(plan.target_usd, 2), risk_usd=round(plan.risk_usd, 2), note=reason,
+        )
+
+    def _heartbeat(self, now: float) -> None:
+        """Periodic proof of life. A bot that trades for days on end is mostly
+        silent between events, and silence should not be ambiguous."""
+        if not self.cfg.heartbeat_seconds:
+            return
+        if now - self._last_heartbeat < self.cfg.heartbeat_seconds:
+            return
+        self._last_heartbeat = now
+
+        positions = self.broker.positions()
+        hours = max((now - self._started_at) / 3600, 1e-9)
+        log.info(
+            "STATUS  open %d ($%.2f at stake) | today %+.2f USD over %d trade(s) | "
+            "%.1f trades/h this run | equity %.2f",
+            len(positions), self.risk.open_risk(positions),
+            self.risk.state.realized_pnl, self.risk.state.trades,
+            self._closes_this_run / hours, self.broker.equity(),
         )
 
     def _feed_is_live(self, symbol: str, quote, now: float) -> bool:

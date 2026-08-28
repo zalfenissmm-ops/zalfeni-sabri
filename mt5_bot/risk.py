@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from .config import Config, in_blackout
 from .models import ClosedTrade, Position
+from .sizing import money_for_points
 
 
 @dataclass
@@ -97,6 +98,25 @@ class RiskManager:
         if last_close and waited < self.cfg.cooldown_seconds:
             return f"cooling down, {self.cfg.cooldown_seconds - waited:.0f}s left"
         return ""
+
+    def open_risk(self, positions: list[Position]) -> float:
+        """Money at stake right now, measured from each position's own stop.
+
+        Commission counts too: a position stopped at break-even still pays it.
+        """
+        total = 0.0
+        for position in positions:
+            if not position.sl:
+                total += self.cfg.max_loss_per_trade_usd  # unprotected: assume the cap
+                continue
+            spec = self.broker.symbol_spec(position.symbol)
+            if position.is_buy:
+                distance = position.price_open - position.sl
+            else:
+                distance = position.sl - position.price_open
+            total += max(0.0, money_for_points(spec, position.volume, distance / spec.point))
+            total += self.cfg.commission_per_lot_usd * position.volume
+        return total
 
     def remaining_loss_budget(self) -> float:
         return max(0.0, self.cfg.daily_loss_limit_usd + min(0.0, self.state.realized_pnl))

@@ -185,3 +185,81 @@ class TestJournal(EngineHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMachineMode(EngineHarness):
+    """Continuous trading across a basket - where the caps have to hold."""
+
+    def test_one_pass_cannot_exceed_the_position_cap_across_symbols(self):
+        cfg, feed, broker, engine = self.build(
+            symbols=["EURUSD", "GBPUSD", "AUDUSD", "USDCHF"],
+            max_open_positions=2,
+            max_total_risk_usd=100.0,
+        )
+        engine.cycle()
+        self.assertEqual(len(broker.positions()), 2)
+
+    def test_each_symbol_in_the_basket_gets_traded(self):
+        cfg, feed, broker, engine = self.build(
+            symbols=["EURUSD", "GBPUSD", "AUDUSD"],
+            max_open_positions=3,
+            max_total_risk_usd=100.0,
+        )
+        engine.cycle()
+        self.assertEqual(
+            {p.symbol for p in broker.positions()}, {"EURUSD", "GBPUSD", "AUDUSD"}
+        )
+
+    def test_the_total_risk_ceiling_stops_further_entries(self):
+        # Each trade risks $1.00, so a $2.50 ceiling admits exactly two.
+        cfg, feed, broker, engine = self.build(
+            symbols=["EURUSD", "GBPUSD", "AUDUSD", "USDCHF"],
+            max_open_positions=10,
+            max_total_risk_usd=2.5,
+        )
+        engine.cycle()
+        self.assertEqual(len(broker.positions()), 2)
+
+    def test_risk_in_play_is_measured_from_each_stop(self):
+        cfg, feed, broker, engine = self.build(max_total_risk_usd=100.0)
+        engine.cycle()
+        self.assertAlmostEqual(engine.risk.open_risk(broker.positions()), 1.0, delta=0.05)
+
+    def test_a_break_even_stop_frees_up_the_risk_budget(self):
+        cfg, feed, broker, engine = self.build(
+            breakeven_at_fraction=0.5, max_hold_seconds=0, max_total_risk_usd=100.0
+        )
+        engine.cycle()
+        entry = broker.positions()[0].price_open
+
+        feed.move_to(bid=entry + 0.00030, ask=entry + 0.00031)
+        engine.cycle()
+
+        self.assertAlmostEqual(engine.risk.open_risk(broker.positions()), 0.0, places=5)
+
+    def test_an_unprotected_position_counts_as_a_full_loss(self):
+        cfg, feed, broker, engine = self.build(max_loss_per_trade_usd=3.0)
+        engine.cycle()
+        broker._positions[broker.positions()[0].ticket].sl = 0.0
+        self.assertAlmostEqual(engine.risk.open_risk(broker.positions()), 3.0)
+
+
+class TestHeartbeat(EngineHarness):
+    def test_reports_status_on_the_configured_interval(self):
+        cfg, feed, broker, engine = self.build(heartbeat_seconds=60)
+        with self.assertLogs("mt5_bot", level="INFO") as captured:
+            engine.cycle()
+        self.assertTrue(any("STATUS" in line for line in captured.output))
+
+    def test_stays_quiet_between_intervals(self):
+        cfg, feed, broker, engine = self.build(heartbeat_seconds=3600)
+        engine.cycle()
+        with self.assertLogs("mt5_bot", level="INFO") as captured:
+            engine.cycle()
+        self.assertFalse(any("STATUS" in line for line in captured.output))
+
+    def test_can_be_switched_off(self):
+        cfg, feed, broker, engine = self.build(heartbeat_seconds=0)
+        with self.assertLogs("mt5_bot", level="INFO") as captured:
+            engine.cycle()
+        self.assertFalse(any("STATUS" in line for line in captured.output))

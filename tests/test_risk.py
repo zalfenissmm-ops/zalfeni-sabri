@@ -122,3 +122,51 @@ class TestSymbolGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpenRisk(unittest.TestCase):
+    class SpecBroker(FakeBroker):
+        def symbol_spec(self, symbol):
+            from tests.helpers import FX_SPEC
+
+            return FX_SPEC
+
+    def manager(self, **overrides):
+        return RiskManager(Config(**overrides), self.SpecBroker())
+
+    def test_measures_each_position_from_its_own_stop(self):
+        risk = self.manager()
+        # 0.02 lot, 100 points of stop distance at $1/point/lot = $2.00.
+        held = Position(
+            ticket=1, symbol="EURUSD", side="buy", volume=0.02, price_open=1.10000,
+            sl=1.09900, tp=1.10100, profit=0.0, time_open=NOON,
+        )
+        self.assertAlmostEqual(risk.open_risk([held]), 2.0, places=2)
+
+    def test_sums_across_the_basket(self):
+        risk = self.manager()
+        held = [
+            Position(ticket=i, symbol=name, side="sell", volume=0.02, price_open=1.10000,
+                     sl=1.10100, tp=1.09900, profit=0.0, time_open=NOON)
+            for i, name in enumerate(("EURUSD", "GBPUSD"))
+        ]
+        self.assertAlmostEqual(risk.open_risk(held), 4.0, places=2)
+
+    def test_a_break_even_stop_risks_only_the_commission(self):
+        risk = self.manager(commission_per_lot_usd=7.0)
+        held = Position(
+            ticket=1, symbol="EURUSD", side="buy", volume=0.02, price_open=1.10000,
+            sl=1.10000, tp=1.10100, profit=0.0, time_open=NOON,
+        )
+        self.assertAlmostEqual(risk.open_risk([held]), 7.0 * 0.02, places=4)
+
+    def test_a_position_without_a_stop_counts_as_the_full_cap(self):
+        risk = self.manager(max_loss_per_trade_usd=3.0)
+        held = Position(
+            ticket=1, symbol="EURUSD", side="buy", volume=0.02, price_open=1.10000,
+            sl=0.0, tp=1.10100, profit=0.0, time_open=NOON,
+        )
+        self.assertAlmostEqual(risk.open_risk([held]), 3.0)
+
+    def test_an_empty_book_risks_nothing(self):
+        self.assertEqual(self.manager().open_risk([]), 0.0)

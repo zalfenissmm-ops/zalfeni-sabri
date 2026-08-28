@@ -32,6 +32,9 @@ class Config:
     stop_loss_ratio: float = 1.0  # SL distance = target x this
     max_loss_per_trade_usd: float = 3.0
     daily_loss_limit_usd: float = 20.0
+    # Ceiling on the money at stake across every open position at once. With a
+    # basket of symbols this, not the position count, is what bounds a bad hour.
+    max_total_risk_usd: float = 6.0
     daily_profit_target_usd: float = 0.0  # 0 = keep trading all day
 
     # --- Entry filters ---
@@ -66,6 +69,7 @@ class Config:
     magic: int = 20260828
     stale_tick_seconds: float = 120.0  # market closed / feed dead -> stand down
     blackout_windows: list[str] = field(default_factory=lambda: ["23:56-00:06"])
+    heartbeat_seconds: int = 300  # periodic "still alive" summary (0 = off)
     journal_path: str = "trades.csv"
     log_path: str = "bot.log"
 
@@ -85,6 +89,10 @@ class Config:
             raise ValueError("config: `max_loss_per_trade_usd` must be > 0")
         if self.daily_loss_limit_usd <= 0:
             raise ValueError("config: `daily_loss_limit_usd` must be > 0")
+        if self.max_total_risk_usd <= 0:
+            raise ValueError("config: `max_total_risk_usd` must be > 0")
+        if self.heartbeat_seconds < 0:
+            raise ValueError("config: `heartbeat_seconds` cannot be negative")
         if self.ema_fast >= self.ema_slow:
             raise ValueError("config: `ema_fast` must be shorter than `ema_slow`")
         if self.poll_seconds <= 0:
@@ -108,6 +116,7 @@ class Config:
         if path:
             with open(path) as f:
                 data = json.load(f)
+        data.pop("_comment", None)  # a note to the human editing the file
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:

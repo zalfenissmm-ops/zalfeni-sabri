@@ -13,6 +13,7 @@ import itertools
 import math
 import random
 import time
+import zlib
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -32,8 +33,35 @@ class PriceFeed(Protocol):
     def candles(self, symbol: str, timeframe: str, count: int) -> list[Candle]: ...
 
 
+class _Walk:
+    """One symbol's price path. Each symbol walks independently, so a basket
+    behaves like a basket instead of one instrument quoted several times."""
+
+    def __init__(self, start_price: float, sigma: float, drift: float, seed: int, start_wall: float):
+        self.sigma = sigma
+        self.drift = drift
+        self.rng = random.Random(seed)
+        self.mid = start_price
+        self.start_wall = start_wall
+        self.elapsed = 0.0
+        self.history: list[tuple[float, float]] = [(start_wall, start_price)]
+
+    def advance_to(self, simulated_now: float) -> float:
+        step = simulated_now - self.elapsed
+        if step <= 0:
+            return self.mid
+        # Reflect off zero so a long run can never produce a negative price.
+        shock = self.rng.gauss(0.0, 1.0) * self.sigma * math.sqrt(step)
+        self.mid = abs(self.mid + self.drift * step + shock)
+        self.elapsed = simulated_now
+        self.history.append((self.start_wall + simulated_now, self.mid))
+        if len(self.history) > 100_000:
+            del self.history[:50_000]
+        return self.mid
+
+
 class SyntheticFeed:
-    """A seeded random walk with a fixed spread, advanced by the wall clock.
+    """Seeded random walks with a fixed spread, advanced by the wall clock.
 
     `speed` compresses time: at speed=60 one real second is one simulated
     minute, which is how you get a day's worth of trades out of a short run.
@@ -55,30 +83,22 @@ class SyntheticFeed:
         self.sigma = volatility_points_per_second * self.point
         self.drift = trend_points_per_second * self.point
         self.speed = speed
-        self._rng = random.Random(seed)
+        self.seed = seed
         self._start_wall = time.time()
         self._start_price = start_price
-        self._mid = start_price
-        self._elapsed = 0.0
-        self._history: list[tuple[float, float]] = [(self._start_wall, start_price)]
+        self._walks: dict[str, _Walk] = {}
 
     def _sim_now(self) -> float:
         return (time.time() - self._start_wall) * self.speed
 
-    def _advance(self) -> float:
-        """Step the walk forward to the current simulated time."""
-        now = self._sim_now()
-        step = now - self._elapsed
-        if step <= 0:
-            return self._mid
-        # Reflect off zero so a long run can never produce a negative price.
-        shock = self._rng.gauss(0.0, 1.0) * self.sigma * math.sqrt(step)
-        self._mid = abs(self._mid + self.drift * step + shock)
-        self._elapsed = now
-        self._history.append((self._start_wall + now, self._mid))
-        if len(self._history) > 100_000:
-            del self._history[:50_000]
-        return self._mid
+    def _walk(self, symbol: str) -> _Walk:
+        if symbol not in self._walks:
+            # Seed from the name so a given symbol replays identically run to run.
+            seed = self.seed + (zlib.crc32(symbol.encode()) & 0xFFFF)
+            self._walks[symbol] = _Walk(
+                self._start_price, self.sigma, self.drift, seed, self._start_wall
+            )
+        return self._walks[symbol]
 
     def spec(self, symbol: str) -> SymbolSpec:
         return SymbolSpec(
@@ -96,21 +116,26 @@ class SyntheticFeed:
         )
 
     def tick(self, symbol: str) -> Tick | None:
-        mid = self._advance()
+        mid = self._walk(symbol).advance_to(self._sim_now())
         half = self.spread / 2
-        return Tick(time=time.time(), bid=round(mid - half, self.digits), ask=round(mid + half, self.digits))
+        return Tick(
+            time=time.time(),
+            bid=round(mid - half, self.digits),
+            ask=round(mid + half, self.digits),
+        )
 
     def candles(self, symbol: str, timeframe: str, count: int) -> list[Candle]:
-        """Aggregate the walk's history into bars in a single pass. When the run
-        is younger than the requested history, bars are extended backwards from
-        the seed price so the strategy still has enough data to warm up."""
-        self._advance()
+        """Aggregate one symbol's history into bars in a single pass. When the
+        run is younger than the requested history, bars are extended backwards
+        from the seed price so the strategy still has enough data to warm up."""
+        walk = self._walk(symbol)
+        walk.advance_to(self._sim_now())
         seconds = _SECONDS_PER_BAR.get(timeframe.upper(), 60)
         newest = int(self._sim_now() // seconds)
         oldest = newest - count + 1
 
         buckets: dict[int, list[float]] = {}
-        for stamp, price in self._history:
+        for stamp, price in walk.history:
             index = int((stamp - self._start_wall) // seconds)
             if index >= oldest:
                 buckets.setdefault(index, []).append(price)
@@ -127,27 +152,28 @@ class SyntheticFeed:
             if (prices := buckets.get(index))
         ]
         if len(bars) < count:
-            bars = self._synthesize_backfill(count - len(bars), seconds, bars)
+            bars = self._synthesize_backfill(symbol, count - len(bars), seconds, bars)
         return bars
 
-    def _synthesize_backfill(self, missing: int, seconds: int, bars: list[Candle]) -> list[Candle]:
+    def _synthesize_backfill(
+        self, symbol: str, missing: int, seconds: int, bars: list[Candle]
+    ) -> list[Candle]:
         """Invent plausible history before the run started, so indicators warm up."""
-        rng = random.Random(hash((self._start_price, missing, seconds)) & 0xFFFF)
-        anchor = bars[0].open if bars else self._mid
+        rng = random.Random(zlib.crc32(f"{symbol}:{missing}:{seconds}".encode()))
+        anchor = bars[0].open if bars else self._walk(symbol).mid
         first_time = bars[0].time if bars else time.time()
         back: list[Candle] = []
         price = anchor
         for index in range(missing):
             close = price
             price = abs(price - rng.gauss(0.0, 1.0) * self.sigma * math.sqrt(seconds))
-            high = max(price, close) + abs(rng.gauss(0.0, 0.3)) * self.sigma * math.sqrt(seconds)
-            low = min(price, close) - abs(rng.gauss(0.0, 0.3)) * self.sigma * math.sqrt(seconds)
+            reach = abs(rng.gauss(0.0, 0.3)) * self.sigma * math.sqrt(seconds)
             back.append(
                 Candle(
                     time=first_time - (index + 1) * seconds,
-                    open=price,
-                    high=round(high, self.digits),
-                    low=round(low, self.digits),
+                    open=round(price, self.digits),
+                    high=round(max(price, close) + reach, self.digits),
+                    low=round(min(price, close) - reach, self.digits),
                     close=round(close, self.digits),
                 )
             )

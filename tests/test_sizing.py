@@ -118,3 +118,37 @@ class TestVolumeRounding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCommissionIsNetted(unittest.TestCase):
+    """`target_profit_*` and `max_loss_per_trade_usd` both mean net of costs."""
+
+    COMMISSION = 7.0  # per lot, round turn
+
+    def plan(self, **overrides):
+        cfg = config(commission_per_lot_usd=self.COMMISSION, **overrides)
+        plan, why = build_plan(cfg, FX_SPEC, "buy", BID, ASK, ATR, 0.02)
+        self.assertIsNotNone(plan, why)
+        return cfg, plan
+
+    def test_the_win_clears_the_target_after_commission(self):
+        cfg, plan = self.plan()
+        gross = money_for_points(FX_SPEC, 0.02, plan.target_points)
+        self.assertAlmostEqual(gross - self.COMMISSION * 0.02, plan.target_usd, places=2)
+
+    def test_the_loss_stays_inside_the_cap_after_commission(self):
+        cfg, plan = self.plan()
+        gross = money_for_points(FX_SPEC, 0.02, plan.stop_points)
+        self.assertAlmostEqual(gross + self.COMMISSION * 0.02, plan.risk_usd, places=2)
+        self.assertLessEqual(plan.risk_usd, cfg.max_loss_per_trade_usd + 1e-9)
+
+    def test_commission_tightens_the_stop_rather_than_widening_the_loss(self):
+        _, charged = self.plan()
+        free, _ = build_plan(config(), FX_SPEC, "buy", BID, ASK, ATR, 0.02)
+        self.assertLess(charged.stop_points, free.stop_points)
+
+    def test_a_trade_whose_commission_eats_the_risk_budget_is_refused(self):
+        cfg = config(commission_per_lot_usd=200.0, max_loss_per_trade_usd=1.0)
+        plan, why = build_plan(cfg, FX_SPEC, "buy", BID, ASK, ATR, 0.02)
+        self.assertIsNone(plan)
+        self.assertIn("commission", why)

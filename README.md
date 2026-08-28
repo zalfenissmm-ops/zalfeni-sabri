@@ -80,7 +80,7 @@ Suggested TP     : 37.96200
 ```bash
 python3 run_bot.py --check --feed mt5 --config config.json   # هل الهدف قابل للتحقيق عند وسيطك؟
 python3 run_bot.py --paper --speed 400             # محاكاة، بلا فلوس وبلا ويندوز
-python3 run_bot.py --config config.json --live     # تداول حقيقي
+python3 run_bot.py --config config.machine.json --live       # وضع الماكينة: عدة أزواج
 ```
 
 التفاصيل الكاملة — الاستراتيجية، إدارة المخاطر، الإعدادات، وحسبة الربحية —
