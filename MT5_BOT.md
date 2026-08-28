@@ -24,8 +24,10 @@
 أكثر من قدرة السوق في دقائق. **البوت يحسبلك المجال الصحيح**:
 
 ```bash
-python3 run_bot.py --check --config config.json
+python3 run_bot.py --check --feed mt5 --config config.json
 ```
+
+`--feed mt5` مهمة: بلاها الفحص يخدم على بيانات محاكاة، والأرقام ما تعنيش وسيطك.
 
 ويطلعلك تقرير كيف هذا:
 
@@ -78,8 +80,70 @@ python3 run_bot.py --config config.json --live
 `--live` وحدها اللي تبعث أوامر حقيقية، وتطلب منك تكتب `LIVE` للتأكيد
 (`--yes` تتخطّى السؤال للتشغيل التلقائي).
 
-> مكتبة `MetaTrader5` تخدم على **ويندوز فقط**، ولازم تشغّل البوت على نفس الجهاز
-> اللي فيه المنصة، مع تفعيل **Algo Trading** في شريط أدوات MT5.
+## التشغيل المباشر على MT5 — خطوة بخطوة
+
+مكتبة `MetaTrader5` تخدم على **ويندوز فقط**، ولازم البوت يخدم على **نفس الجهاز**
+اللي فيه المنصة مفتوحة. هذي الخطوات بالترتيب:
+
+**1. جهّز المنصة**
+
+- افتح MT5 وسجّل دخول بحسابك (ابدا بحساب **Demo**).
+- فعّل **Algo Trading** من شريط الأدوات (الزر يولّي أخضر).
+- في `Tools → Options → Expert Advisors` فعّل `Allow automated trading`.
+- زيد الزوج اللي باش تخدم عليه في **Market Watch** — البوت ما ينجمش يقرا رمز
+  مش موجود في القائمة.
+
+**2. ثبّت المتطلبات** (في PowerShell أو CMD)
+
+```bat
+python -m pip install -r requirements.txt
+```
+
+**3. حطّ بيانات الدخول في متغيرات البيئة** (موش في ملف الإعدادات)
+
+```bat
+set MT5_LOGIN=12345678
+set MT5_PASSWORD=your-password
+set MT5_SERVER=YourBroker-Demo
+```
+
+**4. اختبر الاتصال وحدّد الحجم الصحيح**
+
+```bat
+python run_bot.py --check --feed mt5 --config config.json
+```
+
+هذي الخطوة تتأكد من الاتصال، تقرا السبريد والتقلّب الحقيقيين متاع وسيطك،
+وتقترحلك حجم اللوت. **لا تتخطّاهاش** — الحجم الغالط يخلّي كل الصفقات مرفوضة
+أو خاسرة.
+
+**5. شغّل محاكاة على أسعار وسيطك الحقيقية** (يوم كامل على الأقل)
+
+```bat
+python run_bot.py --feed mt5 --config config.json
+```
+
+**6. بعد ما تقتنع بالنتائج، شغّل حيّ على Demo**
+
+```bat
+python run_bot.py --config config.json --live
+```
+
+**7. خلّيه يخدم على مدار الساعة**
+
+نافذة الـ CMD لازم تبقى مفتوحة والمنصة خدامة. باش يقوم وحده مع الجهاز، اعمل
+مهمّة في `Task Scheduler` تشغّل نفس الأمر عند `At startup` مع تفعيل
+`Run whether user is logged on or not`.
+
+### مشاكل شائعة
+
+| الرسالة | الحل |
+|---------|------|
+| `MT5 initialize failed` | المنصة مسكّرة، ولا البوت يخدم على جهاز آخر |
+| `Algo trading is disabled` | فعّل زر Algo Trading في شريط الأدوات |
+| `Unknown symbol` | زيد الرمز في Market Watch (الاسم يتبدّل حسب الوسيط: `EURUSD.m`، `EURUSDm`…) |
+| `broker reports tick_value=0` | افتح الرمز في Market Watch وستنّى أول تيك |
+| كل الصفقات مرفوضة بسبب السبريد | شغّل `--check --feed mt5` وبدّل الحجم للمقترح |
 
 ## كيفاش يخدم البوت
 

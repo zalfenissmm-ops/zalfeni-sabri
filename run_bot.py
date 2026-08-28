@@ -57,7 +57,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-max", type=float, help="Maximum profit target per trade, in USD")
     parser.add_argument(
         "--check", action="store_true",
-        help="Report whether the target band is reachable on each symbol, then exit",
+        help=(
+            "Report whether the target band is reachable on each symbol, then exit. "
+            "Pair with --feed mt5 to measure your broker's real spread and volatility."
+        ),
     )
     parser.add_argument("--verbose", action="store_true", help="Debug-level logging")
     return parser.parse_args(argv)
@@ -98,8 +101,19 @@ def build_broker(cfg: Config, args: argparse.Namespace):
     return PaperBroker(cfg, SyntheticFeed(speed=args.speed))
 
 
-def run_preflight(cfg: Config, broker) -> int:
-    """Print, per symbol, whether the configured dollar target is reachable."""
+def run_preflight(cfg: Config, broker, from_mt5: bool) -> int:
+    """Print, per symbol, whether the configured dollar target is reachable.
+
+    The data source is stated up front: sizing a real account off the synthetic
+    feed's spread and volatility would be sizing it off invented numbers.
+    """
+    if from_mt5:
+        print("Data source: live MT5 quotes from your broker.\n")
+    else:
+        print(
+            "Data source: the SYNTHETIC random walk, not your broker.\n"
+            "Re-run with --feed mt5 (or --live) before sizing a real account.\n"
+        )
     broker.connect()
     try:
         for symbol in cfg.symbols:
@@ -129,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         try:
-            return run_preflight(cfg, build_broker(cfg, args))
+            return run_preflight(cfg, build_broker(cfg, args), args.live or args.feed == "mt5")
         except BrokerError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
