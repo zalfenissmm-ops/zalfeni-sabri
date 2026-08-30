@@ -122,11 +122,11 @@ class Params:
 
     equal_tol: float = 0.0007     # "equal highs/lows" tolerance (relative) = liquidity pool
 
-    sweep_lookback: int = 24      # look for a sweep in the last N M15 candles
-    mss_window: int = 12          # MSS must occur within N M5 candles after the sweep
+    sweep_lookback: int = 30      # look for a sweep in the last N M15 candles
+    mss_window: int = 18          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
-    disp_atr_mult: float = 1.5    # displacement candle: body >= 1.5 x ATR
+    disp_atr_mult: float = 1.3    # displacement candle: body >= 1.3 x ATR
     disp_body_ratio: float = 0.5  # and body >= 50% of its range
 
     rr_min: float = 1.5           # minimum acceptable Risk:Reward
@@ -570,9 +570,30 @@ def _slice_tail(arr_times, arr, upto_close, tf, win):
     return arr[max(0, j - win):j]
 
 
+def _classify_stage(dec):
+    """Map a Decision to the funnel stage it stopped at (for tuning)."""
+    if dec.signal:
+        return "9  SIGNAL"
+    r = dec.reason
+    if "Not enough data" in r:            return "0  insufficient data"
+    if "No recent liquidity sweep" in r:  return "1  no M15 sweep"
+    if "no M5 candles after" in r:        return "2  sweep, no M5 yet"
+    if "no MSS" in r:                     return "2  sweep, no MSS"
+    if "without strong displacement" in r:return "3  MSS, no displacement"
+    if "left no FVG" in r:                return "4  displacement, no FVG"
+    if "invalidated" in r:                return "5  invalidated before retrace"
+    if "opposing liquidity" in r:         return "6  no TP liquidity"
+    if "Stop distance is zero" in r:      return "6  zero-stop skip"
+    if "RR too small" in r:               return "7  RR below minimum"
+    if "waiting for retracement" in r:    return "8  valid setup, waiting FVG tap"
+    return "?  other"
+
+
 def run_backtest(h1, m15, m5, p: Params, days: int):
     """Walks M5 candles (a decision every 5m), evaluates with the same engine
-       and no look-ahead, then simulates each signal forward to mark WIN/LOSS."""
+       and no look-ahead, then simulates each signal forward to mark WIN/LOSS.
+       Also builds a funnel of where setups stopped, to help tuning."""
+    from collections import Counter
     if not m5:
         print("No M5 data for the backtest.")
         return
@@ -586,6 +607,9 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
 
     trades = []
     seen_keys = set()
+    funnel = Counter()
+    rr_rejects = {}
+    waiting = {}
     open_trade = None
     i = start_i
     n = len(m5)
@@ -595,8 +619,7 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
 
         # if a trade is open, follow it until it closes (one trade at a time)
         if open_trade is not None:
-            hit = _check_exit(open_trade, bar)
-            if hit:
+            if _check_exit(open_trade, bar):
                 open_trade.t_exit = bar.t
                 trades.append(open_trade)
                 open_trade = None
@@ -609,6 +632,13 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
         h1s = _slice_tail(h1_t, h1, upto, "H1", p.win_h1)
 
         dec = evaluate(h1s, m15s, m5s, p)
+        funnel[_classify_stage(dec)] += 1
+        if dec.key:
+            if "RR too small" in dec.reason:
+                rr_rejects[dec.key] = dec.rr
+            elif "waiting for retracement" in dec.reason:
+                waiting[dec.key] = dec.rr
+
         if dec.signal and dec.key not in seen_keys:
             seen_keys.add(dec.key)
             open_trade = Trade(dec.side, dec.context, dec.entry, dec.sl, dec.tp,
@@ -619,7 +649,7 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
     if open_trade is not None:
         trades.append(open_trade)   # still open at the end of the data
 
-    _print_backtest_report(p, days, trades)
+    _print_backtest_report(p, days, trades, funnel, rr_rejects, waiting)
 
 
 def _check_exit(tr: Trade, bar: Candle):
@@ -646,7 +676,8 @@ def _ts(epoch):
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def _print_backtest_report(p: Params, days: int, trades):
+def _print_backtest_report(p: Params, days: int, trades, funnel=None,
+                           rr_rejects=None, waiting=None):
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
     opens = [t for t in trades if t.result == "OPEN"]
@@ -667,9 +698,23 @@ def _print_backtest_report(p: Params, days: int, trades):
         print(f"  Net R           : {total_r:+.2f} R")
     print("=" * 70)
 
+    # funnel: where setups stopped (helps tune when signals are few)
+    if funnel:
+        print("\n  Funnel (per 5-min check, where the setup stopped):")
+        for label in sorted(funnel):
+            print(f"    {label:34s}: {funnel[label]}")
+        if rr_rejects:
+            vals = list(rr_rejects.values())
+            print(f"  Distinct setups rejected by RR : {len(rr_rejects)} "
+                  f"(avg {sum(vals) / len(vals):.2f}, best {max(vals):.2f})")
+        if waiting:
+            print(f"  Distinct valid setups awaiting FVG tap : {len(waiting)}")
+
     if not trades:
-        print("  No signals in this period with these settings. Try lowering --rr-min "
-              "or --disp-atr-mult, or raising --sweep-lookback.")
+        print("\n  No signals. The funnel above shows the wall. Typical fixes:")
+        print("    - stage 3 biggest -> lower --disp-atr-mult (try 1.0)")
+        print("    - stage 7 biggest -> lower --rr-min (try 1.2)")
+        print("    - stage 2 biggest -> raise --mss-window (try 24) or --sweep-lookback (try 40)")
         return
 
     print("\n  Trade details:")
