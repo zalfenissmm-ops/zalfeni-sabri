@@ -309,7 +309,7 @@ def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
     risk = abs(entry - sl)
     if risk <= 0:
         return Decision(False, f"[{dir_txt}] Stop distance is zero - skip.", ctx)
-    key = (sweep["t"], m5[fvg["idx"]].t)
+    key = (side, m5[fvg["idx"]].t)
     tp = target_liquidity(h1, m15, entry, side, p, p.rr_min * risk)
     if tp is None:
         return Decision(False, f"[{dir_txt}] No opposing liquidity far enough for RR>={p.rr_min:.2f}.",
@@ -504,6 +504,8 @@ def analyze(h1, m15, m5, p: Params, days: int):
     m5_swings = swings(m5, p.sw_m5)
     atr_arr = atr_series(m5, p.atr_period)
     m5_times = [c.t for c in m5]
+    h1_ct = [c.close_time("H1") for c in h1]
+    m15_ct = [c.close_time("M15") for c in m15]
     sweeps = find_all_sweeps(m15, p, use_lookback=False)   # ALL sweeps over history
 
     st = Counter()
@@ -530,7 +532,7 @@ def analyze(h1, m15, m5, p: Params, days: int):
             st["4_no_fvg"] += 1
             continue
 
-        key = (sweep["t"], m5[fvg["idx"]].t)
+        key = (side, m5[fvg["idx"]].t)
         if key in seen:
             continue
         seen.add(key)
@@ -539,7 +541,11 @@ def analyze(h1, m15, m5, p: Params, days: int):
         risk = abs(entry - sl)
         if risk <= 0:
             continue
-        tp = target_liquidity(h1, m15, entry, side, p, p.rr_min * risk)
+        # TP uses only liquidity that already existed at the setup time (no look-ahead)
+        asof = m5[mss["break_idx"]].close_time("M5")
+        h1a = h1[:bisect.bisect_right(h1_ct, asof)]
+        m15a = m15[:bisect.bisect_right(m15_ct, asof)]
+        tp = target_liquidity(h1a, m15a, entry, side, p, p.rr_min * risk)
         if tp is None:
             st["6_no_tp"] += 1
             continue
