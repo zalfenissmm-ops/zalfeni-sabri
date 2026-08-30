@@ -11,7 +11,12 @@ Strategy:
     SL beyond the sweep extreme. TP = nearest opposing liquidity that gives
     RR >= rr_min. RR too small or no target far enough -> NO TRADE.
 
-Run (one command does everything: 90-day backtest once, then live every 5 min):
+Every sweep is treated as one opportunity and followed to its conclusion
+(no "one trade at a time" blocking, no "latest sweep only"). The backtest
+prints a full analysis: how many opportunities appeared and where each one
+stopped, then the win/loss of those that actually entered.
+
+Run (one command does everything: 90-day analysis once, then live every 5 min):
     python ict_smc_bot.py
 
 Other modes:
@@ -31,18 +36,16 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 # ============================================================================
 # Settings -- put your Telegram bot token and chat id here (or as env vars)
 # ============================================================================
-# @BotFather -> /newbot for the TOKEN. Send your bot a message then open
-# https://api.telegram.org/bot<TOKEN>/getUpdates to read your chat id.
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "PUT_YOUR_CHAT_ID_HERE")
 
-# Optional MT5 login (else it uses the terminal you already have open).
 MT5_LOGIN         = os.environ.get("MT5_LOGIN")
 MT5_PASSWORD      = os.environ.get("MT5_PASSWORD")
 MT5_SERVER        = os.environ.get("MT5_SERVER")
@@ -64,7 +67,7 @@ TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600}
 
 @dataclass
 class Candle:
-    t: int      # open time (epoch seconds, UTC)
+    t: int
     o: float
     h: float
     l: float
@@ -83,16 +86,16 @@ class Params:
     sw_m15: int = 2
     sw_m5: int = 2
 
-    sweep_lookback: int = 40      # look for a sweep in the last N M15 candles
+    sweep_lookback: int = 40      # live: look for a sweep in the last N M15 candles
     mss_window: int = 24          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
     disp_atr_mult: float = 1.3    # displacement candle: body >= mult x ATR
-    disp_body_ratio: float = 0.5  # and body >= ratio of its range
+    disp_body_ratio: float = 0.5
 
-    rr_min: float = 1.5           # minimum Risk:Reward
+    rr_min: float = 1.5
 
-    win_m5: int = 300             # decision windows (candles per timeframe)
+    win_m5: int = 300             # live decision windows (candles per timeframe)
     win_m15: int = 220
     win_h1: int = 200
 
@@ -120,8 +123,7 @@ def atr_series(candles, period):
 
 
 def swings(candles, w):
-    """Confirmed fractal swing highs/lows. The last w bars are not confirmed
-    (no look-ahead)."""
+    """Confirmed fractal swing highs/lows. Last w bars unconfirmed (no look-ahead)."""
     highs, lows = [], []
     for i in range(w, len(candles) - w):
         seg = candles[i - w:i + w + 1]
@@ -145,40 +147,42 @@ def structure_bias(highs, lows):
 
 
 # ============================================================================
-# Strategy stages
+# Strategy stages (shared by live and analysis)
 # ============================================================================
-def find_recent_sweep(m15, p: Params):
-    """Most recent M15 liquidity sweep. Bull: break a swing low, close back
-    above. Bear: break a swing high, close back below."""
+def find_all_sweeps(m15, p: Params, use_lookback=True):
+    """Every M15 liquidity sweep (deduped by side+bar). Bull: break a swing low
+    and close back above. Bear: break a swing high and close back below.
+    use_lookback=True limits to the last sweep_lookback candles (live)."""
     highs, lows = swings(m15, p.sw_m15)
     n = len(m15)
-    floor_idx = max(0, n - p.sweep_lookback)
-    best = None
+    floor_idx = max(0, n - p.sweep_lookback) if use_lookback else 0
+    found = {}
     for (si, level) in lows:
         for j in range(si + 1, n):
             c = m15[j]
             if c.l < level and c.c > level:
-                if j >= floor_idx and (best is None or j > best["idx"]):
-                    best = {"side": "bull", "level": level, "idx": j, "extreme": c.l, "t": c.t}
+                if j >= floor_idx:
+                    found[("bull", j)] = {"side": "bull", "level": level, "idx": j, "extreme": c.l, "t": c.t}
                 break
     for (si, level) in highs:
         for j in range(si + 1, n):
             c = m15[j]
             if c.h > level and c.c < level:
-                if j >= floor_idx and (best is None or j > best["idx"]):
-                    best = {"side": "bear", "level": level, "idx": j, "extreme": c.h, "t": c.t}
+                if j >= floor_idx:
+                    found[("bear", j)] = {"side": "bear", "level": level, "idx": j, "extreme": c.h, "t": c.t}
                 break
-    return best
+    return [found[k] for k in sorted(found, key=lambda x: x[1])]
 
 
-def detect_mss(m5, start_idx, side, p: Params):
-    """MSS on M5 after the sweep, by close, within the validity window."""
+def detect_mss(m5, start_idx, side, p: Params, m5_swings=None):
+    """MSS on M5 after the sweep, by close, within the validity window.
+    m5_swings (highs, lows) can be precomputed to avoid recomputation."""
     n = len(m5)
     if start_idx >= n:
         return None
+    highs, lows = m5_swings if m5_swings is not None else swings(m5, p.sw_m5)
     if side == "bull":
         rl_idx = min(range(start_idx, n), key=lambda k: m5[k].l)
-        highs, _ = swings(m5, p.sw_m5)
         for (hi, pr) in [(i, v) for (i, v) in highs if i > rl_idx]:
             for k in range(hi + 1, n):
                 if k - start_idx > p.mss_window:
@@ -188,7 +192,6 @@ def detect_mss(m5, start_idx, side, p: Params):
         return None
     else:
         rh_idx = max(range(start_idx, n), key=lambda k: m5[k].h)
-        _, lows = swings(m5, p.sw_m5)
         for (li, pr) in [(i, v) for (i, v) in lows if i > rh_idx]:
             for k in range(li + 1, n):
                 if k - start_idx > p.mss_window:
@@ -199,8 +202,6 @@ def detect_mss(m5, start_idx, side, p: Params):
 
 
 def is_displacement(m5, k, atr_arr, side, p: Params):
-    """Break candle (or the one before) with body >= mult x ATR and >= ratio
-    of range, in the trade direction."""
     for idx in (k, k - 1):
         if idx < 0 or idx >= len(m5) or not atr_arr[idx]:
             continue
@@ -215,7 +216,6 @@ def is_displacement(m5, k, atr_arr, side, p: Params):
 
 
 def find_fvg(m5, lo, hi, side):
-    """Latest FVG (3-candle imbalance) within [lo..hi]."""
     best = None
     top_i = min(len(m5) - 2, hi)
     for i in range(max(1, lo), top_i + 1):
@@ -228,8 +228,7 @@ def find_fvg(m5, lo, hi, side):
 
 
 def target_liquidity(h1, m15, entry, side, p: Params, min_dist=0.0):
-    """Nearest opposing liquidity pool at least min_dist from entry (so RR is
-    acceptable). None if no pool is far enough."""
+    """Nearest opposing liquidity pool at least min_dist from entry."""
     levels = []
     for tf, w in ((m15, p.sw_m15), (h1, p.sw_h1)):
         hs, ls = swings(tf, w)
@@ -242,8 +241,19 @@ def target_liquidity(h1, m15, entry, side, p: Params, min_dist=0.0):
     return min(levels) if side == "bull" else max(levels)
 
 
+def sl_entry(m5, start_idx, mss, atr_arr, side, fvg):
+    """Reaction extreme (for SL) and entry (near FVG edge)."""
+    seg = m5[start_idx:mss["break_idx"] + 1]
+    buf = 0.1 * (atr_arr[mss["break_idx"]] or (m5[-1].h - m5[-1].l))
+    if side == "bull":
+        react = min(x.l for x in seg)
+        return react, react - buf, fvg["top"]           # react, sl, entry
+    react = max(x.h for x in seg)
+    return react, react + buf, fvg["bottom"]
+
+
 # ============================================================================
-# Decision
+# Decision (live) -- fires if any recent setup taps its FVG now
 # ============================================================================
 @dataclass
 class Decision:
@@ -271,45 +281,25 @@ def h1_context(h1, side, p: Params):
     return f"{trend} ({kind})"
 
 
-def evaluate(h1, m15, m5, p: Params) -> Decision:
-    need = max(p.sw_m5 * 2 + 2, p.atr_period + 2)
-    if len(m5) < need or len(m15) < (p.sw_m15 * 2 + 2) or len(h1) < (p.sw_h1 * 2 + 2):
-        return Decision(False, "Not enough data yet.")
-
-    sweep = find_recent_sweep(m15, p)
-    if not sweep:
-        return Decision(False, "No recent liquidity sweep on M15.")
+def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
     side = sweep["side"]
     ctx = h1_context(h1, side, p)
     dir_txt = "BUY" if side == "bull" else "SELL"
 
-    start_idx = bisect.bisect_left([c.t for c in m5], sweep["t"])
+    start_idx = bisect.bisect_left(m5_times, sweep["t"])
     if start_idx >= len(m5):
         return Decision(False, f"[{dir_txt}] Sweep on M15 but no M5 candles after it yet.", ctx)
 
-    mss = detect_mss(m5, start_idx, side, p)
+    mss = detect_mss(m5, start_idx, side, p, m5_swings)
     if not mss:
         return Decision(False, f"[{dir_txt}] Sweep found but no MSS on M5 within the window.", ctx)
-
-    atr_arr = atr_series(m5, p.atr_period)
     if not is_displacement(m5, mss["break_idx"], atr_arr, side, p):
         return Decision(False, f"[{dir_txt}] MSS but no strong displacement.", ctx)
-
     fvg = find_fvg(m5, mss["ref_idx"], mss["break_idx"] + 1, side)
     if not fvg:
         return Decision(False, f"[{dir_txt}] Displacement but no FVG.", ctx)
 
-    seg = m5[start_idx:mss["break_idx"] + 1]
-    buf = 0.1 * (atr_arr[mss["break_idx"]] or (m5[-1].h - m5[-1].l))
-    if side == "bull":
-        react = min(x.l for x in seg)
-        sl = react - buf
-        entry = fvg["top"]
-    else:
-        react = max(x.h for x in seg)
-        sl = react + buf
-        entry = fvg["bottom"]
-
+    react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg)
     for k in range(mss["break_idx"] + 1, len(m5)):
         if side == "bull" and m5[k].c < react:
             return Decision(False, f"[{dir_txt}] Invalidated: closed below the sweep low.", ctx)
@@ -320,27 +310,44 @@ def evaluate(h1, m15, m5, p: Params) -> Decision:
     if risk <= 0:
         return Decision(False, f"[{dir_txt}] Stop distance is zero - skip.", ctx)
     key = (sweep["t"], m5[fvg["idx"]].t)
-
     tp = target_liquidity(h1, m15, entry, side, p, p.rr_min * risk)
     if tp is None:
-        return Decision(False,
-                        f"[{dir_txt}] No opposing liquidity far enough for RR>={p.rr_min:.2f} "
-                        f"(target too close).", ctx, side, entry, sl, 0.0, 0.0, key)
+        return Decision(False, f"[{dir_txt}] No opposing liquidity far enough for RR>={p.rr_min:.2f}.",
+                        ctx, side, entry, sl, 0.0, 0.0, key)
     rr = abs(tp - entry) / risk
 
-    last = m5[-1]
-    prev = m5[-2] if len(m5) >= 2 else last
+    last, prev = m5[-1], (m5[-2] if len(m5) >= 2 else m5[-1])
     if side == "bull":
         tagged_now = last.l <= fvg["top"] and prev.l > fvg["top"]
     else:
         tagged_now = last.h >= fvg["bottom"] and prev.h < fvg["bottom"]
     if not tagged_now:
-        return Decision(False,
-                        f"[{dir_txt}] Setup ready (RR={rr:.2f}) but price has not returned to the "
-                        f"FVG yet (waiting for retracement).", ctx, side, entry, sl, tp, rr, key)
+        return Decision(False, f"[{dir_txt}] Setup ready (RR={rr:.2f}) but waiting for retracement to FVG.",
+                        ctx, side, entry, sl, tp, rr, key)
 
     return Decision(True, f"{dir_txt} signal - Sweep->MSS->Displacement->FVG->Retracement OK",
                     ctx, side, entry, sl, tp, rr, key)
+
+
+def evaluate(h1, m15, m5, p: Params) -> Decision:
+    """Live: check every recent sweep; fire on the first setup that taps now."""
+    if len(m5) < max(p.sw_m5 * 2 + 2, p.atr_period + 2) or \
+       len(m15) < (p.sw_m15 * 2 + 2) or len(h1) < (p.sw_h1 * 2 + 2):
+        return Decision(False, "Not enough data yet.")
+    sweeps = find_all_sweeps(m15, p, use_lookback=True)
+    if not sweeps:
+        return Decision(False, "No recent liquidity sweep on M15.")
+    m5_swings = swings(m5, p.sw_m5)
+    atr_arr = atr_series(m5, p.atr_period)
+    m5_times = [c.t for c in m5]
+    first = None
+    for sweep in reversed(sweeps):                      # most recent first
+        res = _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p)
+        if res.signal:
+            return res
+        if first is None:
+            first = res
+    return first
 
 
 # ============================================================================
@@ -428,7 +435,7 @@ class MT5Feed:
 
 
 # ============================================================================
-# Backtest: 90 days, WIN/LOSS, print every trade
+# Trade + simulation
 # ============================================================================
 @dataclass
 class Trade:
@@ -443,35 +450,6 @@ class Trade:
     exit_price: float = 0.0
     result: str = "OPEN"
     r_mult: float = 0.0
-
-
-def _slice_tail(arr_times, arr, upto_close, tf, win):
-    j = bisect.bisect_right(arr_times, upto_close - TF_SECONDS[tf])
-    return arr[max(0, j - win):j]
-
-
-def run_backtest(h1, m15, m5, p: Params, days: int):
-    if not m5:
-        print("No M5 data for the backtest.")
-        return
-    cutoff = m5[-1].close_time("M5") - days * 86400
-    start_i = max(bisect.bisect_left([c.t for c in m5], cutoff), p.win_m5)
-    m15_t = [c.t for c in m15]
-    h1_t = [c.t for c in h1]
-
-    trades, seen_keys = [], set()
-    for i in range(start_i, len(m5)):
-        bar = m5[i]
-        upto = bar.close_time("M5")
-        dec = evaluate(_slice_tail(h1_t, h1, upto, "H1", p.win_h1),
-                       _slice_tail(m15_t, m15, upto, "M15", p.win_m15),
-                       m5[max(0, i - p.win_m5 + 1):i + 1], p)
-        if dec.signal and dec.key not in seen_keys:
-            seen_keys.add(dec.key)
-            tr = Trade(dec.side, dec.context, dec.entry, dec.sl, dec.tp, dec.rr, bar.t)
-            _simulate(tr, m5, i)
-            trades.append(tr)
-    _print_backtest_report(p, days, trades)
 
 
 def _check_exit(tr: Trade, bar: Candle):
@@ -494,8 +472,6 @@ def _check_exit(tr: Trade, bar: Candle):
 
 
 def _simulate(tr: Trade, m5, entry_i):
-    """Walk forward from the entry bar; first TP/SL touch resolves the trade.
-    Signals are simulated independently (the bot emits signals; you size risk)."""
     for j in range(entry_i + 1, len(m5)):
         if _check_exit(tr, m5[j]):
             tr.t_exit = m5[j].t
@@ -506,16 +482,115 @@ def _ts(epoch):
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def _print_backtest_report(p: Params, days: int, trades):
+# ============================================================================
+# Analysis / Backtest -- counts EVERY opportunity, shows where each one stops
+# ============================================================================
+STAGES = [
+    ("2_no_mss",     "sweep, no MSS"),
+    ("3_no_disp",    "MSS, no displacement"),
+    ("4_no_fvg",     "displacement, no FVG"),
+    ("6_no_tp",      "valid, no TP for RR>=min"),
+    ("5_invalid",    "invalidated before retrace"),
+    ("7_no_retrace", "never retraced to FVG"),
+    ("9_signal",     "ENTERED (signal)"),
+]
+
+
+def analyze(h1, m15, m5, p: Params, days: int):
+    if not m5:
+        print("No M5 data.")
+        return
+    cutoff = m5[-1].close_time("M5") - days * 86400
+    m5_swings = swings(m5, p.sw_m5)
+    atr_arr = atr_series(m5, p.atr_period)
+    m5_times = [c.t for c in m5]
+    sweeps = find_all_sweeps(m15, p, use_lookback=False)   # ALL sweeps over history
+
+    st = Counter()
+    trades = []
+    seen = set()
+    for sweep in sweeps:
+        if sweep["t"] < cutoff:
+            continue
+        st["0_sweeps"] += 1
+        side = sweep["side"]
+        start_idx = bisect.bisect_left(m5_times, sweep["t"])
+        if start_idx >= len(m5):
+            continue
+
+        mss = detect_mss(m5, start_idx, side, p, m5_swings)
+        if not mss:
+            st["2_no_mss"] += 1
+            continue
+        if not is_displacement(m5, mss["break_idx"], atr_arr, side, p):
+            st["3_no_disp"] += 1
+            continue
+        fvg = find_fvg(m5, mss["ref_idx"], mss["break_idx"] + 1, side)
+        if not fvg:
+            st["4_no_fvg"] += 1
+            continue
+
+        key = (sweep["t"], m5[fvg["idx"]].t)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg)
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
+        tp = target_liquidity(h1, m15, entry, side, p, p.rr_min * risk)
+        if tp is None:
+            st["6_no_tp"] += 1
+            continue
+        rr = abs(tp - entry) / risk
+
+        retrace_i, invalid = None, False
+        for k in range(mss["break_idx"] + 1, len(m5)):
+            c = m5[k]
+            if side == "bull":
+                if c.c < react:
+                    invalid = True; break
+                if c.l <= entry:
+                    retrace_i = k; break
+            else:
+                if c.c > react:
+                    invalid = True; break
+                if c.h >= entry:
+                    retrace_i = k; break
+        if invalid:
+            st["5_invalid"] += 1
+            continue
+        if retrace_i is None:
+            st["7_no_retrace"] += 1
+            continue
+
+        st["9_signal"] += 1
+        tr = Trade(side, h1_context(h1, side, p), entry, sl, tp, rr, m5[retrace_i].t)
+        _simulate(tr, m5, retrace_i)
+        trades.append(tr)
+
+    _print_analysis(p, days, st, trades)
+
+
+def _print_analysis(p: Params, days: int, st: Counter, trades):
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
     opens = [t for t in trades if t.result == "OPEN"]
     closed = len(wins) + len(losses)
+    sweeps = st.get("0_sweeps", 0)
 
     print("\n" + "=" * 70)
-    print(f"  BACKTEST - {p.symbol} - last {days} days")
+    print(f"  ANALYSIS - {p.symbol} - last {days} days")
     print("=" * 70)
-    print(f"  Total signals   : {len(trades)}")
+    print(f"  Opportunities (sweeps found) : {sweeps}")
+    print("  Where each opportunity stopped:")
+    for kk, label in STAGES:
+        n = st.get(kk, 0)
+        pct = (100.0 * n / sweeps) if sweeps else 0.0
+        print(f"    {label:28s}: {n:6d}  ({pct:4.1f}%)")
+    print("=" * 70)
+    print(f"  ENTERED signals : {len(trades)}   (~{len(trades) / max(days, 1):.2f}/day)")
     print(f"  Wins            : {len(wins)}")
     print(f"  Losses          : {len(losses)}")
     if opens:
@@ -526,9 +601,8 @@ def _print_backtest_report(p: Params, days: int, trades):
     print("=" * 70)
 
     if not trades:
-        print("  No signals in this period. Try --rr-min 1.2 or --disp-atr-mult 1.0.")
+        print("  No entered signals. See the funnel above for the wall.")
         return
-
     print("\n  Trade details:")
     print("  " + "-" * 66)
     for n_, t in enumerate(trades, 1):
@@ -625,9 +699,9 @@ def _aggregate(m5, tf):
 
 
 def selftest(p: Params):
-    print("[selftest] Synthetic data, running the backtest (no MT5)...")
+    print("[selftest] Synthetic data, running the analysis (no MT5)...")
     m5 = _gen_synthetic()
-    run_backtest(_aggregate(m5, "H1"), _aggregate(m5, "M15"), m5, p, days=90)
+    analyze(_aggregate(m5, "H1"), _aggregate(m5, "M15"), m5, p, days=90)
 
 
 # ============================================================================
@@ -671,12 +745,13 @@ def main():
     try:
         if not args.live_only:
             now = datetime.now(timezone.utc)
+            dt_from = now - timedelta(days=args.days + 15)
             print(f"[MT5] Fetching {args.days}+15 days of history...")
-            h1 = feed.range("H1", now - timedelta(days=args.days + 15), now)
-            m15 = feed.range("M15", now - timedelta(days=args.days + 15), now)
-            m5 = feed.range("M5", now - timedelta(days=args.days + 15), now)
+            h1 = feed.range("H1", dt_from, now)
+            m15 = feed.range("M15", dt_from, now)
+            m5 = feed.range("M5", dt_from, now)
             print(f"[MT5] H1={len(h1)}  M15={len(m15)}  M5={len(m5)} candles")
-            run_backtest(h1, m15, m5, p, days=args.days)
+            analyze(h1, m15, m5, p, days=args.days)
         if not args.backtest_only:
             live_loop(feed, p)
     finally:
