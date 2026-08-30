@@ -80,11 +80,11 @@ class Params:
     digits: int = 2
 
     sw_h1: int = 4
-    sw_m15: int = 3
+    sw_m15: int = 2
     sw_m5: int = 2
 
-    sweep_lookback: int = 30      # look for a sweep in the last N M15 candles
-    mss_window: int = 18          # MSS must occur within N M5 candles after the sweep
+    sweep_lookback: int = 40      # look for a sweep in the last N M15 candles
+    mss_window: int = 24          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
     disp_atr_mult: float = 1.3    # displacement candle: body >= mult x ATR
@@ -319,7 +319,7 @@ def evaluate(h1, m15, m5, p: Params) -> Decision:
     risk = abs(entry - sl)
     if risk <= 0:
         return Decision(False, f"[{dir_txt}] Stop distance is zero - skip.", ctx)
-    key = (sweep["idx"], mss["break_idx"], fvg["idx"])
+    key = (sweep["t"], m5[fvg["idx"]].t)
 
     tp = target_liquidity(h1, m15, entry, side, p, p.rr_min * risk)
     if tp is None:
@@ -459,27 +459,18 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
     m15_t = [c.t for c in m15]
     h1_t = [c.t for c in h1]
 
-    trades, seen_keys, open_trade = [], set(), None
-    i, n = start_i, len(m5)
-    while i < n:
+    trades, seen_keys = [], set()
+    for i in range(start_i, len(m5)):
         bar = m5[i]
-        if open_trade is not None:
-            if _check_exit(open_trade, bar):
-                open_trade.t_exit = bar.t
-                trades.append(open_trade)
-                open_trade = None
-            i += 1
-            continue
         upto = bar.close_time("M5")
         dec = evaluate(_slice_tail(h1_t, h1, upto, "H1", p.win_h1),
                        _slice_tail(m15_t, m15, upto, "M15", p.win_m15),
                        m5[max(0, i - p.win_m5 + 1):i + 1], p)
         if dec.signal and dec.key not in seen_keys:
             seen_keys.add(dec.key)
-            open_trade = Trade(dec.side, dec.context, dec.entry, dec.sl, dec.tp, dec.rr, bar.t)
-        i += 1
-    if open_trade is not None:
-        trades.append(open_trade)
+            tr = Trade(dec.side, dec.context, dec.entry, dec.sl, dec.tp, dec.rr, bar.t)
+            _simulate(tr, m5, i)
+            trades.append(tr)
     _print_backtest_report(p, days, trades)
 
 
@@ -500,6 +491,15 @@ def _check_exit(tr: Trade, bar: Candle):
         tr.r_mult = (tr.exit_price - tr.entry) / risk if tr.side == "bull" else (tr.entry - tr.exit_price) / risk
         return True
     return False
+
+
+def _simulate(tr: Trade, m5, entry_i):
+    """Walk forward from the entry bar; first TP/SL touch resolves the trade.
+    Signals are simulated independently (the bot emits signals; you size risk)."""
+    for j in range(entry_i + 1, len(m5)):
+        if _check_exit(tr, m5[j]):
+            tr.t_exit = m5[j].t
+            return
 
 
 def _ts(epoch):
