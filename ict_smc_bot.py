@@ -289,16 +289,18 @@ def find_fvg(m5, lo, hi, side):
     return best
 
 
-def target_liquidity(h1, m15, entry, side, p: Params):
-    """TP = nearest opposing liquidity (a high above for BUY / a low below for
-       SELL) taken from M15 and H1 swings."""
+def target_liquidity(h1, m15, entry, side, p: Params, min_dist=0.0):
+    """TP = the nearest opposing liquidity pool (a high above for BUY / a low
+       below for SELL, from M15 and H1 swings) that is at least `min_dist`
+       away from entry, so the target yields an acceptable RR. Returns None
+       if no pool is far enough."""
     levels = []
     for tf, w in ((m15, p.sw_m15), (h1, p.sw_h1)):
         hs, ls = swings(tf, w)
         if side == "bull":
-            levels += [v for (_, v) in hs if v > entry]
+            levels += [v for (_, v) in hs if v >= entry + min_dist]
         else:
-            levels += [v for (_, v) in ls if v < entry]
+            levels += [v for (_, v) in ls if v <= entry - min_dist]
     if not levels:
         return None
     return min(levels) if side == "bull" else max(levels)
@@ -404,23 +406,21 @@ def evaluate(h1, m15, m5, p: Params) -> Decision:
         if side == "bear" and m5[k].c > react:
             return Decision(False, f"[{dir_txt}] Idea invalidated: price closed above the sweep high.", ctx)
 
-    # (6) TP = opposing liquidity + RR filter
-    tp = target_liquidity(h1, m15, entry, side, p)
-    if tp is None:
-        return Decision(False, f"[{dir_txt}] No clear opposing liquidity to use as TP.", ctx)
-
+    # (6) TP = nearest opposing liquidity that yields RR >= rr_min
     risk = abs(entry - sl)
-    reward = abs(tp - entry)
     if risk <= 0:
         return Decision(False, f"[{dir_txt}] Stop distance is zero - skip.", ctx)
-    rr = reward / risk
     key = (sweep["idx"], mss["break_idx"], fvg["idx"])
     base_info = {"sweep": sweep, "mss": mss, "fvg": fvg, "react": react}
 
-    if rr < p.rr_min:
+    min_dist = p.rr_min * risk
+    tp = target_liquidity(h1, m15, entry, side, p, min_dist)
+    if tp is None:
         return Decision(False,
-                        f"[{dir_txt}] RR too small {rr:.2f} < {p.rr_min:.2f} (target too close) -> NO TRADE.",
-                        ctx, side, entry, sl, tp, rr, key, base_info)
+                        f"[{dir_txt}] No opposing liquidity far enough for RR>={p.rr_min:.2f} "
+                        f"(draw on liquidity too close) -> NO TRADE.",
+                        ctx, side, entry, sl, 0.0, 0.0, key, base_info)
+    rr = abs(tp - entry) / risk
 
     # (7) Retracement: price must tag the FVG now (first touch)
     last = m5[-1]
@@ -582,7 +582,7 @@ def _classify_stage(dec):
     if "without strong displacement" in r:return "3  MSS, no displacement"
     if "left no FVG" in r:                return "4  displacement, no FVG"
     if "invalidated" in r:                return "5  invalidated before retrace"
-    if "opposing liquidity" in r:         return "6  no TP liquidity"
+    if "opposing liquidity" in r:         return "6  full setup, no TP w/ enough RR"
     if "Stop distance is zero" in r:      return "6  zero-stop skip"
     if "RR too small" in r:               return "7  RR below minimum"
     if "waiting for retracement" in r:    return "8  valid setup, waiting FVG tap"
@@ -608,7 +608,8 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
     trades = []
     seen_keys = set()
     funnel = Counter()
-    rr_rejects = {}
+    full_setups = set()
+    no_tp = set()
     waiting = {}
     open_trade = None
     i = start_i
@@ -632,11 +633,14 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
         h1s = _slice_tail(h1_t, h1, upto, "H1", p.win_h1)
 
         dec = evaluate(h1s, m15s, m5s, p)
-        funnel[_classify_stage(dec)] += 1
+        lbl = _classify_stage(dec)
+        funnel[lbl] += 1
         if dec.key:
-            if "RR too small" in dec.reason:
-                rr_rejects[dec.key] = dec.rr
-            elif "waiting for retracement" in dec.reason:
+            if lbl[0] in "6789":
+                full_setups.add(dec.key)
+            if lbl[0] == "6":
+                no_tp.add(dec.key)
+            elif lbl[0] == "8":
                 waiting[dec.key] = dec.rr
 
         if dec.signal and dec.key not in seen_keys:
@@ -649,7 +653,7 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
     if open_trade is not None:
         trades.append(open_trade)   # still open at the end of the data
 
-    _print_backtest_report(p, days, trades, funnel, rr_rejects, waiting)
+    _print_backtest_report(p, days, trades, funnel, full_setups, no_tp, waiting)
 
 
 def _check_exit(tr: Trade, bar: Candle):
@@ -677,7 +681,7 @@ def _ts(epoch):
 
 
 def _print_backtest_report(p: Params, days: int, trades, funnel=None,
-                           rr_rejects=None, waiting=None):
+                           full_setups=None, no_tp=None, waiting=None):
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
     opens = [t for t in trades if t.result == "OPEN"]
@@ -703,17 +707,17 @@ def _print_backtest_report(p: Params, days: int, trades, funnel=None,
         print("\n  Funnel (per 5-min check, where the setup stopped):")
         for label in sorted(funnel):
             print(f"    {label:34s}: {funnel[label]}")
-        if rr_rejects:
-            vals = list(rr_rejects.values())
-            print(f"  Distinct setups rejected by RR : {len(rr_rejects)} "
-                  f"(avg {sum(vals) / len(vals):.2f}, best {max(vals):.2f})")
+        if full_setups:
+            print(f"  Distinct FULL setups formed (sweep+MSS+disp+FVG) : {len(full_setups)}")
+        if no_tp:
+            print(f"    of which no TP far enough for RR>={p.rr_min:.2f} : {len(no_tp)}")
         if waiting:
-            print(f"  Distinct valid setups awaiting FVG tap : {len(waiting)}")
+            print(f"  Distinct armed setups awaiting FVG tap : {len(waiting)}")
 
     if not trades:
         print("\n  No signals. The funnel above shows the wall. Typical fixes:")
+        print("    - stage 6 biggest -> lower --rr-min (target liquidity sits too close)")
         print("    - stage 3 biggest -> lower --disp-atr-mult (try 1.0)")
-        print("    - stage 7 biggest -> lower --rr-min (try 1.2)")
         print("    - stage 2 biggest -> raise --mss-window (try 24) or --sweep-lookback (try 40)")
         return
 
