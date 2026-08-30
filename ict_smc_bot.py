@@ -2,42 +2,46 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-ICT / SMC Intraday Bot  --  ملف واحد
+ICT / SMC Intraday Bot  --  single file  (Gold / XAUUSD by default)
 ================================================================================
-الاستراتيجية (كيما اتفقنا):
+Strategy:
 
-    H1  → السياق: نصنّف الصفقة (مع الاتجاه / انعكاس أو تصحيح). ما يمنعش الصفقة.
-    M15 → Liquidity + Sweep  (كسر قمة/قاع + رجوع = فخ سيولة).
-    M5  → MSS + Displacement + FVG.
-    ثم Retracement للـ FVG = الدخول.
+    H1  -> Context: classify the trade (with-trend / reversal-correction).
+           Label only; it does NOT block the trade.
+    M15 -> Liquidity + Sweep  (break a high/low then close back = liquidity trap).
+    M5  -> MSS + Displacement + FVG.
+    Then Retracement into the FVG = entry.
 
-    Sweep → MSS → Displacement → FVG → Retracement → RR مناسب → إشارة.
+    Sweep -> MSS -> Displacement -> FVG -> Retracement -> good RR -> signal.
 
-قواعد ذهبية:
-    - كسر القاع وحده ≠ SELL   /   كسر القمة وحده ≠ BUY.
-    - لازم Sweep + MSS.
-    - لازم Displacement + FVG.
-    - SL تحت/فوق أدنى/أعلى نقطة عملها الـ Sweep.
-    - TP عند السيولة المقابلة.
-    - RR >= 1.5 و إلا NO TRADE.
-
---------------------------------------------------------------------------------
-طريقة التشغيل (كيما طلبت):
-    1) أول ما يشتغل  → يعمل Backtest على 90 يوم مرة وحدة، يطبع كل الإشارات
-       مصنّفة (رابحة / خاسرة) بتفاصيلها + ملخّص.
-    2) بعدها يدخل في وضع مباشر: كل 5 دقايق يجيب بيانات جديدة من MT5 و يعطي:
-         - كان فما صفقة  → Entry / SL / TP / RR  و يبعث إشعار تيليقرام.
-         - كان NO TRADE  → يطبع علاش (أي مرحلة وقفت).
+Golden rules:
+    - Breaking a low alone  != SELL.
+    - Breaking a high alone != BUY.
+    - Sweep + MSS required.
+    - Displacement + FVG required.
+    - SL below/above the sweep extreme.
+    - TP at the opposing liquidity.
+    - RR >= 1.5 or NO TRADE.
 
 --------------------------------------------------------------------------------
-الأوامر:
-    python3 ict_smc_bot.py                 # backtest 90 يوم ثم مباشر كل 5 د
-    python3 ict_smc_bot.py --backtest-only # backtest برك
-    python3 ict_smc_bot.py --live-only     # مباشر برك (بلا backtest)
-    python3 ict_smc_bot.py --selftest      # تجربة المحرّك ببيانات مولّدة (بلا MT5)
-    python3 ict_smc_bot.py --symbol EURUSD --rr-min 2.0 ...
+How it runs:
+    1) On start -> one 90-day backtest: prints every signal classified as
+       WIN / LOSS with details, plus a summary.
+    2) Then live mode: every 5 minutes it pulls fresh data from MT5 and prints:
+         - a trade    -> Entry / SL / TP / RR  and sends a Telegram alert.
+         - NO TRADE    -> the reason (which stage stopped).
 
-المتطلبات للتشغيل الحقيقي:  MetaTrader5 مثبّت (Windows) + الحزمة:
+    Runs 24h; there is no trading-session filter (gold trades ~23h/weekday).
+
+--------------------------------------------------------------------------------
+Commands:
+    python3 ict_smc_bot.py                  # 90-day backtest then live every 5m
+    python3 ict_smc_bot.py --backtest-only  # backtest only
+    python3 ict_smc_bot.py --live-only      # live only (no backtest)
+    python3 ict_smc_bot.py --selftest       # test the engine on synthetic data
+    python3 ict_smc_bot.py --symbol XAUUSD --rr-min 2.0 ...
+
+Requirements for live trading: MetaTrader5 installed (Windows) + package:
     pip install MetaTrader5
 ================================================================================
 """
@@ -55,27 +59,32 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 # ============================================================================
-# 1) الإعدادات  --  التوكن و الـ Chat ID متاع تيليقرام: حطهم هنا
+# 1) Settings  --  put your Telegram bot token and chat id here
 # ============================================================================
-# طريقة الحصول عليهم:
-#   1. في تيليقرام كلّم @BotFather  → /newbot  → خذ الـ TOKEN
-#   2. ابعث أي رسالة للبوت متاعك، ثم افتح في المتصفح:
+# How to get them:
+#   1. In Telegram talk to @BotFather -> /newbot -> copy the TOKEN
+#   2. Send any message to your bot, then open in a browser:
 #        https://api.telegram.org/bot<TOKEN>/getUpdates
-#      و خذ الرقم  "chat":{"id": ... }
+#      and copy the number  "chat":{"id": ... }
 #
-# تنجم تخليهم هنا، ولا تحطهم كمتغيرات بيئة  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+# You can hard-code them here, or set them as environment variables
+# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "PUT_YOUR_CHAT_ID_HERE")
 
-# إعدادات MT5 (اختيارية: إذا حطيتهم الكود يعمل login بروحه، و إلا يستعمل
-# التيرمينال المفتوح عندك)
-MT5_LOGIN         = os.environ.get("MT5_LOGIN")          # مثال "51234567"
+# MT5 settings (optional: if set, the bot logs in itself; otherwise it uses
+# the terminal you already have open and logged in).
+MT5_LOGIN         = os.environ.get("MT5_LOGIN")          # e.g. "51234567"
 MT5_PASSWORD      = os.environ.get("MT5_PASSWORD")
-MT5_SERVER        = os.environ.get("MT5_SERVER")         # مثال "ICMarkets-Demo"
-MT5_TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH")  # مسار terminal64.exe
+MT5_SERVER        = os.environ.get("MT5_SERVER")         # e.g. "ICMarkets-Demo"
+MT5_TERMINAL_PATH = os.environ.get("MT5_TERMINAL_PATH")  # path to terminal64.exe
 
 _PLACEHOLDERS = ("PUT_YOUR_BOT_TOKEN_HERE", "PUT_YOUR_CHAT_ID_HERE", "", None)
+
+# Number of decimals used to print prices. Gold is usually 2.
+# Auto-updated from MT5 symbol info at connect time.
+PRICE_DIGITS = 2
 
 
 def telegram_configured() -> bool:
@@ -83,14 +92,14 @@ def telegram_configured() -> bool:
 
 
 # ============================================================================
-# 2) نموذج الشمعة + الفريمات
+# 2) Candle model + timeframes
 # ============================================================================
 TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600}
 
 
 @dataclass
 class Candle:
-    t: int      # وقت الفتح (epoch ثواني، UTC)
+    t: int      # open time (epoch seconds, UTC)
     o: float
     h: float
     l: float
@@ -102,36 +111,37 @@ class Candle:
 
 @dataclass
 class Params:
-    """كل الأرقام القابلة للتعديل. تنجم تبدّلهم من سطر الأوامر."""
-    symbol: str = "EURUSD"
+    """All tunable numbers. Overridable from the command line."""
+    symbol: str = "XAUUSD"        # gold
+    digits: int = 2               # price decimals for display
 
-    # اكتشاف القمم/القيعان (نافذة fractal لكل فريم)
+    # swing detection (fractal window per timeframe)
     sw_h1: int = 4
     sw_m15: int = 3
     sw_m5: int = 2
 
-    equal_tol: float = 0.0007     # تفاوت "القمم المتساوية" (نسبة) = مجمع سيولة
+    equal_tol: float = 0.0007     # "equal highs/lows" tolerance (relative) = liquidity pool
 
-    sweep_lookback: int = 24      # نبحث على Sweep في آخر كم شمعة M15
-    mss_window: int = 12          # الـ MSS لازم يصير خلال كم شمعة M5 بعد الـ Sweep
+    sweep_lookback: int = 24      # look for a sweep in the last N M15 candles
+    mss_window: int = 12          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
-    disp_atr_mult: float = 1.5    # شمعة الاندفاع: جسمها >= 1.5 × ATR
-    disp_body_ratio: float = 0.5  # و جسمها >= 50% من مداها
+    disp_atr_mult: float = 1.5    # displacement candle: body >= 1.5 x ATR
+    disp_body_ratio: float = 0.5  # and body >= 50% of its range
 
-    rr_min: float = 1.5           # أقل Risk:Reward مقبول
+    rr_min: float = 1.5           # minimum acceptable Risk:Reward
 
-    # نوافذ القرار في الوضع المباشر و الباكتيست (عدد شمعات لكل فريم)
+    # decision windows in live/backtest (candles per timeframe)
     win_m5: int = 300
     win_m15: int = 220
     win_h1: int = 200
 
 
 # ============================================================================
-# 3) مؤشرات و أدوات هيكلية (بايثون صافي، بلا مكتبات)
+# 3) Indicators & structure tools (pure Python, no libraries)
 # ============================================================================
 def atr_series(candles, period):
-    """ATR (متوسط المدى الحقيقي) — قائمة بنفس طول الشمعات (None قبل ما يكمل period)."""
+    """ATR (average true range) -- list as long as candles (None before period fills)."""
     n = len(candles)
     trs = [0.0] * n
     for i, c in enumerate(candles):
@@ -151,8 +161,9 @@ def atr_series(candles, period):
 
 
 def swings(candles, w):
-    """قمم/قيعان مؤكّدة (fractal): الشمعة قمة/قاع كان كانت الأعلى/الأدنى
-    وسط نافذة w على كل جيهة. آخر w شمعات ما تتأكدش (باش ما فماش نظر للمستقبل)."""
+    """Confirmed swing highs/lows (fractal): a bar is a swing if it is the
+    extreme within w bars on each side. The last w bars are not confirmed
+    (so there is no look-ahead)."""
     highs, lows = [], []
     n = len(candles)
     for i in range(w, n - w):
@@ -167,7 +178,7 @@ def swings(candles, w):
 
 
 def structure_bias(highs, lows):
-    """اتجاه الهيكل من آخر قمتين/قاعين."""
+    """Structure direction from the last two swing highs/lows."""
     if len(highs) < 2 or len(lows) < 2:
         return "unknown"
     hh = highs[-1][1] > highs[-2][1]
@@ -180,28 +191,28 @@ def structure_bias(highs, lows):
 
 
 # ============================================================================
-# 4) مراحل الاستراتيجية
+# 4) Strategy stages
 # ============================================================================
 def find_recent_sweep(m15, p: Params):
-    """آخر Liquidity Sweep على M15:
-       - Bull sweep : السعر كسر قاع (swing low) و رجع أغلق فوقه  → نبحث BUY.
-       - Bear sweep : السعر كسر قمة (swing high) و رجع أغلق تحتها → نبحث SELL.
-       نرجّعو الأحدث."""
+    """Most recent liquidity sweep on M15:
+       - Bull sweep : price breaks a swing low and closes back above  -> look BUY.
+       - Bear sweep : price breaks a swing high and closes back below  -> look SELL.
+       Returns the latest one."""
     highs, lows = swings(m15, p.sw_m15)
     n = len(m15)
     floor_idx = max(0, n - p.sweep_lookback)
     best = None
 
-    for (si, level) in lows:                       # sell-side liquidity → bull sweep
+    for (si, level) in lows:                       # sell-side liquidity -> bull sweep
         for j in range(si + 1, n):
             c = m15[j]
-            if c.l < level and c.c > level:        # كسر بالفتيل + إغلاق فوق
+            if c.l < level and c.c > level:        # wick below + close above
                 if j >= floor_idx and (best is None or j > best["idx"]):
                     best = {"side": "bull", "level": level, "idx": j,
                             "extreme": c.l, "t": c.t}
                 break
 
-    for (si, level) in highs:                      # buy-side liquidity → bear sweep
+    for (si, level) in highs:                      # buy-side liquidity -> bear sweep
         for j in range(si + 1, n):
             c = m15[j]
             if c.h > level and c.c < level:
@@ -214,14 +225,15 @@ def find_recent_sweep(m15, p: Params):
 
 
 def detect_mss(m5, start_idx, side, p: Params):
-    """MSS على M5 بعد الـ Sweep، بالإغلاق (أقوى من الفتيل)، داخل النافذة الزمنية.
-       Bull: كسر آخر Lower High فوق.   Bear: كسر آخر Higher Low تحت."""
+    """MSS on M5 after the sweep, by close (stronger than a wick), within the
+       validity window. Bull: break the last Lower High up. Bear: break the last
+       Higher Low down."""
     n = len(m5)
     if start_idx >= n:
         return None
 
     if side == "bull":
-        rl_idx = min(range(start_idx, n), key=lambda k: m5[k].l)   # قاع الارتداد
+        rl_idx = min(range(start_idx, n), key=lambda k: m5[k].l)   # reaction low
         highs, _ = swings(m5, p.sw_m5)
         for (hi, pr) in [(i, v) for (i, v) in highs if i > rl_idx]:
             for k in range(hi + 1, n):
@@ -231,7 +243,7 @@ def detect_mss(m5, start_idx, side, p: Params):
                     return {"ref_idx": hi, "ref": pr, "break_idx": k, "ext_idx": rl_idx}
         return None
     else:
-        rh_idx = max(range(start_idx, n), key=lambda k: m5[k].h)   # قمة الارتداد
+        rh_idx = max(range(start_idx, n), key=lambda k: m5[k].h)   # reaction high
         _, lows = swings(m5, p.sw_m5)
         for (li, pr) in [(i, v) for (i, v) in lows if i > rh_idx]:
             for k in range(li + 1, n):
@@ -243,8 +255,9 @@ def detect_mss(m5, start_idx, side, p: Params):
 
 
 def is_displacement(m5, k, atr_arr, side, p: Params):
-    """اندفاع واضح: جسم الشمعة >= disp_atr_mult×ATR و >= disp_body_ratio من المدى،
-       و في اتجاه الصفقة. نقبلو شمعة الكسر k ولا الي قبلها."""
+    """Clear displacement: body >= disp_atr_mult x ATR and >= disp_body_ratio of
+       the range, in the trade direction. Accept the break candle k or the one
+       before it."""
     for idx in (k, k - 1):
         if idx < 0 or idx >= len(m5):
             continue
@@ -262,8 +275,9 @@ def is_displacement(m5, k, atr_arr, side, p: Params):
 
 
 def find_fvg(m5, lo, hi, side):
-    """FVG (فجوة القيمة العادلة) بين شمعتين تحوطو بشمعة الاندفاع، في مجال [lo..hi].
-       Bull: c1.high < c3.low.   Bear: c1.low > c3.high.  نرجّعو الأحدث."""
+    """FVG (fair value gap): imbalance between the two candles around the
+       displacement candle, within [lo..hi].
+       Bull: c1.high < c3.low.   Bear: c1.low > c3.high.  Returns the latest."""
     best = None
     top_i = min(len(m5) - 2, hi)
     for i in range(max(1, lo), top_i + 1):
@@ -276,7 +290,8 @@ def find_fvg(m5, lo, hi, side):
 
 
 def target_liquidity(h1, m15, entry, side, p: Params):
-    """TP = أقرب سيولة مقابلة (قمة فوق للـ BUY / قاع تحت للـ SELL) من M15 و H1."""
+    """TP = nearest opposing liquidity (a high above for BUY / a low below for
+       SELL) taken from M15 and H1 swings."""
     levels = []
     for tf, w in ((m15, p.sw_m15), (h1, p.sw_h1)):
         hs, ls = swings(tf, w)
@@ -290,7 +305,7 @@ def target_liquidity(h1, m15, entry, side, p: Params):
 
 
 # ============================================================================
-# 5) القرار: إشارة ولا NO TRADE + السبب
+# 5) Decision: a signal or NO TRADE + reason
 # ============================================================================
 @dataclass
 class Decision:
@@ -307,106 +322,107 @@ class Decision:
 
 
 def h1_context(h1, side, p: Params):
-    """تصنيف H1: مع الاتجاه ولا انعكاس/تصحيح (تصنيف برك، ما يمنعش)."""
+    """Classify H1: with-trend or reversal/correction (label only, no blocking)."""
     highs, lows = swings(h1, p.sw_h1)
     bias = structure_bias(highs, lows)
     if bias == "up":
-        trend = "H1 صاعد"
+        trend = "H1 up"
     elif bias == "down":
-        trend = "H1 هابط"
+        trend = "H1 down"
     elif bias == "mixed":
-        trend = "H1 عرضي/متذبذب"
+        trend = "H1 ranging"
     else:
-        trend = "H1 غير واضح"
+        trend = "H1 unclear"
     if (side == "bull" and bias == "up") or (side == "bear" and bias == "down"):
-        kind = "مع الاتجاه"
+        kind = "with-trend"
     elif bias in ("up", "down"):
-        kind = "انعكاس/تصحيح"
+        kind = "reversal/correction"
     else:
-        kind = "بلا سياق واضح"
+        kind = "no clear context"
     return f"{trend} ({kind})"
 
 
 def evaluate(h1, m15, m5, p: Params) -> Decision:
-    """المحرّك: يمشي مرحلة مرحلة و يوقف عند أول وحدة تفشل، مع السبب."""
+    """The engine: walks stage by stage and stops at the first that fails,
+       returning the reason."""
     need = max(p.sw_m5 * 2 + 2, p.atr_period + 2)
     if len(m5) < need or len(m15) < (p.sw_m15 * 2 + 2) or len(h1) < (p.sw_h1 * 2 + 2):
-        return Decision(False, "بيانات غير كافية بعد (ننتظر شمعات أكثر).")
+        return Decision(False, "Not enough data yet (waiting for more candles).")
 
-    # (1) Sweep على M15
+    # (1) Sweep on M15
     sweep = find_recent_sweep(m15, p)
     if not sweep:
-        return Decision(False, "لا يوجد Liquidity Sweep حديث على M15 — ما فماش فخ سيولة.")
+        return Decision(False, "No recent liquidity sweep on M15 - no liquidity trap.")
     side = sweep["side"]
     ctx = h1_context(h1, side, p)
     dir_txt = "BUY" if side == "bull" else "SELL"
 
-    # نحدّد بداية الارتداد على M5 (أول شمعة M5 بعد فتح شمعة الـ Sweep)
+    # find the reaction start on M5 (first M5 candle after the sweep candle opened)
     m5_times = [c.t for c in m5]
     start_idx = bisect.bisect_left(m5_times, sweep["t"])
     if start_idx >= len(m5):
-        return Decision(False, f"[{dir_txt}] صار Sweep على M15 أما مازال ما توفّرتش شمعات M5 بعده.", ctx)
+        return Decision(False, f"[{dir_txt}] Sweep on M15 but no M5 candles after it yet.", ctx)
 
-    # (2) MSS على M5
+    # (2) MSS on M5
     mss = detect_mss(m5, start_idx, side, p)
     if not mss:
         return Decision(False,
-                        f"[{dir_txt}] فما Sweep أما ما صارش MSS على M5 داخل النافذة ({p.mss_window} شمعة).",
+                        f"[{dir_txt}] Sweep found but no MSS on M5 within the window ({p.mss_window} candles).",
                         ctx)
 
     # (3) Displacement
     atr_arr = atr_series(m5, p.atr_period)
     if not is_displacement(m5, mss["break_idx"], atr_arr, side, p):
         return Decision(False,
-                        f"[{dir_txt}] صار MSS أما بلا Displacement قوي (الاندفاع ضعيف).",
+                        f"[{dir_txt}] MSS occurred but without strong displacement (weak impulse).",
                         ctx)
 
     # (4) FVG
     fvg = find_fvg(m5, mss["ref_idx"], mss["break_idx"] + 1, side)
     if not fvg:
         return Decision(False,
-                        f"[{dir_txt}] Displacement موجود أما ما خلّاش FVG (فجوة سعرية).",
+                        f"[{dir_txt}] Displacement present but left no FVG.",
                         ctx)
 
-    # نقطة الـ Sweep المتطرّفة (لتحديد SL) + الدخول (حافة الـ FVG القريبة)
+    # sweep extreme (for SL) + entry (near edge of the FVG)
     seg = m5[start_idx:mss["break_idx"] + 1]
     a = atr_arr[mss["break_idx"]] or (m5[-1].h - m5[-1].l)
     buf = 0.1 * a
     if side == "bull":
         react = min(x.l for x in seg)
         sl = react - buf
-        entry = fvg["top"]                     # حافة الـ FVG العليا (proximal من فوق)
+        entry = fvg["top"]                     # upper edge of the FVG (proximal from above)
     else:
         react = max(x.h for x in seg)
         sl = react + buf
-        entry = fvg["bottom"]                  # حافة الـ FVG السفلى (proximal من تحت)
+        entry = fvg["bottom"]                  # lower edge of the FVG (proximal from below)
 
-    # (5) إبطال: كان بعد الـ MSS السعر أغلق ورا نقطة الـ Sweep قبل الرجوع للـ FVG
+    # (5) invalidation: after MSS, price closed beyond the sweep point before returning to the FVG
     for k in range(mss["break_idx"] + 1, len(m5)):
         if side == "bull" and m5[k].c < react:
-            return Decision(False, f"[{dir_txt}] الفكرة أُبطلت: السعر أغلق تحت قاع الـ Sweep.", ctx)
+            return Decision(False, f"[{dir_txt}] Idea invalidated: price closed below the sweep low.", ctx)
         if side == "bear" and m5[k].c > react:
-            return Decision(False, f"[{dir_txt}] الفكرة أُبطلت: السعر أغلق فوق قمة الـ Sweep.", ctx)
+            return Decision(False, f"[{dir_txt}] Idea invalidated: price closed above the sweep high.", ctx)
 
-    # (6) TP = السيولة المقابلة  +  فلتر RR
+    # (6) TP = opposing liquidity + RR filter
     tp = target_liquidity(h1, m15, entry, side, p)
     if tp is None:
-        return Decision(False, f"[{dir_txt}] ما فماش سيولة مقابلة واضحة كهدف (TP).", ctx)
+        return Decision(False, f"[{dir_txt}] No clear opposing liquidity to use as TP.", ctx)
 
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     if risk <= 0:
-        return Decision(False, f"[{dir_txt}] مسافة الوقف صفر — تجاهل.", ctx)
+        return Decision(False, f"[{dir_txt}] Stop distance is zero - skip.", ctx)
     rr = reward / risk
     key = (sweep["idx"], mss["break_idx"], fvg["idx"])
     base_info = {"sweep": sweep, "mss": mss, "fvg": fvg, "react": react}
 
     if rr < p.rr_min:
         return Decision(False,
-                        f"[{dir_txt}] RR ضعيف {rr:.2f} < {p.rr_min:.2f} (الهدف قريب برشة) → NO TRADE.",
+                        f"[{dir_txt}] RR too small {rr:.2f} < {p.rr_min:.2f} (target too close) -> NO TRADE.",
                         ctx, side, entry, sl, tp, rr, key, base_info)
 
-    # (7) Retracement: لازم السعر يرجع يلمس الـ FVG توّا (أول لمسة)
+    # (7) Retracement: price must tag the FVG now (first touch)
     last = m5[-1]
     prev = m5[-2] if len(m5) >= 2 else last
     if side == "bull":
@@ -416,28 +432,29 @@ def evaluate(h1, m15, m5, p: Params) -> Decision:
 
     if not tagged_now:
         return Decision(False,
-                        f"[{dir_txt}] الإعداد جاهز و RR={rr:.2f} أما السعر مازال ما رجعش للـ FVG "
-                        f"(ننتظر Retracement).",
+                        f"[{dir_txt}] Setup ready and RR={rr:.2f}, but price has not returned to the FVG "
+                        f"yet (waiting for retracement).",
                         ctx, side, entry, sl, tp, rr, key, base_info)
 
-    # إشارة كاملة
+    # full signal
     return Decision(True,
-                    f"إشارة {dir_txt} — Sweep→MSS→Displacement→FVG→Retracement ✔",
+                    f"{dir_txt} signal - Sweep->MSS->Displacement->FVG->Retracement OK",
                     ctx, side, entry, sl, tp, rr, key, base_info)
 
 
 # ============================================================================
-# 6) تنسيق النص + تيليقرام
+# 6) Text formatting + Telegram
 # ============================================================================
-def fmt(x, d=5):
-    return f"{x:.{d}f}"
+def fmt(x, d=None):
+    return f"{x:.{PRICE_DIGITS if d is None else d}f}"
 
 
 def signal_text(sym, dec: Decision) -> str:
-    arrow = "🟢 BUY" if dec.side == "bull" else "🔴 SELL"
+    arrow = "BUY" if dec.side == "bull" else "SELL"
+    emoji = "\U0001F7E2" if dec.side == "bull" else "\U0001F534"  # green / red circle
     return (
-        f"{arrow}  {sym}\n"
-        f"— — — — — — — —\n"
+        f"{emoji} {arrow}  {sym}\n"
+        f"----------------\n"
         f"Entry : {fmt(dec.entry)}\n"
         f"SL    : {fmt(dec.sl)}\n"
         f"TP    : {fmt(dec.tp)}\n"
@@ -449,7 +466,7 @@ def signal_text(sym, dec: Decision) -> str:
 
 def telegram_send(text: str) -> bool:
     if not telegram_configured():
-        print("[تيليقرام] غير مهيّأ (حط التوكن و الـ Chat ID) — تخطّي الإرسال.")
+        print("[Telegram] Not configured (set the token and chat id) - skipping send.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
@@ -457,23 +474,23 @@ def telegram_send(text: str) -> bool:
         with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as r:
             ok = json.loads(r.read().decode()).get("ok", False)
             if not ok:
-                print("[تيليقرام] الرد ما كانش ok.")
+                print("[Telegram] Response was not ok.")
             return ok
-    except Exception as e:                      # noqa: BLE001
-        print(f"[تيليقرام] فشل الإرسال: {e}")
+    except Exception as e:                       # noqa: BLE001
+        print(f"[Telegram] Send failed: {e}")
         return False
 
 
 # ============================================================================
-# 7) MT5 — جلب البيانات
+# 7) MT5 - data feed
 # ============================================================================
 class MT5Feed:
     def __init__(self, params: Params):
         try:
-            import MetaTrader5 as mt5           # noqa: N813
-        except Exception as e:                  # noqa: BLE001
+            import MetaTrader5 as mt5            # noqa: N813
+        except Exception as e:                   # noqa: BLE001
             raise RuntimeError(
-                "حزمة MetaTrader5 غير متوفّرة. ثبّتها على Windows:  pip install MetaTrader5"
+                "MetaTrader5 package not available. Install it on Windows:  pip install MetaTrader5"
             ) from e
         self.mt5 = mt5
         self.p = params
@@ -483,21 +500,26 @@ class MT5Feed:
         }
 
     def connect(self):
+        global PRICE_DIGITS
         kwargs = {}
         if MT5_TERMINAL_PATH:
             kwargs["path"] = MT5_TERMINAL_PATH
         if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
             kwargs.update(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER)
         if not self.mt5.initialize(**kwargs):
-            raise RuntimeError(f"فشل تهيئة MT5: {self.mt5.last_error()}")
+            raise RuntimeError(f"MT5 initialize failed: {self.mt5.last_error()}")
         if not self.mt5.symbol_select(self.p.symbol, True):
-            raise RuntimeError(f"الرمز {self.p.symbol} غير متوفّر في MT5.")
-        print(f"[MT5] متّصل. الرمز: {self.p.symbol}")
+            raise RuntimeError(f"Symbol {self.p.symbol} is not available in MT5.")
+        info = self.mt5.symbol_info(self.p.symbol)
+        if info is not None and getattr(info, "digits", None) is not None:
+            self.p.digits = info.digits
+            PRICE_DIGITS = info.digits
+        print(f"[MT5] Connected. Symbol: {self.p.symbol}  digits={self.p.digits}")
 
     def shutdown(self):
         try:
             self.mt5.shutdown()
-        except Exception:                       # noqa: BLE001
+        except Exception:                        # noqa: BLE001
             pass
 
     @staticmethod
@@ -513,7 +535,7 @@ class MT5Feed:
     def latest(self, tf: str, count: int):
         rates = self.mt5.copy_rates_from_pos(self.p.symbol, self.tf_map[tf], 0, count)
         c = self._to_candles(rates)
-        # نحيّدو الشمعة الأخيرة إذا مازالت ما سكّرتش
+        # drop the last candle if it has not closed yet
         now = time.time()
         while c and c[-1].close_time(tf) > now:
             c.pop()
@@ -525,7 +547,7 @@ class MT5Feed:
 
 
 # ============================================================================
-# 8) الباكتيست — 90 يوم، تصنيف رابحة/خاسرة، طباعة كل صفقة
+# 8) Backtest - 90 days, WIN/LOSS classification, print every trade
 # ============================================================================
 @dataclass
 class Trade:
@@ -543,17 +565,16 @@ class Trade:
 
 
 def _slice_tail(arr_times, arr, upto_close, tf, win):
-    """آخر win شمعة مسكّرة قبل upto_close."""
-    # arr_times = أوقات الفتح؛ الشمعة مسكّرة كان t + tf <= upto_close
+    """Last `win` candles closed before upto_close."""
     j = bisect.bisect_right(arr_times, upto_close - TF_SECONDS[tf])
     return arr[max(0, j - win):j]
 
 
 def run_backtest(h1, m15, m5, p: Params, days: int):
-    """يمشي على شمعات M5 (سبب القرار كل 5 د)، يقيّم بنفس المحرّك بلا نظر للمستقبل،
-       ثم يحاكي كل إشارة للأمام باش يعرف WIN/LOSS."""
+    """Walks M5 candles (a decision every 5m), evaluates with the same engine
+       and no look-ahead, then simulates each signal forward to mark WIN/LOSS."""
     if not m5:
-        print("لا توجد بيانات M5 للباكتيست.")
+        print("No M5 data for the backtest.")
         return
 
     cutoff = m5[-1].close_time("M5") - days * 86400
@@ -572,7 +593,7 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
     while i < n:
         bar = m5[i]
 
-        # كان عندنا صفقة مفتوحة نتابعها لين تسكّر (صفقة وحدة في نفس الوقت)
+        # if a trade is open, follow it until it closes (one trade at a time)
         if open_trade is not None:
             hit = _check_exit(open_trade, bar)
             if hit:
@@ -592,17 +613,17 @@ def run_backtest(h1, m15, m5, p: Params, days: int):
             seen_keys.add(dec.key)
             open_trade = Trade(dec.side, dec.context, dec.entry, dec.sl, dec.tp,
                                dec.rr, bar.t)
-            # المحاكاة تبدا من الشمعة الجاية
+            # simulation starts on the next candle
         i += 1
 
     if open_trade is not None:
-        trades.append(open_trade)   # مازالت مفتوحة في آخر البيانات
+        trades.append(open_trade)   # still open at the end of the data
 
     _print_backtest_report(p, days, trades)
 
 
 def _check_exit(tr: Trade, bar: Candle):
-    """هل هذي الشمعة سكّرت الصفقة؟ (نفترض الوقف يضرب قبل الهدف عند التعارض = تحفّظ)."""
+    """Did this candle close the trade? (assume SL fills before TP on conflict = conservative)."""
     if tr.side == "bull":
         if bar.l <= tr.sl:
             tr.result = "LOSS"; tr.exit_price = tr.sl
@@ -632,47 +653,47 @@ def _print_backtest_report(p: Params, days: int, trades):
     closed = len(wins) + len(losses)
 
     print("\n" + "=" * 70)
-    print(f"  BACKTEST — {p.symbol} — آخر {days} يوم")
+    print(f"  BACKTEST - {p.symbol} - last {days} days")
     print("=" * 70)
-    print(f"  إجمالي الإشارات      : {len(trades)}")
-    print(f"  رابحة (WIN)          : {len(wins)}")
-    print(f"  خاسرة (LOSS)         : {len(losses)}")
+    print(f"  Total signals   : {len(trades)}")
+    print(f"  Wins            : {len(wins)}")
+    print(f"  Losses          : {len(losses)}")
     if opens:
-        print(f"  مازالت مفتوحة        : {len(opens)}")
+        print(f"  Still open      : {len(opens)}")
     if closed:
         wr = 100.0 * len(wins) / closed
         total_r = sum(t.r_mult for t in wins + losses)
-        print(f"  نسبة الربح (Win rate): {wr:.1f}%")
-        print(f"  صافي R               : {total_r:+.2f} R")
+        print(f"  Win rate        : {wr:.1f}%")
+        print(f"  Net R           : {total_r:+.2f} R")
     print("=" * 70)
 
     if not trades:
-        print("  ما طلعت حتى إشارة على هالفترة بهالإعدادات. جرّب تخفّض --rr-min "
-              "ولا --disp-atr-mult ولا تزيد --sweep-lookback.")
+        print("  No signals in this period with these settings. Try lowering --rr-min "
+              "or --disp-atr-mult, or raising --sweep-lookback.")
         return
 
-    print("\n  تفاصيل كل صفقة:")
+    print("\n  Trade details:")
     print("  " + "-" * 66)
     for n_, t in enumerate(trades, 1):
         side = "BUY " if t.side == "bull" else "SELL"
-        tag = {"WIN": "✅ WIN ", "LOSS": "❌ LOSS", "OPEN": "⏳ OPEN"}[t.result]
-        print(f"  #{n_:<3} {side} {tag}  RR=1:{t.rr:.2f}  R={t.r_mult:+.2f}")
-        print(f"       دخول : {_ts(t.t_entry)}   @ {fmt(t.entry)}")
+        tag = {"WIN": "WIN ", "LOSS": "LOSS", "OPEN": "OPEN"}[t.result]
+        print(f"  #{n_:<3} {side} [{tag}]  RR=1:{t.rr:.2f}  R={t.r_mult:+.2f}")
+        print(f"       entry: {_ts(t.t_entry)}   @ {fmt(t.entry)}")
         print(f"       SL   : {fmt(t.sl)}    TP: {fmt(t.tp)}")
         if t.result != "OPEN":
-            print(f"       خروج : {_ts(t.t_exit)}   @ {fmt(t.exit_price)}")
-        print(f"       سياق : {t.context}")
+            print(f"       exit : {_ts(t.t_exit)}   @ {fmt(t.exit_price)}")
+        print(f"       ctx  : {t.context}")
         print("  " + "-" * 66)
 
 
 # ============================================================================
-# 9) الوضع المباشر — كل 5 دقايق
+# 9) Live mode - every 5 minutes, 24h (no session filter)
 # ============================================================================
 def load_sent(path="sent_signals.json"):
     try:
         with open(path) as f:
             return set(tuple(k) for k in json.load(f))
-    except Exception:                           # noqa: BLE001
+    except Exception:                            # noqa: BLE001
         return set()
 
 
@@ -680,18 +701,18 @@ def save_sent(keys, path="sent_signals.json"):
     try:
         with open(path, "w") as f:
             json.dump([list(k) for k in keys], f)
-    except Exception:                           # noqa: BLE001
+    except Exception:                            # noqa: BLE001
         pass
 
 
 def live_loop(feed: MT5Feed, p: Params):
     print("\n" + "=" * 70)
-    print(f"  الوضع المباشر — {p.symbol} — تحديث كل {TF_SECONDS['M5'] // 60} دقايق")
+    print(f"  LIVE - {p.symbol} - refresh every {TF_SECONDS['M5'] // 60} minutes (24h, no session filter)")
     print("=" * 70)
     sent = load_sent()
 
     while True:
-        # نستنّى إغلاق شمعة M5 الجاية + هامش صغير باش البروكر يحدّث
+        # wait for the next M5 candle to close + a small margin for the broker to update
         now = time.time()
         nxt = (int(now) // 300 + 1) * 300 + 8
         time.sleep(max(1, nxt - now))
@@ -700,8 +721,8 @@ def live_loop(feed: MT5Feed, p: Params):
             h1 = feed.latest("H1", 600)
             m15 = feed.latest("M15", 1500)
             m5 = feed.latest("M5", p.win_m5 + 50)
-        except Exception as e:                  # noqa: BLE001
-            print(f"[{_ts(int(time.time()))}] خطأ في جلب البيانات: {e}")
+        except Exception as e:                   # noqa: BLE001
+            print(f"[{_ts(int(time.time()))}] Data fetch error: {e}")
             continue
 
         dec = evaluate(h1, m15, m5, p)
@@ -709,42 +730,42 @@ def live_loop(feed: MT5Feed, p: Params):
 
         if dec.signal:
             if dec.key in sent:
-                print(f"[{stamp}] إشارة مكرّرة (تبعثت قبل) — تخطّي.")
+                print(f"[{stamp}] Duplicate signal (already sent) - skipping.")
                 continue
             text = signal_text(p.symbol, dec)
-            print(f"\n[{stamp}] === إشارة ===\n{text}\n")
+            print(f"\n[{stamp}] === SIGNAL ===\n{text}\n")
             telegram_send(text)
             sent.add(dec.key)
             save_sent(sent)
         else:
-            print(f"[{stamp}] NO TRADE — {dec.reason}"
+            print(f"[{stamp}] NO TRADE - {dec.reason}"
                   + (f"  | {dec.context}" if dec.context else ""))
 
 
 # ============================================================================
-# 10) Self-test — يجرّب المحرّك و الباكتيست ببيانات مولّدة (بلا MT5)
+# 10) Self-test - exercises the engine and backtest on synthetic data (no MT5)
 # ============================================================================
-def _gen_synthetic_m5(n=26000, seed=7, start_price=1.10000):
-    """random-walk بسيط باش نتأكدو أن الكود يشتغل بلا crash."""
+def _gen_synthetic(n=26000, seed=7, start_price=2000.0):
+    """Simple random walk (gold-like prices) to prove the code runs without crashing."""
     import random
     rnd = random.Random(seed)
     t0 = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp())
     price = start_price
     out = []
     for i in range(n):
-        drift = math.sin(i / 500.0) * 0.00005
+        drift = math.sin(i / 500.0) * 0.05
         o = price
-        step = rnd.gauss(drift, 0.00035)
-        c = max(0.5, o + step)
-        hi = max(o, c) + abs(rnd.gauss(0, 0.00025))
-        lo = min(o, c) - abs(rnd.gauss(0, 0.00025))
-        out.append(Candle(t0 + i * 300, round(o, 5), round(hi, 5), round(lo, 5), round(c, 5)))
+        step = rnd.gauss(drift, 0.6)
+        c = max(1.0, o + step)
+        hi = max(o, c) + abs(rnd.gauss(0, 0.4))
+        lo = min(o, c) - abs(rnd.gauss(0, 0.4))
+        out.append(Candle(t0 + i * 300, round(o, 2), round(hi, 2), round(lo, 2), round(c, 2)))
         price = c
     return out
 
 
 def _aggregate(m5, tf):
-    """نجمّع M5 لفريم أكبر (M15/H1) حسب الوقت."""
+    """Aggregate M5 into a higher timeframe (M15/H1) by time bucket."""
     step = TF_SECONDS[tf]
     buckets = {}
     order = []
@@ -762,13 +783,15 @@ def _aggregate(m5, tf):
 
 
 def selftest(p: Params):
-    print("[selftest] توليد بيانات وهمية (random-walk) و تشغيل الباكتيست…")
-    m5 = _gen_synthetic_m5()
+    global PRICE_DIGITS
+    PRICE_DIGITS = 2
+    print("[selftest] Generating synthetic data (random walk) and running the backtest...")
+    m5 = _gen_synthetic()
     m15 = _aggregate(m5, "M15")
     h1 = _aggregate(m5, "H1")
-    print(f"[selftest] M5={len(m5)}  M15={len(m15)}  H1={len(h1)} شمعة")
+    print(f"[selftest] M5={len(m5)}  M15={len(m15)}  H1={len(h1)} candles")
     run_backtest(h1, m15, m5, p, days=90)
-    print("\n[selftest] المحرّك اشتغل بلا أخطاء ✔ (النتائج على بيانات وهمية، للتجربة برك).")
+    print("\n[selftest] Engine ran without errors. (Results are on synthetic data, for testing only.)")
 
 
 # ============================================================================
@@ -786,13 +809,13 @@ def build_params(args) -> Params:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="ICT/SMC Intraday Bot (MT5 + Telegram) — ملف واحد.")
-    ap.add_argument("--symbol", default="EURUSD")
-    ap.add_argument("--backtest-only", action="store_true", help="backtest برك ثم يخرج")
-    ap.add_argument("--live-only", action="store_true", help="مباشر برك بلا backtest")
-    ap.add_argument("--selftest", action="store_true", help="تجربة ببيانات وهمية بلا MT5")
-    ap.add_argument("--days", type=int, default=90, help="عدد أيام الباكتيست (افتراضي 90)")
-    # ضبط الاستراتيجية
+    ap = argparse.ArgumentParser(description="ICT/SMC Intraday Bot (MT5 + Telegram) - single file.")
+    ap.add_argument("--symbol", default="XAUUSD")
+    ap.add_argument("--backtest-only", action="store_true", help="backtest only then exit")
+    ap.add_argument("--live-only", action="store_true", help="live only, no backtest")
+    ap.add_argument("--selftest", action="store_true", help="test on synthetic data without MT5")
+    ap.add_argument("--days", type=int, default=90, help="backtest days (default 90)")
+    # strategy tuning
     ap.add_argument("--rr-min", type=float, dest="rr_min")
     ap.add_argument("--disp-atr-mult", type=float, dest="disp_atr_mult")
     ap.add_argument("--disp-body-ratio", type=float, dest="disp_body_ratio")
@@ -814,18 +837,18 @@ def main():
     feed.connect()
     try:
         if not args.live_only:
-            # (1) Backtest مرة وحدة عند التشغيل
+            # (1) one backtest on start
             now = datetime.now(timezone.utc)
-            dt_from = now - timedelta(days=args.days + 15)   # +15 تسخين
-            print(f"[MT5] جلب تاريخ {args.days}+15 يوم…")
+            dt_from = now - timedelta(days=args.days + 15)   # +15 warmup
+            print(f"[MT5] Fetching {args.days}+15 days of history...")
             h1 = feed.range("H1", dt_from, now)
             m15 = feed.range("M15", dt_from, now)
             m5 = feed.range("M5", dt_from, now)
-            print(f"[MT5] H1={len(h1)}  M15={len(m15)}  M5={len(m5)} شمعة")
+            print(f"[MT5] H1={len(h1)}  M15={len(m15)}  M5={len(m5)} candles")
             run_backtest(h1, m15, m5, p, days=args.days)
 
         if not args.backtest_only:
-            # (2) مباشر كل 5 دقايق
+            # (2) live every 5 minutes
             live_loop(feed, p)
     finally:
         feed.shutdown()
@@ -835,7 +858,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nتوقّف بطلب المستخدم.")
+        print("\nStopped by user.")
     except RuntimeError as e:
-        print(f"خطأ: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

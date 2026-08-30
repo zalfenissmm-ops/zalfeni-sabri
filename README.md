@@ -70,86 +70,91 @@ Suggested TP     : 37.96200
 `Entry ready: True` يعني السعر رجع لمنطقة العلاوة (فوق 50% من الهبوط) وداخل الأوردر بلوك أو الفجوة السعرية —
 نفس النقطة اللي كانت متوضحة في خريطة الاستراتيجية.
 
+
 ---
 
 ## 🔥 ICT/SMC Intraday Bot — `ict_smc_bot.py`
 
-بوت **ملف واحد** يطبّق استراتيجية ICT الانترادي (H1 سياق → M15 سيولة/Sweep →
-M5 MSS + Displacement + FVG → Retracement)، يجيب البيانات من **MetaTrader 5**،
-يعمل **Backtest 90 يوم** عند التشغيل، ثم يشتغل **مباشر كل 5 دقايق** و يبعث
-إشارات (Entry / SL / TP / RR) على **تيليقرام**.
+A **single-file** bot that runs the ICT intraday strategy (H1 context → M15
+liquidity/sweep → M5 MSS + Displacement + FVG → Retracement), pulls data from
+**MetaTrader 5**, runs a **90-day backtest** on start, then runs **live every 5
+minutes** and sends signals (Entry / SL / TP / RR) to **Telegram**.
 
-### تسلسل الاستراتيجية
+Default symbol: **Gold (XAUUSD)**. Runs **24h** — there is no trading-session
+filter.
+
+### Strategy sequence
 
 ```
-H1  : تصنيف السياق (مع الاتجاه / انعكاس-تصحيح) — تصنيف برك، ما يمنعش الصفقة
-M15 : Liquidity Sweep (كسر قمة/قاع + رجوع = فخ)
-M5  : MSS (بالإغلاق) + Displacement (جسم ≥ 1.5×ATR) + FVG
-ثم  : Retracement للـ FVG = الدخول
-SL  : تحت/فوق نقطة الـ Sweep   |   TP : السيولة المقابلة   |   RR ≥ 1.5 و إلا NO TRADE
+H1  : classify context (with-trend / reversal-correction) — label only, does NOT block
+M15 : liquidity sweep (break a high/low then close back = trap)
+M5  : MSS (by close) + Displacement (body >= 1.5 x ATR) + FVG
+then: retracement into the FVG = entry
+SL  : beyond the sweep extreme  |  TP : opposing liquidity  |  RR >= 1.5 or NO TRADE
 ```
 
-### طريقة التشغيل
+### How to run
 
 ```bash
-# 1) حط التوكن و الـ Chat ID (في أعلى الملف أو كمتغيرات بيئة)
+# 1) Set your Telegram token and chat id (top of the file, or as env vars)
 export TELEGRAM_BOT_TOKEN="123456:ABC..."
 export TELEGRAM_CHAT_ID="987654321"
 
-# 2) التشغيل الكامل: Backtest 90 يوم مرة وحدة، ثم مباشر كل 5 دقايق
-python3 ict_smc_bot.py --symbol EURUSD
+# 2) Full run: one 90-day backtest, then live every 5 minutes
+python3 ict_smc_bot.py                    # defaults to XAUUSD
 
-# خيارات أخرى
-python3 ict_smc_bot.py --backtest-only          # backtest برك
-python3 ict_smc_bot.py --live-only              # مباشر برك
-python3 ict_smc_bot.py --selftest               # تجربة المحرّك ببيانات وهمية (بلا MT5)
+# other modes
+python3 ict_smc_bot.py --backtest-only    # backtest only
+python3 ict_smc_bot.py --live-only        # live only
+python3 ict_smc_bot.py --selftest         # test the engine on synthetic data (no MT5)
 ```
 
-### المتطلبات
+### Requirements
 
-- **Windows** + تيرمينال **MetaTrader 5** مفتوح و مسجّل دخول.
+- **Windows** + an open, logged-in **MetaTrader 5** terminal.
 - `pip install MetaTrader5`
-- تيليقرام: بوت من `@BotFather` + الـ Chat ID (الطريقة مشروحة أعلى الملف).
+- Telegram: a bot from `@BotFather` + your chat id (steps are at the top of the file).
 
-### أهم الأرقام القابلة للتعديل (من سطر الأوامر)
+### Main tunables (command line)
 
-| الخيار | المعنى | الافتراضي |
+| Option | Meaning | Default |
 |---|---|---|
-| `--rr-min` | أقل Risk:Reward مقبول | 1.5 |
-| `--disp-atr-mult` | حجم شمعة الاندفاع (× ATR) | 1.5 |
-| `--disp-body-ratio` | نسبة الجسم من المدى | 0.5 |
-| `--sweep-lookback` | نبحث على Sweep في آخر كم شمعة M15 | 24 |
-| `--mss-window` | الـ MSS لازم يصير خلال كم شمعة M5 بعد الـ Sweep | 12 |
-| `--atr-period` | فترة ATR | 14 |
+| `--symbol` | trading symbol | XAUUSD |
+| `--rr-min` | minimum Risk:Reward | 1.5 |
+| `--disp-atr-mult` | displacement candle size (x ATR) | 1.5 |
+| `--disp-body-ratio` | body as fraction of range | 0.5 |
+| `--sweep-lookback` | look for a sweep in the last N M15 candles | 24 |
+| `--mss-window` | MSS must occur within N M5 candles after the sweep | 12 |
+| `--atr-period` | ATR period | 14 |
 
-### مثال مخرجات الباكتيست
+### Backtest output (example)
 
 ```
 ======================================================================
-  BACKTEST — EURUSD — آخر 90 يوم
+  BACKTEST - XAUUSD - last 90 days
 ======================================================================
-  إجمالي الإشارات      : 12
-  رابحة (WIN)          : 7
-  خاسرة (LOSS)         : 5
-  نسبة الربح (Win rate): 58.3%
-  صافي R               : +6.40 R
+  Total signals   : 12
+  Wins            : 7
+  Losses          : 5
+  Win rate        : 58.3%
+  Net R           : +6.40 R
 ======================================================================
-  ... تفاصيل كل صفقة (دخول/خروج/SL/TP/RR/سياق) ...
+  ... details of every trade (entry/exit/SL/TP/RR/context) ...
 ```
 
-### مثال إشارة مباشرة (تيليقرام)
+### Live signal (Telegram) example
 
 ```
-🟢 BUY  EURUSD
-Entry : 1.08540
-SL    : 1.08390
-TP    : 1.09150
-RR    : 1 : 4.10
-Context: H1 صاعد (مع الاتجاه)
+🟢 BUY  XAUUSD
+Entry : 2345.60
+SL    : 2342.10
+TP    : 2358.90
+RR    : 1 : 3.80
+Context: H1 up (with-trend)
 ```
 
-و كان NO TRADE يطبع علاش (أي مرحلة وقفت): مثلاً
-`NO TRADE — [BUY] فما Sweep أما ما صارش MSS على M5 داخل النافذة (12 شمعة).`
+On NO TRADE it prints the reason (which stage stopped), e.g.
+`NO TRADE - [BUY] Sweep found but no MSS on M5 within the window (12 candles).`
 
-> ملاحظة: الباكتيست بلا نظر للمستقبل (القمم/القيعان تتأكد بالتأخير الصحيح).
-> نتائج `--selftest` على بيانات **وهمية** للتجربة برك، موش أداء حقيقي.
+> Note: the backtest has no look-ahead (swings confirm with the correct lag).
+> `--selftest` numbers are on **synthetic** data — for testing the code, not real performance.
