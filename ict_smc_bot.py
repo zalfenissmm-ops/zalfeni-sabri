@@ -99,6 +99,7 @@ class Params:
     rr_min: float = 1.5
     balance: float = 1000.0       # backtest account example
     risk_pct: float = 1.0         # % of equity risked per trade
+    max_hold_hours: float = 24.0  # time-stop: close if neither TP nor SL hit (0 = off)
 
     win_m5: int = 300             # live decision windows (candles per timeframe)
     win_m15: int = 220
@@ -467,22 +468,24 @@ class Trade:
     r_mult: float = 0.0
 
 
-def _resolve_on_m1(tr: Trade, m1, m1_times, entry_open):
+def _resolve_on_m1(tr: Trade, m1, m1_times, entry_open, max_hold=0):
     """Fill on M1 (limit at entry) then walk M1 forward. SL is checked before TP
-    within each minute (pessimistic when both are touched in the same minute)."""
+    within each minute (pessimistic when both are touched in the same minute).
+    If max_hold seconds pass without TP/SL, close at market (time-stop)."""
     i = bisect.bisect_left(m1_times, entry_open)
     filled = False
+    fill_t = None
     for j in range(i, len(m1)):
         b = m1[j]
         if not filled:
             if tr.side == "bull":
                 if b.l <= tr.entry:
-                    filled = True; tr.t_entry = b.t
+                    filled = True; tr.t_entry = b.t; fill_t = b.t
                 else:
                     continue
             else:
                 if b.h >= tr.entry:
-                    filled = True; tr.t_entry = b.t
+                    filled = True; tr.t_entry = b.t; fill_t = b.t
                 else:
                     continue
         if tr.side == "bull":
@@ -495,6 +498,11 @@ def _resolve_on_m1(tr: Trade, m1, m1_times, entry_open):
                 tr.result, tr.exit_price, tr.t_exit = "LOSS", tr.sl, b.t; break
             if b.l <= tr.tp:
                 tr.result, tr.exit_price, tr.t_exit = "WIN", tr.tp, b.t; break
+        if max_hold and (b.t - fill_t) >= max_hold:
+            gain = (b.c - tr.entry) if tr.side == "bull" else (tr.entry - b.c)
+            tr.result = "WIN" if gain >= 0 else "LOSS"
+            tr.exit_price, tr.t_exit = b.c, b.t
+            break
     if tr.result in ("WIN", "LOSS"):
         risk = abs(tr.entry - tr.sl) or 1e-9
         tr.r_mult = (tr.exit_price - tr.entry) / risk if tr.side == "bull" else (tr.entry - tr.exit_price) / risk
@@ -597,7 +605,7 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
         st["9_signal"] += 1
         tr = Trade(side, h1_context(h1a, side, p), entry, sl, tp, rr, m5[retrace_i].t)
         if m1:
-            _resolve_on_m1(tr, m1, m1_times, m5[retrace_i].t)   # honest M1 outcome
+            _resolve_on_m1(tr, m1, m1_times, m5[retrace_i].t, p.max_hold_hours * 3600)
         trades.append(tr)
 
     _print_analysis(p, days, st, trades, bool(m1), entry_tf)
@@ -791,7 +799,7 @@ def build_params(args) -> Params:
     p = Params()
     for f_ in ("symbol", "sweep_lookback", "mss_window", "atr_period",
                "disp_atr_mult", "disp_body_ratio", "rr_min", "sw_h1", "sw_m15", "sw_m5",
-               "balance", "risk_pct"):
+               "balance", "risk_pct", "max_hold_hours"):
         v = getattr(args, f_, None)
         if v is not None:
             setattr(p, f_, v)
@@ -810,6 +818,7 @@ def main():
     ap.add_argument("--days", type=int, default=90)
     ap.add_argument("--balance", type=float, dest="balance", help="account example balance (default 1000)")
     ap.add_argument("--risk-pct", type=float, dest="risk_pct", help="%% of equity risked per trade (default 1.0)")
+    ap.add_argument("--max-hold-hours", type=float, dest="max_hold_hours", help="time-stop hours (0 = off, default 24)")
     ap.add_argument("--rr-min", type=float, dest="rr_min")
     ap.add_argument("--disp-atr-mult", type=float, dest="disp_atr_mult")
     ap.add_argument("--disp-body-ratio", type=float, dest="disp_body_ratio")
