@@ -97,6 +97,8 @@ class Params:
     disp_body_ratio: float = 0.4
 
     rr_min: float = 1.5
+    balance: float = 1000.0       # backtest account example
+    risk_pct: float = 1.0         # % of equity risked per trade
 
     win_m5: int = 300             # live decision windows (candles per timeframe)
     win_m15: int = 220
@@ -602,6 +604,19 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
     return trades
 
 
+def _equity_stats(trades, balance, risk_pct):
+    """Compound each closed trade by risking risk_pct of current equity; return
+    final balance and max peak-to-trough drawdown."""
+    eq = peak = balance
+    max_dd = 0.0
+    for t in sorted((x for x in trades if x.result in ("WIN", "LOSS")), key=lambda x: x.t_entry):
+        eq += eq * (risk_pct / 100.0) * t.r_mult
+        peak = max(peak, eq)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - eq) / peak)
+    return eq, max_dd
+
+
 def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf="M5"):
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
@@ -628,6 +643,10 @@ def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf
     if closed:
         print(f"  Win rate        : {100.0 * len(wins) / closed:.1f}%")
         print(f"  Net R           : {sum(t.r_mult for t in wins + losses):+.2f} R")
+        final, max_dd = _equity_stats(trades, p.balance, p.risk_pct)
+        print(f"  --- ${p.balance:.0f} account, risk {p.risk_pct:.1f}%/trade ---")
+        print(f"  Final balance   : ${final:,.2f}  ({(final / p.balance - 1) * 100:+.1f}%)")
+        print(f"  Max drawdown    : {max_dd * 100:.1f}%")
     print("=" * 70)
 
     if not trades:
@@ -646,7 +665,7 @@ def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf
         print("  " + "-" * 66)
 
 
-def _print_combined(days, n_symbols, trades):
+def _print_combined(p, days, n_symbols, trades):
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
     closed = len(wins) + len(losses)
@@ -658,6 +677,9 @@ def _print_combined(days, n_symbols, trades):
     if closed:
         print(f"  Win rate      : {100.0 * len(wins) / closed:.1f}%")
         print(f"  Net R         : {sum(t.r_mult for t in wins + losses):+.2f} R")
+        final, max_dd = _equity_stats(trades, p.balance, p.risk_pct)
+        print(f"  ${p.balance:.0f} acct (risk {p.risk_pct:.1f}%): final ${final:,.2f}"
+              f"  ({(final / p.balance - 1) * 100:+.1f}%)   max DD {max_dd * 100:.1f}%")
     print("#" * 70)
 
 
@@ -768,7 +790,8 @@ def selftest(p: Params, fast=False):
 def build_params(args) -> Params:
     p = Params()
     for f_ in ("symbol", "sweep_lookback", "mss_window", "atr_period",
-               "disp_atr_mult", "disp_body_ratio", "rr_min", "sw_h1", "sw_m15", "sw_m5"):
+               "disp_atr_mult", "disp_body_ratio", "rr_min", "sw_h1", "sw_m15", "sw_m5",
+               "balance", "risk_pct"):
         v = getattr(args, f_, None)
         if v is not None:
             setattr(p, f_, v)
@@ -785,6 +808,8 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--fast", action="store_true", help="faster timeframes M15/M5/M1 (more trades)")
     ap.add_argument("--days", type=int, default=90)
+    ap.add_argument("--balance", type=float, dest="balance", help="account example balance (default 1000)")
+    ap.add_argument("--risk-pct", type=float, dest="risk_pct", help="%% of equity risked per trade (default 1.0)")
     ap.add_argument("--rr-min", type=float, dest="rr_min")
     ap.add_argument("--disp-atr-mult", type=float, dest="disp_atr_mult")
     ap.add_argument("--disp-body-ratio", type=float, dest="disp_body_ratio")
@@ -830,7 +855,7 @@ def main():
                     print("[warn] No resolve-timeframe data - outcomes unresolved. Increase MT5 max bars.")
                 all_trades += analyze(ctx, sweepc, entryc, resc, p, args.days, ctx_tf, sweep_tf, entry_tf)
             if len(symbols) > 1:
-                _print_combined(args.days, len(symbols), all_trades)
+                _print_combined(p, args.days, len(symbols), all_trades)
         if not args.backtest_only:
             live_loop(feed, p, symbols, ctx_tf, sweep_tf, entry_tf, refresh)
     finally:
