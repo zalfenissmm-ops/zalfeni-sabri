@@ -90,11 +90,11 @@ class Params:
     sw_m5: int = 1
 
     sweep_lookback: int = 40      # live: look for a sweep in the last N M15 candles
-    mss_window: int = 36          # MSS must occur within N M5 candles after the sweep
+    mss_window: int = 48          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
-    disp_atr_mult: float = 1.3
-    disp_body_ratio: float = 0.5
+    disp_atr_mult: float = 1.0
+    disp_body_ratio: float = 0.4
 
     rr_min: float = 1.5
 
