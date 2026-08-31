@@ -181,22 +181,19 @@ def detect_mss(m5, start_idx, side, p: Params, m5_swings=None):
     n = len(m5)
     if start_idx >= n:
         return None
+    end = min(n, start_idx + p.mss_window + 1)          # search ONLY inside the window after the sweep
     highs, lows = m5_swings if m5_swings is not None else swings(m5, p.sw_m5)
     if side == "bull":
-        rl_idx = min(range(start_idx, n), key=lambda k: m5[k].l)
-        for (hi, pr) in [(i, v) for (i, v) in highs if i > rl_idx]:
-            for k in range(hi + 1, n):
-                if k - start_idx > p.mss_window:
-                    break
+        rl_idx = min(range(start_idx, end), key=lambda k: m5[k].l)   # local reaction low (not a future one)
+        for (hi, pr) in [(i, v) for (i, v) in highs if rl_idx < i < end]:
+            for k in range(hi + 1, end):
                 if m5[k].c > pr:
                     return {"ref_idx": hi, "break_idx": k, "ext_idx": rl_idx}
         return None
     else:
-        rh_idx = max(range(start_idx, n), key=lambda k: m5[k].h)
-        for (li, pr) in [(i, v) for (i, v) in lows if i > rh_idx]:
-            for k in range(li + 1, n):
-                if k - start_idx > p.mss_window:
-                    break
+        rh_idx = max(range(start_idx, end), key=lambda k: m5[k].h)   # local reaction high
+        for (li, pr) in [(i, v) for (i, v) in lows if rh_idx < i < end]:
+            for k in range(li + 1, end):
                 if m5[k].c < pr:
                     return {"ref_idx": li, "break_idx": k, "ext_idx": rh_idx}
         return None
