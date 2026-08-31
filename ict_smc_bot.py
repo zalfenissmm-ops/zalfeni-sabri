@@ -90,13 +90,14 @@ class Params:
     sw_m5: int = 1
 
     sweep_lookback: int = 40      # live: look for a sweep in the last N M15 candles
-    mss_window: int = 48          # MSS must occur within N M5 candles after the sweep
+    mss_window: int = 60          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
     disp_atr_mult: float = 1.0
     disp_body_ratio: float = 0.4
 
     rr_min: float = 1.5
+    entry_mode: str = "edge"      # entry inside the FVG: edge (proximal, best in tests) / ce (50%) / far (deep)
     balance: float = 1000.0       # backtest account example
     risk_pct: float = 1.0         # % of equity risked per trade
     max_hold_hours: float = 24.0  # time-stop: close if neither TP nor SL hit (0 = off)
@@ -253,14 +254,19 @@ def target_liquidity(h1, m15, entry, side, p: Params, min_dist=0.0):
     return min(levels) if side == "bull" else max(levels)
 
 
-def sl_entry(m5, start_idx, mss, atr_arr, side, fvg):
+def sl_entry(m5, start_idx, mss, atr_arr, side, fvg, entry_mode="ce"):
+    """SL beyond the reaction extreme; entry inside the FVG. entry_mode:
+    'edge' = proximal (first touch), 'ce' = 50% mid (optimal entry), 'far' = deep."""
     seg = m5[start_idx:mss["break_idx"] + 1]
     buf = 0.1 * (atr_arr[mss["break_idx"]] or (m5[-1].h - m5[-1].l))
+    mid = (fvg["top"] + fvg["bottom"]) / 2
     if side == "bull":
         react = min(x.l for x in seg)
-        return react, react - buf, fvg["top"]
+        entry = fvg["top"] if entry_mode == "edge" else (fvg["bottom"] if entry_mode == "far" else mid)
+        return react, react - buf, entry
     react = max(x.h for x in seg)
-    return react, react + buf, fvg["bottom"]
+    entry = fvg["bottom"] if entry_mode == "edge" else (fvg["top"] if entry_mode == "far" else mid)
+    return react, react + buf, entry
 
 
 # ============================================================================
@@ -309,7 +315,7 @@ def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
     if not fvg:
         return Decision(False, f"[{dir_txt}] Displacement but no FVG.", ctx)
 
-    react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg)
+    react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg, p.entry_mode)
     for k in range(mss["break_idx"] + 1, len(m5)):
         if side == "bull" and m5[k].c < react:
             return Decision(False, f"[{dir_txt}] Invalidated: closed below the sweep low.", ctx)
@@ -328,9 +334,9 @@ def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
 
     last, prev = m5[-1], (m5[-2] if len(m5) >= 2 else m5[-1])
     if side == "bull":
-        tagged_now = last.l <= fvg["top"] and prev.l > fvg["top"]
+        tagged_now = last.l <= entry and prev.l > entry
     else:
-        tagged_now = last.h >= fvg["bottom"] and prev.h < fvg["bottom"]
+        tagged_now = last.h >= entry and prev.h < entry
     if not tagged_now:
         return Decision(False, f"[{dir_txt}] Setup ready (RR={rr:.2f}) but waiting for retracement to FVG.",
                         ctx, side, entry, sl, tp, rr, key)
@@ -583,7 +589,7 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
             continue
         seen.add(key)
 
-        react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg)
+        react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg, p.entry_mode)
         risk = abs(entry - sl)
         if risk <= 0:
             continue
@@ -819,7 +825,7 @@ def build_params(args) -> Params:
     p = Params()
     for f_ in ("symbol", "sweep_lookback", "mss_window", "atr_period",
                "disp_atr_mult", "disp_body_ratio", "rr_min", "sw_h1", "sw_m15", "sw_m5",
-               "balance", "risk_pct", "max_hold_hours"):
+               "balance", "risk_pct", "max_hold_hours", "entry_mode"):
         v = getattr(args, f_, None)
         if v is not None:
             setattr(p, f_, v)
@@ -839,6 +845,7 @@ def main():
     ap.add_argument("--balance", type=float, dest="balance", help="account example balance (default 1000)")
     ap.add_argument("--risk-pct", type=float, dest="risk_pct", help="%% of equity risked per trade (default 1.0)")
     ap.add_argument("--max-hold-hours", type=float, dest="max_hold_hours", help="time-stop hours (0 = off, default 24)")
+    ap.add_argument("--entry", dest="entry_mode", choices=["ce", "edge", "far"], help="entry inside FVG (default ce)")
     ap.add_argument("--rr-min", type=float, dest="rr_min")
     ap.add_argument("--disp-atr-mult", type=float, dest="disp_atr_mult")
     ap.add_argument("--disp-body-ratio", type=float, dest="disp_body_ratio")
