@@ -87,10 +87,10 @@ class Params:
 
     sw_h1: int = 4
     sw_m15: int = 2
-    sw_m5: int = 2
+    sw_m5: int = 1
 
     sweep_lookback: int = 40      # live: look for a sweep in the last N M15 candles
-    mss_window: int = 24          # MSS must occur within N M5 candles after the sweep
+    mss_window: int = 36          # MSS must occur within N M5 candles after the sweep
 
     atr_period: int = 14
     disp_atr_mult: float = 1.3
@@ -427,6 +427,12 @@ class MT5Feed:
     def range(self, tf: str, dt_from: datetime, dt_to: datetime):
         return self._to_candles(self.mt5.copy_rates_range(self.p.symbol, self.tf_map[tf], dt_from, dt_to))
 
+    def current_price(self):
+        tick = self.mt5.symbol_info_tick(self.p.symbol)
+        if tick is None:
+            return None
+        return tick.bid, tick.ask, int(tick.time)
+
 
 # ============================================================================
 # Trade + M1 outcome resolution
@@ -751,6 +757,10 @@ def main():
 
     feed = MT5Feed(p)
     feed.connect()
+    px = feed.current_price()
+    if px:
+        print(f"[MT5] Current {p.symbol} price:  bid={px[0]:.{p.digits}f}  ask={px[1]:.{p.digits}f}"
+              f"   (tick time {_ts(px[2])} UTC)")
     try:
         if not args.live_only:
             now = datetime.now(timezone.utc)
