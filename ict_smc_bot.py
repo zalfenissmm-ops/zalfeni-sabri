@@ -347,6 +347,11 @@ def evaluate(h1, m15, m5, p: Params) -> Decision:
 # ============================================================================
 # Text + Telegram
 # ============================================================================
+def _set_digits(dg):
+    global PRICE_DIGITS
+    PRICE_DIGITS = dg
+
+
 def fmt(x):
     return f"{x:.{PRICE_DIGITS}f}"
 
@@ -417,18 +422,26 @@ class MT5Feed:
         return [Candle(int(r["time"]), float(r["open"]), float(r["high"]),
                        float(r["low"]), float(r["close"])) for r in rates]
 
-    def latest(self, tf: str, count: int):
-        c = self._to_candles(self.mt5.copy_rates_from_pos(self.p.symbol, self.tf_map[tf], 0, count))
+    def ensure(self, symbol: str) -> int:
+        if not self.mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"Symbol {symbol} not available in MT5.")
+        info = self.mt5.symbol_info(symbol)
+        return info.digits if info is not None and getattr(info, "digits", None) is not None else 2
+
+    def latest(self, tf: str, count: int, symbol=None):
+        sym = symbol or self.p.symbol
+        c = self._to_candles(self.mt5.copy_rates_from_pos(sym, self.tf_map[tf], 0, count))
         now = time.time()
         while c and c[-1].close_time(tf) > now:
             c.pop()
         return c
 
-    def range(self, tf: str, dt_from: datetime, dt_to: datetime):
-        return self._to_candles(self.mt5.copy_rates_range(self.p.symbol, self.tf_map[tf], dt_from, dt_to))
+    def range(self, tf: str, dt_from: datetime, dt_to: datetime, symbol=None):
+        sym = symbol or self.p.symbol
+        return self._to_candles(self.mt5.copy_rates_range(sym, self.tf_map[tf], dt_from, dt_to))
 
-    def current_price(self):
-        tick = self.mt5.symbol_info_tick(self.p.symbol)
+    def current_price(self, symbol=None):
+        tick = self.mt5.symbol_info_tick(symbol or self.p.symbol)
         if tick is None:
             return None
         return tick.bid, tick.ask, int(tick.time)
@@ -586,6 +599,7 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
         trades.append(tr)
 
     _print_analysis(p, days, st, trades, bool(m1), entry_tf)
+    return trades
 
 
 def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf="M5"):
@@ -632,6 +646,21 @@ def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf
         print("  " + "-" * 66)
 
 
+def _print_combined(days, n_symbols, trades):
+    wins = [t for t in trades if t.result == "WIN"]
+    losses = [t for t in trades if t.result == "LOSS"]
+    closed = len(wins) + len(losses)
+    print("\n" + "#" * 70)
+    print(f"  COMBINED - {n_symbols} symbols - last {days} days")
+    print("#" * 70)
+    print(f"  Total signals : {len(trades)}   (~{len(trades) / max(days, 1):.2f}/day)")
+    print(f"  Wins / Losses : {len(wins)} / {len(losses)}")
+    if closed:
+        print(f"  Win rate      : {100.0 * len(wins) / closed:.1f}%")
+        print(f"  Net R         : {sum(t.r_mult for t in wins + losses):+.2f} R")
+    print("#" * 70)
+
+
 # ============================================================================
 # Live mode: every 5 minutes, 24h (no session filter)
 # ============================================================================
@@ -651,35 +680,44 @@ def save_sent(keys, path="sent_signals.json"):
         pass
 
 
-def live_loop(feed: MT5Feed, p: Params, ctx_tf="H1", sweep_tf="M15", entry_tf="M5", refresh=300):
+def live_loop(feed: MT5Feed, p: Params, symbols, ctx_tf="H1", sweep_tf="M15", entry_tf="M5", refresh=300):
     print("\n" + "=" * 70)
-    print(f"  LIVE - {p.symbol} - every {refresh // 60} min "
+    print(f"  LIVE - {len(symbols)} symbol(s) - every {refresh // 60} min "
           f"({ctx_tf}/{sweep_tf}/{entry_tf}, 24h)")
     print("=" * 70)
     sent = load_sent()
+    digits = {}
     while True:
         now = time.time()
         time.sleep(max(1, (int(now) // refresh + 1) * refresh + 5 - now))
-        try:
-            h1 = feed.latest(ctx_tf, 600)
-            m15 = feed.latest(sweep_tf, 1500)
-            m5 = feed.latest(entry_tf, p.win_m5 + 50)
-        except Exception as e:                   # noqa: BLE001
-            print(f"[{_ts(int(time.time()))}] Data fetch error: {e}")
-            continue
-        dec = evaluate(h1, m15, m5, p)
-        stamp = _ts(m5[-1].close_time(entry_tf)) if m5 else _ts(int(time.time()))
-        if dec.signal:
-            if dec.key in sent:
-                print(f"[{stamp}] Duplicate signal - skipping.")
+        found = 0
+        for sym in symbols:
+            try:
+                if sym not in digits:
+                    digits[sym] = feed.ensure(sym)
+                _set_digits(digits[sym])
+                h1 = feed.latest(ctx_tf, 600, sym)
+                m15 = feed.latest(sweep_tf, 1500, sym)
+                m5 = feed.latest(entry_tf, p.win_m5 + 50, sym)
+            except Exception as e:               # noqa: BLE001
+                print(f"[{_ts(int(time.time()))}] {sym} data error: {e}")
                 continue
-            text = signal_text(p.symbol, dec)
-            print(f"\n[{stamp}] === SIGNAL ===\n{text}\n")
-            telegram_send(text)
-            sent.add(dec.key)
-            save_sent(sent)
-        else:
-            print(f"[{stamp}] NO TRADE - {dec.reason}" + (f"  | {dec.context}" if dec.context else ""))
+            dec = evaluate(h1, m15, m5, p)
+            stamp = _ts(m5[-1].close_time(entry_tf)) if m5 else _ts(int(time.time()))
+            if dec.signal:
+                key = (sym,) + tuple(dec.key)
+                if key in sent:
+                    continue
+                text = signal_text(sym, dec)
+                print(f"\n[{stamp}] === SIGNAL ({sym}) ===\n{text}\n")
+                telegram_send(text)
+                sent.add(key)
+                save_sent(sent)
+                found += 1
+            elif len(symbols) == 1:
+                print(f"[{stamp}] NO TRADE - {dec.reason}" + (f"  | {dec.context}" if dec.context else ""))
+        if len(symbols) > 1:
+            print(f"[{_ts(int(time.time()))}] scanned {len(symbols)} symbols - {found} signal(s)")
 
 
 # ============================================================================
@@ -740,6 +778,8 @@ def build_params(args) -> Params:
 def main():
     ap = argparse.ArgumentParser(description="ICT/SMC Intraday Bot (MT5 + Telegram) - single file.")
     ap.add_argument("--symbol", default="XAUUSD")
+    ap.add_argument("--symbols", default=None,
+                    help="comma-separated basket, overrides --symbol (e.g. XAUUSD,EURUSD,GBPUSD)")
     ap.add_argument("--backtest-only", action="store_true")
     ap.add_argument("--live-only", action="store_true")
     ap.add_argument("--selftest", action="store_true")
@@ -766,28 +806,33 @@ def main():
     else:
         ctx_tf, sweep_tf, entry_tf, res_tf, refresh = "H1", "M15", "M5", "M1", 300
 
+    symbols = [x.strip() for x in args.symbols.split(",") if x.strip()] if args.symbols else [p.symbol]
+
     feed = MT5Feed(p)
     feed.connect()
-    px = feed.current_price()
-    if px:
-        print(f"[MT5] Current {p.symbol} price:  bid={px[0]:.{p.digits}f}  ask={px[1]:.{p.digits}f}"
-              f"   (tick time {_ts(px[2])} UTC)")
     try:
         if not args.live_only:
             now = datetime.now(timezone.utc)
             dt_from = now - timedelta(days=args.days + 15)
-            print(f"[MT5] Fetching {args.days}+15 days ({ctx_tf}/{sweep_tf}/{entry_tf})...")
-            ctx = feed.range(ctx_tf, dt_from, now)
-            sweepc = feed.range(sweep_tf, dt_from, now)
-            entryc = feed.range(entry_tf, dt_from, now)
-            resc = entryc if res_tf == entry_tf else feed.range(res_tf, dt_from, now)
-            print(f"[MT5] {ctx_tf}={len(ctx)}  {sweep_tf}={len(sweepc)}  "
-                  f"{entry_tf}={len(entryc)}  resolve({res_tf})={len(resc)} candles")
-            if not resc:
-                print("[warn] No resolve-timeframe data - outcomes unresolved. Increase MT5 max bars.")
-            analyze(ctx, sweepc, entryc, resc, p, args.days, ctx_tf, sweep_tf, entry_tf)
+            all_trades = []
+            for sym in symbols:
+                _set_digits(feed.ensure(sym))
+                p.symbol = sym
+                px = feed.current_price(sym)
+                if px:
+                    print(f"\n[{sym}] price bid={px[0]:.{PRICE_DIGITS}f} ask={px[1]:.{PRICE_DIGITS}f}"
+                          f" ({_ts(px[2])} UTC) - fetching {ctx_tf}/{sweep_tf}/{entry_tf}...")
+                ctx = feed.range(ctx_tf, dt_from, now, sym)
+                sweepc = feed.range(sweep_tf, dt_from, now, sym)
+                entryc = feed.range(entry_tf, dt_from, now, sym)
+                resc = entryc if res_tf == entry_tf else feed.range(res_tf, dt_from, now, sym)
+                if not resc:
+                    print("[warn] No resolve-timeframe data - outcomes unresolved. Increase MT5 max bars.")
+                all_trades += analyze(ctx, sweepc, entryc, resc, p, args.days, ctx_tf, sweep_tf, entry_tf)
+            if len(symbols) > 1:
+                _print_combined(args.days, len(symbols), all_trades)
         if not args.backtest_only:
-            live_loop(feed, p, ctx_tf, sweep_tf, entry_tf, refresh)
+            live_loop(feed, p, symbols, ctx_tf, sweep_tf, entry_tf, refresh)
     finally:
         feed.shutdown()
 
