@@ -199,6 +199,21 @@ def detect_mss(m5, start_idx, side, p: Params, m5_swings=None):
         return None
 
 
+def _why_no_mss(m5, start_idx, side, p: Params, m5_swings):
+    """Diagnose why MSS was not found: no structure (no swing to break) inside
+    the window, or structure existed but price never closed through it."""
+    n = len(m5)
+    end = min(n, start_idx + p.mss_window + 1)
+    highs, lows = m5_swings
+    if side == "bull":
+        rl_idx = min(range(start_idx, end), key=lambda k: m5[k].l)
+        cands = [i for (i, _) in highs if rl_idx < i < end]
+    else:
+        rh_idx = max(range(start_idx, end), key=lambda k: m5[k].h)
+        cands = [i for (i, _) in lows if rh_idx < i < end]
+    return "not_broken" if cands else "no_structure"
+
+
 def is_displacement(m5, k, atr_arr, side, p: Params):
     for idx in (k, k - 1):
         if idx < 0 or idx >= len(m5) or not atr_arr[idx]:
@@ -545,6 +560,7 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
             continue
         st["0_sweeps"] += 1
         side = sweep["side"]
+        st["sweep_" + side] += 1
         start_idx = bisect.bisect_left(m5_times, sweep["t"])
         if start_idx >= len(m5):
             continue
@@ -552,6 +568,7 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
         mss = detect_mss(m5, start_idx, side, p, m5_swings)
         if not mss:
             st["2_no_mss"] += 1
+            st["nomss_" + _why_no_mss(m5, start_idx, side, p, m5_swings)] += 1
             continue
         if not is_displacement(m5, mss["break_idx"], atr_arr, side, p):
             st["3_no_disp"] += 1
@@ -639,6 +656,12 @@ def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf
         n = st.get(kk, 0)
         pct = (100.0 * n / sweeps) if sweeps else 0.0
         print(f"    {label:28s}: {n:6d}  ({pct:4.1f}%)")
+    print("  Diagnostics of the 'sweep, no MSS' wall:")
+    print(f"    sweeps  bull / bear        : {st.get('sweep_bull', 0)} / {st.get('sweep_bear', 0)}")
+    print(f"    no-MSS: structure NOT broken: {st.get('nomss_not_broken', 0)}"
+          f"   (real - price never broke structure)")
+    print(f"    no-MSS: NO structure formed : {st.get('nomss_no_structure', 0)}"
+          f"   (widen --mss-window / lower --sw-m5)")
     print("=" * 70)
     print(f"  ENTERED signals : {len(trades)}   (~{len(trades) / max(days, 1):.2f}/day)")
     print(f"  Wins            : {len(wins)}")
