@@ -503,17 +503,18 @@ STAGES = [
 ]
 
 
-def analyze(h1, m15, m5, m1, p: Params, days: int):
+def analyze(h1, m15, m5, m1, p: Params, days: int,
+            ctx_tf="H1", sweep_tf="M15", entry_tf="M5"):
     if not m5:
-        print("No M5 data.")
+        print("No entry-timeframe data.")
         return
-    cutoff = m5[-1].close_time("M5") - days * 86400
+    cutoff = m5[-1].close_time(entry_tf) - days * 86400
     m5_swings = swings(m5, p.sw_m5)
     atr_arr = atr_series(m5, p.atr_period)
     m5_times = [c.t for c in m5]
     m1_times = [c.t for c in m1]
-    h1_ct = [c.close_time("H1") for c in h1]
-    m15_ct = [c.close_time("M15") for c in m15]
+    h1_ct = [c.close_time(ctx_tf) for c in h1]
+    m15_ct = [c.close_time(sweep_tf) for c in m15]
     sweeps = find_all_sweeps(m15, p, use_lookback=False)
 
     st = Counter()
@@ -549,7 +550,7 @@ def analyze(h1, m15, m5, m1, p: Params, days: int):
         risk = abs(entry - sl)
         if risk <= 0:
             continue
-        asof = m5[mss["break_idx"]].close_time("M5")
+        asof = m5[mss["break_idx"]].close_time(entry_tf)
         h1a = h1[:bisect.bisect_right(h1_ct, asof)]
         m15a = m15[:bisect.bisect_right(m15_ct, asof)]
         tp = target_liquidity(h1a, m15a, entry, side, p, p.rr_min * risk)
@@ -584,10 +585,10 @@ def analyze(h1, m15, m5, m1, p: Params, days: int):
             _resolve_on_m1(tr, m1, m1_times, m5[retrace_i].t)   # honest M1 outcome
         trades.append(tr)
 
-    _print_analysis(p, days, st, trades, bool(m1))
+    _print_analysis(p, days, st, trades, bool(m1), entry_tf)
 
 
-def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used):
+def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf="M5"):
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
     opens = [t for t in trades if t.result == "OPEN"]
@@ -595,8 +596,8 @@ def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used):
     sweeps = st.get("0_sweeps", 0)
 
     print("\n" + "=" * 70)
-    print(f"  ANALYSIS - {p.symbol} - last {days} days"
-          + ("   [outcomes resolved on M1]" if m1_used else "   [no M1 - outcomes unresolved]"))
+    print(f"  ANALYSIS - {p.symbol} - last {days} days   [entry {entry_tf}]"
+          + ("   [outcomes on M1]" if m1_used else "   [outcomes unresolved]"))
     print("=" * 70)
     print(f"  Opportunities (sweeps found) : {sweeps}")
     print("  Where each opportunity stopped:")
@@ -650,23 +651,24 @@ def save_sent(keys, path="sent_signals.json"):
         pass
 
 
-def live_loop(feed: MT5Feed, p: Params):
+def live_loop(feed: MT5Feed, p: Params, ctx_tf="H1", sweep_tf="M15", entry_tf="M5", refresh=300):
     print("\n" + "=" * 70)
-    print(f"  LIVE - {p.symbol} - refresh every 5 minutes (24h, no session filter)")
+    print(f"  LIVE - {p.symbol} - every {refresh // 60} min "
+          f"({ctx_tf}/{sweep_tf}/{entry_tf}, 24h)")
     print("=" * 70)
     sent = load_sent()
     while True:
         now = time.time()
-        time.sleep(max(1, (int(now) // 300 + 1) * 300 + 8 - now))
+        time.sleep(max(1, (int(now) // refresh + 1) * refresh + 5 - now))
         try:
-            h1 = feed.latest("H1", 600)
-            m15 = feed.latest("M15", 1500)
-            m5 = feed.latest("M5", p.win_m5 + 50)
+            h1 = feed.latest(ctx_tf, 600)
+            m15 = feed.latest(sweep_tf, 1500)
+            m5 = feed.latest(entry_tf, p.win_m5 + 50)
         except Exception as e:                   # noqa: BLE001
             print(f"[{_ts(int(time.time()))}] Data fetch error: {e}")
             continue
         dec = evaluate(h1, m15, m5, p)
-        stamp = _ts(m5[-1].close_time("M5")) if m5 else _ts(int(time.time()))
+        stamp = _ts(m5[-1].close_time(entry_tf)) if m5 else _ts(int(time.time()))
         if dec.signal:
             if dec.key in sent:
                 print(f"[{stamp}] Duplicate signal - skipping.")
@@ -713,10 +715,13 @@ def _aggregate(base, tf):
     return [Candle(b, *buckets[b]) for b in order]
 
 
-def selftest(p: Params):
+def selftest(p: Params, fast=False):
     print("[selftest] Synthetic data, honest analysis (M1-resolved, no MT5)...")
     m1 = _gen_m1()
-    analyze(_aggregate(m1, "H1"), _aggregate(m1, "M15"), _aggregate(m1, "M5"), m1, p, days=90)
+    if fast:
+        analyze(_aggregate(m1, "M15"), _aggregate(m1, "M5"), m1, m1, p, 90, "M15", "M5", "M1")
+    else:
+        analyze(_aggregate(m1, "H1"), _aggregate(m1, "M15"), _aggregate(m1, "M5"), m1, p, 90)
 
 
 # ============================================================================
@@ -738,6 +743,7 @@ def main():
     ap.add_argument("--backtest-only", action="store_true")
     ap.add_argument("--live-only", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--fast", action="store_true", help="faster timeframes M15/M5/M1 (more trades)")
     ap.add_argument("--days", type=int, default=90)
     ap.add_argument("--rr-min", type=float, dest="rr_min")
     ap.add_argument("--disp-atr-mult", type=float, dest="disp_atr_mult")
@@ -752,8 +758,13 @@ def main():
     p = build_params(args)
 
     if args.selftest:
-        selftest(p)
+        selftest(p, fast=args.fast)
         return
+
+    if args.fast:
+        ctx_tf, sweep_tf, entry_tf, res_tf, refresh = "M15", "M5", "M1", "M1", 60
+    else:
+        ctx_tf, sweep_tf, entry_tf, res_tf, refresh = "H1", "M15", "M5", "M1", 300
 
     feed = MT5Feed(p)
     feed.connect()
@@ -765,18 +776,18 @@ def main():
         if not args.live_only:
             now = datetime.now(timezone.utc)
             dt_from = now - timedelta(days=args.days + 15)
-            print(f"[MT5] Fetching {args.days}+15 days of history (incl. M1 for honest outcomes)...")
-            h1 = feed.range("H1", dt_from, now)
-            m15 = feed.range("M15", dt_from, now)
-            m5 = feed.range("M5", dt_from, now)
-            m1 = feed.range("M1", dt_from, now)
-            print(f"[MT5] H1={len(h1)}  M15={len(m15)}  M5={len(m5)}  M1={len(m1)} candles")
-            if not m1:
-                print("[warn] No M1 data returned - outcomes will be unresolved. "
-                      "Enable more history in MT5 (Tools > Options > Charts > Max bars).")
-            analyze(h1, m15, m5, m1, p, days=args.days)
+            print(f"[MT5] Fetching {args.days}+15 days ({ctx_tf}/{sweep_tf}/{entry_tf})...")
+            ctx = feed.range(ctx_tf, dt_from, now)
+            sweepc = feed.range(sweep_tf, dt_from, now)
+            entryc = feed.range(entry_tf, dt_from, now)
+            resc = entryc if res_tf == entry_tf else feed.range(res_tf, dt_from, now)
+            print(f"[MT5] {ctx_tf}={len(ctx)}  {sweep_tf}={len(sweepc)}  "
+                  f"{entry_tf}={len(entryc)}  resolve({res_tf})={len(resc)} candles")
+            if not resc:
+                print("[warn] No resolve-timeframe data - outcomes unresolved. Increase MT5 max bars.")
+            analyze(ctx, sweepc, entryc, resc, p, args.days, ctx_tf, sweep_tf, entry_tf)
         if not args.backtest_only:
-            live_loop(feed, p)
+            live_loop(feed, p, ctx_tf, sweep_tf, entry_tf, refresh)
     finally:
         feed.shutdown()
 
