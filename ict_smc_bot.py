@@ -3,13 +3,19 @@
 """
 ICT / SMC Intraday Bot  --  single file  (Gold / XAUUSD)
 
-Strategy:
+Strategy (default mode = v2; pass --mode v1 for the original single-MSS logic):
     H1  -> context (with-trend / reversal-correction), label only.
-    M15 -> liquidity sweep (break a high/low then close back).
-    M5  -> MSS + Displacement + FVG.
-    then retracement into the FVG = entry.
+    M15 -> liquidity sweep of a swing OR an EQH/EQL pool (equal highs/lows =
+           stronger liquidity), break then close back.
+    M5  -> CHoCH (first structure break after the sweep) then BOS (second break
+           in the trade direction); Displacement must accompany the BOS.
+    M1  -> entry zone = Order Block (last opposite candle before the
+           displacement) + FVG, preferring their confluence; refined on M1.
+    then retracement into the zone = entry.
     SL beyond the sweep extreme. TP = nearest opposing liquidity that gives
     RR >= rr_min. RR too small or no target far enough -> NO TRADE.
+
+    v1 keeps the original M5 pipeline: MSS + Displacement + FVG.
 
 Honest backtest:
     Setups are detected on M5/M15/H1, but each trade's WIN/LOSS is resolved on
@@ -106,6 +112,12 @@ class Params:
     win_m15: int = 220
     win_h1: int = 200
 
+    # --- v2 upgrade: EQH/EQL liquidity + CHoCH->BOS + OB/FVG confluence + M1 entry ---
+    mode: str = "v2"             # "v2" = upgraded pipeline, "v1" = original single-MSS
+    eq_tol_atr: float = 0.10     # EQH/EQL: two swings are "equal" within this * M15 ATR
+    bos_window: int = 40         # BOS must close-through within N M5 candles after the CHoCH
+    entry_m1_window: int = 180   # search this many M1 candles after BOS for the M1 entry FVG
+
 
 # ============================================================================
 # Indicators & structure
@@ -156,24 +168,57 @@ def structure_bias(highs, lows):
 # ============================================================================
 # Strategy stages (shared by live and analysis)
 # ============================================================================
+def equal_levels(highs, lows, tol):
+    """Cluster confirmed swings whose price sits within `tol` of each other
+    (Equal Highs / Equal Lows). Returns (eqh, eql) as (latest_idx, avg_level)."""
+    def cluster(points):
+        out, used = [], [False] * len(points)
+        for a in range(len(points)):
+            if used[a]:
+                continue
+            grp = [points[a]]; used[a] = True
+            for b in range(a + 1, len(points)):
+                if not used[b] and abs(points[b][1] - points[a][1]) <= tol:
+                    grp.append(points[b]); used[b] = True
+            if len(grp) >= 2:
+                out.append((max(g[0] for g in grp), sum(g[1] for g in grp) / len(grp)))
+        return out
+    return cluster(highs), cluster(lows)
+
+
 def find_all_sweeps(m15, p: Params, use_lookback=True):
     highs, lows = swings(m15, p.sw_m15)
     n = len(m15)
     floor_idx = max(0, n - p.sweep_lookback) if use_lookback else 0
+    # v2: add EQH/EQL as stronger liquidity pools alongside plain swings
+    hi_levels = [(si, lv, False) for (si, lv) in highs]
+    lo_levels = [(si, lv, False) for (si, lv) in lows]
+    if p.mode == "v2" and n:
+        atr15 = atr_series(m15, p.atr_period)
+        tol = p.eq_tol_atr * (atr15[-1] or (m15[-1].h - m15[-1].l) or 1.0)
+        eqh, eql = equal_levels(highs, lows, tol)
+        hi_levels += [(si, lv, True) for (si, lv) in eqh]
+        lo_levels += [(si, lv, True) for (si, lv) in eql]
     found = {}
-    for (si, level) in lows:
+    for (si, level, strong) in lo_levels:
         for j in range(si + 1, n):
             c = m15[j]
             if c.l < level and c.c > level:
                 if j >= floor_idx:
-                    found[("bull", j)] = {"side": "bull", "level": level, "idx": j, "extreme": c.l, "t": c.t}
+                    prev = found.get(("bull", j))
+                    if prev is None or strong or not prev["strong"]:
+                        found[("bull", j)] = {"side": "bull", "level": level, "idx": j,
+                                              "extreme": c.l, "t": c.t, "strong": strong}
                 break
-    for (si, level) in highs:
+    for (si, level, strong) in hi_levels:
         for j in range(si + 1, n):
             c = m15[j]
             if c.h > level and c.c < level:
                 if j >= floor_idx:
-                    found[("bear", j)] = {"side": "bear", "level": level, "idx": j, "extreme": c.h, "t": c.t}
+                    prev = found.get(("bear", j))
+                    if prev is None or strong or not prev["strong"]:
+                        found[("bear", j)] = {"side": "bear", "level": level, "idx": j,
+                                              "extreme": c.h, "t": c.t, "strong": strong}
                 break
     return [found[k] for k in sorted(found, key=lambda x: x[1])]
 
@@ -270,6 +315,115 @@ def sl_entry(m5, start_idx, mss, atr_arr, side, fvg, entry_mode="ce"):
 
 
 # ============================================================================
+# v2 structure: CHoCH -> BOS, Order Block, entry-zone confluence, M1 entry
+# ============================================================================
+def detect_choch_bos(m5, start_idx, side, p: Params, m5_swings=None):
+    """Two-stage confirmation. CHoCH = first close-through of structure in the
+    trade direction after the sweep (same test as MSS). BOS = a SECOND
+    close-through of a newer swing in the same direction, within bos_window.
+    Displacement is required on the BOS. Returns
+    {choch_idx, ref_idx, break_idx, ext_idx} (break_idx = the BOS candle)."""
+    choch = detect_mss(m5, start_idx, side, p, m5_swings)
+    if not choch:
+        return None
+    n = len(m5)
+    c_break = choch["break_idx"]
+    end = min(n, c_break + p.bos_window + 1)
+    highs, lows = m5_swings if m5_swings is not None else swings(m5, p.sw_m5)
+    if side == "bull":
+        for (hi, pr) in [(i, v) for (i, v) in highs if c_break <= i < end]:
+            for k in range(hi + 1, end):
+                if m5[k].c > pr:
+                    return {"choch_idx": c_break, "ref_idx": hi, "break_idx": k,
+                            "ext_idx": choch["ext_idx"]}
+    else:
+        for (li, pr) in [(i, v) for (i, v) in lows if c_break <= i < end]:
+            for k in range(li + 1, end):
+                if m5[k].c < pr:
+                    return {"choch_idx": c_break, "ref_idx": li, "break_idx": k,
+                            "ext_idx": choch["ext_idx"]}
+    return None
+
+
+def find_order_block(m5, disp_idx, side, lookback=20):
+    """Last opposite-colour candle at/before the displacement candle.
+    Bull move -> last bearish candle = Bullish OB; bear move -> last bullish."""
+    for i in range(disp_idx, max(-1, disp_idx - lookback) - 1, -1):
+        if i < 0:
+            break
+        c = m5[i]
+        if side == "bull" and c.c < c.o:
+            return {"top": c.h, "bottom": c.l, "idx": i}
+        if side == "bear" and c.c > c.o:
+            return {"top": c.h, "bottom": c.l, "idx": i}
+    return None
+
+
+def _overlap(a, b):
+    lo, hi = max(a["bottom"], b["bottom"]), min(a["top"], b["top"])
+    return {"bottom": lo, "top": hi} if hi > lo else None
+
+
+def pick_zone(fvg, ob, side):
+    """Prefer the FVG+OB overlap (confluence); else FVG; else OB."""
+    if fvg and ob:
+        ov = _overlap(fvg, ob)
+        if ov:
+            ov["idx"], ov["kind"] = fvg["idx"], "FVG+OB"
+            return ov
+    if fvg:
+        z = dict(fvg); z["kind"] = "FVG"; return z
+    if ob:
+        z = dict(ob); z["kind"] = "OB"; return z
+    return None
+
+
+def refine_entry_m1(m1, m1_times, zone, side, after_t, window, entry_mode):
+    """v2 entry precision: the first M1 FVG that intersects the entry zone within
+    `window` M1 candles after the BOS. Returns its entry price (per entry_mode),
+    or None to fall back to the higher-timeframe zone."""
+    if not m1:
+        return None
+    i = bisect.bisect_left(m1_times, after_t)
+    end = min(len(m1), i + window)
+    for k in range(i + 1, end - 1):
+        c1, c3 = m1[k - 1], m1[k + 1]
+        if side == "bull" and c1.h < c3.l:
+            top, bottom = c3.l, c1.h
+        elif side == "bear" and c1.l > c3.h:
+            top, bottom = c1.l, c3.h
+        else:
+            continue
+        if min(top, zone["top"]) - max(bottom, zone["bottom"]) <= 0:      # must intersect the zone
+            continue
+        if side == "bull":
+            return top if entry_mode == "edge" else ((top + bottom) / 2 if entry_mode == "ce" else bottom)
+        return bottom if entry_mode == "edge" else ((top + bottom) / 2 if entry_mode == "ce" else top)
+    return None
+
+
+def detect_setup(m5, start_idx, side, p: Params, m5_swings, atr_arr):
+    """Shared detection for both modes. Returns (setup, None) on success or
+    (None, funnel_stage_key) on failure. setup carries break_idx/ref_idx/ext_idx
+    and the chosen entry `zone` (top/bottom/idx/kind)."""
+    st = detect_choch_bos(m5, start_idx, side, p, m5_swings) if p.mode == "v2" \
+        else detect_mss(m5, start_idx, side, p, m5_swings)
+    if not st:
+        return None, "2_no_mss"
+    if not is_displacement(m5, st["break_idx"], atr_arr, side, p):
+        return None, "3_no_disp"
+    fvg = find_fvg(m5, st["ref_idx"], st["break_idx"] + 1, side)
+    if p.mode == "v2":
+        zone = pick_zone(fvg, find_order_block(m5, st["break_idx"], side), side)
+    else:
+        zone = (dict(fvg, kind="FVG") if fvg else None)
+    if not zone:
+        return None, "4_no_fvg"
+    st["zone"] = zone
+    return st, None
+
+
+# ============================================================================
 # Decision (live)
 # ============================================================================
 @dataclass
@@ -298,7 +452,7 @@ def h1_context(h1, side, p: Params):
     return f"{trend} ({kind})"
 
 
-def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
+def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p, m1=None, m1_times=None) -> Decision:
     side = sweep["side"]
     ctx = h1_context(h1, side, p)
     dir_txt = "BUY" if side == "bull" else "SELL"
@@ -306,17 +460,21 @@ def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
     start_idx = bisect.bisect_left(m5_times, sweep["t"])
     if start_idx >= len(m5):
         return Decision(False, f"[{dir_txt}] Sweep on M15 but no M5 candles after it yet.", ctx)
-    mss = detect_mss(m5, start_idx, side, p, m5_swings)
-    if not mss:
-        return Decision(False, f"[{dir_txt}] Sweep found but no MSS on M5 within the window.", ctx)
-    if not is_displacement(m5, mss["break_idx"], atr_arr, side, p):
-        return Decision(False, f"[{dir_txt}] MSS but no strong displacement.", ctx)
-    fvg = find_fvg(m5, mss["ref_idx"], mss["break_idx"] + 1, side)
-    if not fvg:
-        return Decision(False, f"[{dir_txt}] Displacement but no FVG.", ctx)
+    setup, stage = detect_setup(m5, start_idx, side, p, m5_swings, atr_arr)
+    if setup is None:
+        msg = {"2_no_mss": "no MSS/CHoCH->BOS on M5 within the window",
+               "3_no_disp": "structure shift but no strong displacement",
+               "4_no_fvg": "displacement but no FVG/OB entry zone"}[stage]
+        return Decision(False, f"[{dir_txt}] Sweep found but {msg}.", ctx)
+    zone = setup["zone"]
 
-    react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg, p.entry_mode)
-    for k in range(mss["break_idx"] + 1, len(m5)):
+    react, sl, entry = sl_entry(m5, start_idx, setup, atr_arr, side, zone, p.entry_mode)
+    if p.mode == "v2" and m1:
+        r = refine_entry_m1(m1, m1_times, zone, side, m5[setup["break_idx"]].t,
+                            p.entry_m1_window, p.entry_mode)
+        if r is not None:
+            entry = r
+    for k in range(setup["break_idx"] + 1, len(m5)):
         if side == "bull" and m5[k].c < react:
             return Decision(False, f"[{dir_txt}] Invalidated: closed below the sweep low.", ctx)
         if side == "bear" and m5[k].c > react:
@@ -325,7 +483,7 @@ def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
     risk = abs(entry - sl)
     if risk <= 0:
         return Decision(False, f"[{dir_txt}] Stop distance is zero - skip.", ctx)
-    key = (side, m5[fvg["idx"]].t)
+    key = (side, m5[zone["idx"]].t)
     tp = target_liquidity(h1, m15, entry, side, p, p.rr_min * risk)
     if tp is None:
         return Decision(False, f"[{dir_txt}] No opposing liquidity far enough for RR>={p.rr_min:.2f}.",
@@ -338,14 +496,15 @@ def _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p) -> Decision:
     else:
         tagged_now = last.h >= entry and prev.h < entry
     if not tagged_now:
-        return Decision(False, f"[{dir_txt}] Setup ready (RR={rr:.2f}) but waiting for retracement to FVG.",
+        return Decision(False, f"[{dir_txt}] Setup ready (RR={rr:.2f}) but waiting for retracement to zone.",
                         ctx, side, entry, sl, tp, rr, key)
 
-    return Decision(True, f"{dir_txt} signal - Sweep->MSS->Displacement->FVG->Retracement OK",
-                    ctx, side, entry, sl, tp, rr, key)
+    seq = (f"Sweep->CHoCH->BOS->Displacement->{zone['kind']}->Entry" if p.mode == "v2"
+           else "Sweep->MSS->Displacement->FVG->Retracement")
+    return Decision(True, f"{dir_txt} signal - {seq} OK", ctx, side, entry, sl, tp, rr, key)
 
 
-def evaluate(h1, m15, m5, p: Params) -> Decision:
+def evaluate(h1, m15, m5, p: Params, m1=None) -> Decision:
     if len(m5) < max(p.sw_m5 * 2 + 2, p.atr_period + 2) or \
        len(m15) < (p.sw_m15 * 2 + 2) or len(h1) < (p.sw_h1 * 2 + 2):
         return Decision(False, "Not enough data yet.")
@@ -355,9 +514,10 @@ def evaluate(h1, m15, m5, p: Params) -> Decision:
     m5_swings = swings(m5, p.sw_m5)
     atr_arr = atr_series(m5, p.atr_period)
     m5_times = [c.t for c in m5]
+    m1_times = [c.t for c in m1] if m1 else None
     first = None
     for sweep in reversed(sweeps):
-        res = _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p)
+        res = _eval_one(sweep, h1, m15, m5, m5_swings, atr_arr, m5_times, p, m1, m1_times)
         if res.signal:
             return res
         if first is None:
@@ -534,12 +694,12 @@ def _ts(epoch):
 # Analysis / Backtest -- counts EVERY opportunity, M1-resolved outcomes
 # ============================================================================
 STAGES = [
-    ("2_no_mss",     "sweep, no MSS"),
-    ("3_no_disp",    "MSS, no displacement"),
-    ("4_no_fvg",     "displacement, no FVG"),
+    ("2_no_mss",     "sweep, no structure shift"),
+    ("3_no_disp",    "shift, no displacement"),
+    ("4_no_fvg",     "displacement, no FVG/OB"),
     ("6_no_tp",      "valid, no TP for RR>=min"),
     ("5_invalid",    "invalidated before retrace"),
-    ("7_no_retrace", "never retraced to FVG"),
+    ("7_no_retrace", "never retraced to zone"),
     ("9_signal",     "ENTERED (signal)"),
 ]
 
@@ -571,25 +731,25 @@ def analyze(h1, m15, m5, m1, p: Params, days: int,
         if start_idx >= len(m5):
             continue
 
-        mss = detect_mss(m5, start_idx, side, p, m5_swings)
-        if not mss:
-            st["2_no_mss"] += 1
-            st["nomss_" + _why_no_mss(m5, start_idx, side, p, m5_swings)] += 1
+        setup, stage = detect_setup(m5, start_idx, side, p, m5_swings, atr_arr)
+        if setup is None:
+            st[stage] += 1
+            if stage == "2_no_mss":
+                st["nomss_" + _why_no_mss(m5, start_idx, side, p, m5_swings)] += 1
             continue
-        if not is_displacement(m5, mss["break_idx"], atr_arr, side, p):
-            st["3_no_disp"] += 1
-            continue
-        fvg = find_fvg(m5, mss["ref_idx"], mss["break_idx"] + 1, side)
-        if not fvg:
-            st["4_no_fvg"] += 1
-            continue
+        mss, zone = setup, setup["zone"]
 
-        key = (side, m5[fvg["idx"]].t)
+        key = (side, m5[zone["idx"]].t)
         if key in seen:
             continue
         seen.add(key)
 
-        react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, fvg, p.entry_mode)
+        react, sl, entry = sl_entry(m5, start_idx, mss, atr_arr, side, zone, p.entry_mode)
+        if p.mode == "v2" and m1:
+            r = refine_entry_m1(m1, m1_times, zone, side, m5[mss["break_idx"]].t,
+                                p.entry_m1_window, p.entry_mode)
+            if r is not None:
+                entry = r
         risk = abs(entry - sl)
         if risk <= 0:
             continue
@@ -653,7 +813,7 @@ def _print_analysis(p: Params, days: int, st: Counter, trades, m1_used, entry_tf
     sweeps = st.get("0_sweeps", 0)
 
     print("\n" + "=" * 70)
-    print(f"  ANALYSIS - {p.symbol} - last {days} days   [entry {entry_tf}]"
+    print(f"  ANALYSIS - {p.symbol} - last {days} days   [{p.mode}]  [entry {entry_tf}]"
           + ("   [outcomes on M1]" if m1_used else "   [outcomes unresolved]"))
     print("=" * 70)
     print(f"  Opportunities (sweeps found) : {sweeps}")
@@ -758,7 +918,13 @@ def live_loop(feed: MT5Feed, p: Params, symbols, ctx_tf="H1", sweep_tf="M15", en
             except Exception as e:               # noqa: BLE001
                 print(f"[{_ts(int(time.time()))}] {sym} data error: {e}")
                 continue
-            dec = evaluate(h1, m15, m5, p)
+            m1 = None
+            if p.mode == "v2":
+                try:
+                    m1 = feed.latest("M1", p.entry_m1_window + 300, sym)
+                except Exception:                # noqa: BLE001
+                    m1 = None
+            dec = evaluate(h1, m15, m5, p, m1)
             stamp = _ts(m5[-1].close_time(entry_tf)) if m5 else _ts(int(time.time()))
             if dec.signal:
                 key = (sym,) + tuple(dec.key)
@@ -825,7 +991,8 @@ def build_params(args) -> Params:
     p = Params()
     for f_ in ("symbol", "sweep_lookback", "mss_window", "atr_period",
                "disp_atr_mult", "disp_body_ratio", "rr_min", "sw_h1", "sw_m15", "sw_m5",
-               "balance", "risk_pct", "max_hold_hours", "entry_mode"):
+               "balance", "risk_pct", "max_hold_hours", "entry_mode",
+               "mode", "eq_tol_atr", "bos_window", "entry_m1_window"):
         v = getattr(args, f_, None)
         if v is not None:
             setattr(p, f_, v)
@@ -857,6 +1024,11 @@ def main():
     ap.add_argument("--sw-h1", type=int, dest="sw_h1")
     ap.add_argument("--sw-m15", type=int, dest="sw_m15")
     ap.add_argument("--sw-m5", type=int, dest="sw_m5")
+    ap.add_argument("--mode", choices=["v1", "v2"],
+                    help="v2 (default): EQH/EQL + CHoCH->BOS + OB/FVG confluence + M1 entry; v1: original MSS")
+    ap.add_argument("--eq-tol-atr", type=float, dest="eq_tol_atr", help="EQH/EQL tolerance as * M15 ATR (v2)")
+    ap.add_argument("--bos-window", type=int, dest="bos_window", help="M5 candles allowed for BOS after CHoCH (v2)")
+    ap.add_argument("--entry-m1-window", type=int, dest="entry_m1_window", help="M1 candles scanned for the entry FVG (v2)")
     args = ap.parse_args()
     p = build_params(args)
 
