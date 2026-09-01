@@ -840,6 +840,8 @@ def main():
     ap.add_argument("--backtest-only", action="store_true")
     ap.add_argument("--live-only", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--test-telegram", action="store_true",
+                    help="send one test message to Telegram and exit")
     ap.add_argument("--fast", action="store_true", help="faster timeframes M15/M5/M1 (more trades)")
     ap.add_argument("--days", type=int, default=90)
     ap.add_argument("--balance", type=float, dest="balance", help="account example balance (default 1000)")
@@ -857,6 +859,18 @@ def main():
     ap.add_argument("--sw-m5", type=int, dest="sw_m5")
     args = ap.parse_args()
     p = build_params(args)
+
+    if args.test_telegram:
+        if not telegram_configured():
+            print("[Telegram] Not configured. Edit TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+                  "near the top of this file (or set them as env vars).")
+            return
+        ok = telegram_send("✅ ICT/SMC Bot - Telegram test message. "
+                           "Token and chat id are working.")
+        print("[Telegram] Test message sent OK - check your Telegram." if ok
+              else "[Telegram] Test FAILED - check token, chat id, and that "
+                   "you pressed Start on the bot.")
+        return
 
     if args.selftest:
         selftest(p, fast=args.fast)
