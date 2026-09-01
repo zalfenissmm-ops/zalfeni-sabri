@@ -885,6 +885,7 @@ def main():
 
     feed = MT5Feed(p)
     feed.connect()
+    telegram_send("ICT/SMC Bot started (XAUUSD). Telegram connected - signals will arrive here.")
     try:
         if not args.live_only:
             now = datetime.now(timezone.utc)
