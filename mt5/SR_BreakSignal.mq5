@@ -4,9 +4,9 @@
 //+------------------------------------------------------------------+
 #property copyright "zalfeni-sabri"
 #property link      "https://github.com/zalfenissmm-ops/zalfeni-sabri"
-#property version   "1.00"
-#property description "Builds support/resistance ZONES by clustering swing pivots and"
-#property description "scores each zone (touches, reaction in ATR, recency, flip, round number)."
+#property version   "1.10"
+#property description "Builds support/resistance ZONES by clustering swing pivots and scores"
+#property description "each one (reaction vs noise, touches, recency, flip, round number)."
 #property description "Signals only CONFIRMED breaks and marks false breaks (liquidity sweeps)."
 
 #property indicator_chart_window
@@ -55,7 +55,7 @@ input int    InpSwing          = 3;      // Swing (pivot) window
 input int    InpATRPeriod      = 14;     // ATR period
 input double InpZoneWidthATR   = 0.5;    // Zone width (x ATR)
 input int    InpMinTouches     = 2;      // Min touches for a valid zone
-input double InpMinScore       = 50.0;   // Min zone score (0-100)
+input double InpMinScore       = 60.0;   // Min zone score (0-100)
 input int    InpMaxZones       = 6;      // Max zones kept
 
 input group             "=== Break confirmation ==="
@@ -80,15 +80,17 @@ input bool   InpAlertPush      = false;  // Push notification
 input bool   InpAlertSound     = false;  // Sound alert
 
 //--- score weights (must sum to 1.0)
-#define W_TOUCHES   0.30
-#define W_REACTION  0.25
+#define W_REACTION  0.40
+#define W_TOUCHES   0.20
 #define W_RECENCY   0.20
-#define W_FLIP      0.15
+#define W_FLIP      0.10
 #define W_ROUND     0.10
 
 #define TOUCHES_FOR_FULL_SCORE  5
-#define ATR_MOVE_FOR_FULL_SCORE 3.0
+#define REACTION_NOISE_FLOOR    1.0
+#define REACTION_FULL_SCORE     2.0
 #define REACTION_LOOKAHEAD      10
+#define FLIP_LOOKBACK           40
 
 //--- signal codes written into the Signal buffer
 #define SIG_BREAK_UP    1.0
@@ -126,7 +128,7 @@ struct SRZone
    int      firstTouch;
    int      lastTouch;
    bool     flipped;
-   double   reaction;   // average reaction in ATR
+   double   reaction;   // average reaction vs noise (1.0 = random walk)
    double   score;      // 0..100
   };
 
@@ -237,8 +239,11 @@ int FindPivots(const double &high[], const double &low[],
   }
 
 //+------------------------------------------------------------------+
-//| How far price ran away from a pivot, in ATR units. A level price  |
-//| barely bounced off is not a level.                                |
+//| How far price ran away from a pivot, measured against what a      |
+//| random walk covers over the same horizon (ATR x sqrt(bars)).      |
+//| 1.0 = pure noise, 2.0 = twice what drift-free price would do.     |
+//| Comparing against a flat ATR multiple would score noise full      |
+//| marks: over 10 bars a random walk already travels ~3.2 x ATR.     |
 //+------------------------------------------------------------------+
 double ReactionATR(const SRPivot &p, const int upToBar,
                    const double &high[], const double &low[])
@@ -250,6 +255,8 @@ double ReactionATR(const SRPivot &p, const int upToBar,
    int end = p.bar + REACTION_LOOKAHEAD;
    if(end > upToBar) end = upToBar;
    if(end <= p.bar) return 0.0;
+   double noise = a * MathSqrt((double)(end - p.bar));
+   if(noise <= 0.0) return 0.0;
 
    double move = 0.0;
    if(p.kind > 0)
@@ -266,7 +273,7 @@ double ReactionATR(const SRPivot &p, const int upToBar,
          hi = MathMax(hi, high[k]);
       move = hi - p.price;
      }
-   return MathMax(move, 0.0) / a;
+   return MathMax(move, 0.0) / noise;
   }
 
 //+------------------------------------------------------------------+
@@ -303,13 +310,31 @@ void SortByPrice(SRPivot &arr[], const int count)
   }
 
 //+------------------------------------------------------------------+
+//| Sort pivots by bar (a cluster is small).                          |
+//+------------------------------------------------------------------+
+void SortByBar(SRPivot &arr[], const int count)
+  {
+   for(int i = 1; i < count; i++)
+     {
+      SRPivot key = arr[i];
+      int j = i - 1;
+      while(j >= 0 && arr[j].bar > key.bar)
+        {
+         arr[j + 1] = arr[j];
+         j--;
+        }
+      arr[j + 1] = key;
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Build the scored zones from every pivot confirmed up to `upToBar`.|
 //| Highs and lows are clustered together on purpose: broken          |
 //| resistance becomes support, and both touches belong to one zone.  |
 //+------------------------------------------------------------------+
 int BuildZones(const SRPivot &pivots[], const int pivotCount, const int upToBar,
                const int scanStart, const double &high[], const double &low[],
-               SRZone &zones[])
+               const double &close[], SRZone &zones[])
   {
    ArrayResize(zones, 0);
    if(pivotCount < InpMinTouches)
@@ -324,6 +349,11 @@ int BuildZones(const SRPivot &pivots[], const int pivotCount, const int upToBar,
    double band = InpZoneWidthATR * g_atr[upToBar];
    if(band <= 0.0)
       band = 10 * _Point;
+
+   SRPivot member[];
+   SRPivot touch[];
+   ArrayResize(member, pivotCount);
+   ArrayResize(touch, pivotCount);
 
    ArrayResize(zones, pivotCount);
    int zoneCount = 0;
@@ -347,57 +377,115 @@ int BuildZones(const SRPivot &pivots[], const int pivotCount, const int upToBar,
       int members = i - clusterStart;
       if(members >= InpMinTouches)
         {
-         SRZone z;
-         z.bottom     = sorted[clusterStart].price;
-         z.top        = sorted[i - 1].price;
-         z.touches    = members;
-         z.firstTouch = sorted[clusterStart].bar;
-         z.lastTouch  = sorted[clusterStart].bar;
-
-         double sumPrice = 0.0;
-         double sumReact = 0.0;
-         bool hasHigh = false;
-         bool hasLow  = false;
-
-         for(int k = clusterStart; k < i; k++)
-           {
-            sumPrice += sorted[k].price;
-            sumReact += ReactionATR(sorted[k], upToBar, high, low);
-            if(sorted[k].kind > 0) hasHigh = true;
-            else                   hasLow  = true;
-            if(sorted[k].bar < z.firstTouch) z.firstTouch = sorted[k].bar;
-            if(sorted[k].bar > z.lastTouch)  z.lastTouch  = sorted[k].bar;
-           }
-
-         z.center   = sumPrice / members;
-         z.reaction = sumReact / members;
-         z.flipped  = (hasHigh && hasLow);
-
          // support/resistance is an area, never a line
-         if(z.top - z.bottom < band)
+         double bottom = sorted[clusterStart].price;
+         double top    = sorted[i - 1].price;
+         if(top - bottom < band)
            {
-            z.bottom = z.center - band / 2.0;
-            z.top    = z.center + band / 2.0;
+            double mid = (bottom + top) / 2.0;
+            bottom = mid - band / 2.0;
+            top    = mid + band / 2.0;
            }
 
-         int    counted     = (members < TOUCHES_FOR_FULL_SCORE) ? members : TOUCHES_FOR_FULL_SCORE;
-         double touchPart   = (double)counted / (double)TOUCHES_FOR_FULL_SCORE;
-         double reactPart   = MathMin(z.reaction / ATR_MOVE_FOR_FULL_SCORE, 1.0);
-         double span        = (double)(upToBar - scanStart);
-         double recencyPart = (span > 0.0) ? (double)(z.lastTouch - scanStart) / span : 0.0;
-         double flipPart    = z.flipped ? 1.0 : 0.0;
-         double roundPart   = RoundNumberScore(z.center);
+         for(int k = 0; k < members; k++)
+            member[k] = sorted[clusterStart + k];
+         SortByBar(member, members);
 
-         z.score = 100.0 * (W_TOUCHES  * touchPart +
-                            W_REACTION * reactPart +
-                            W_RECENCY  * recencyPart +
-                            W_FLIP     * flipPart +
-                            W_ROUND    * roundPart);
-
-         if(z.score >= InpMinScore)
+         // Pivots from the same visit are ONE touch. A new touch is counted
+         // only once price has closed outside the zone since the previous one,
+         // otherwise a single swing inflates the score into a fake "strong" zone.
+         touch[0] = member[0];
+         int nTouch = 1;
+         for(int k = 1; k < members; k++)
            {
-            zones[zoneCount] = z;
-            zoneCount++;
+            bool leftZone = false;
+            for(int b = touch[nTouch - 1].bar + 1; b < member[k].bar; b++)
+               if(close[b] > top || close[b] < bottom)
+                 {
+                  leftZone = true;
+                  break;
+                 }
+            if(leftZone)
+              {
+               touch[nTouch] = member[k];
+               nTouch++;
+              }
+           }
+
+         if(nTouch >= InpMinTouches)
+           {
+            SRZone z;
+            z.bottom     = bottom;
+            z.top        = top;
+            z.firstTouch = touch[0].bar;
+            z.lastTouch  = touch[nTouch - 1].bar;
+            z.touches    = nTouch;
+
+            double sumPrice = 0.0;
+            double sumReact = 0.0;
+            bool   fromAbove = false;
+            bool   fromBelow = false;
+
+            for(int k = 0; k < nTouch; k++)
+              {
+               sumPrice += touch[k].price;
+               sumReact += ReactionATR(touch[k], upToBar, high, low);
+
+               // which side price approached from: a zone that has been
+               // approached from both sides has genuinely reversed roles
+               int stop = touch[k].bar - FLIP_LOOKBACK;
+               if(stop < scanStart)
+                  stop = scanStart;
+               for(int b = touch[k].bar - 1; b >= stop; b--)
+                 {
+                  if(close[b] > top)
+                    {
+                     fromAbove = true;
+                     break;
+                    }
+                  if(close[b] < bottom)
+                    {
+                     fromBelow = true;
+                     break;
+                    }
+                 }
+              }
+
+            // a real role reversal also needs price to have traded a full ATR
+            // clear of the zone on both sides, not merely closed past its edge
+            bool heldAbove = false;
+            bool heldBelow = false;
+            for(int b = z.firstTouch; b <= z.lastTouch; b++)
+              {
+               if(close[b] > top + g_atr[b])    heldAbove = true;
+               if(close[b] < bottom - g_atr[b]) heldBelow = true;
+              }
+
+            z.center   = sumPrice / nTouch;
+            z.reaction = sumReact / nTouch;
+            z.flipped  = (fromAbove && fromBelow && heldAbove && heldBelow);
+
+            int    counted     = (nTouch < TOUCHES_FOR_FULL_SCORE) ? nTouch : TOUCHES_FOR_FULL_SCORE;
+            double touchPart   = (double)counted / (double)TOUCHES_FOR_FULL_SCORE;
+            double excess      = (z.reaction - REACTION_NOISE_FLOOR) /
+                                 (REACTION_FULL_SCORE - REACTION_NOISE_FLOOR);
+            double reactPart   = MathMax(0.0, MathMin(excess, 1.0));
+            double span        = (double)(upToBar - scanStart);
+            double recencyPart = (span > 0.0) ? (double)(z.lastTouch - scanStart) / span : 0.0;
+            double flipPart    = z.flipped ? 1.0 : 0.0;
+            double roundPart   = RoundNumberScore(z.center);
+
+            z.score = 100.0 * (W_TOUCHES  * touchPart +
+                               W_REACTION * reactPart +
+                               W_RECENCY  * recencyPart +
+                               W_FLIP     * flipPart +
+                               W_ROUND    * roundPart);
+
+            if(z.score >= InpMinScore)
+              {
+               zones[zoneCount] = z;
+               zoneCount++;
+              }
            }
         }
       clusterStart = i;
@@ -612,7 +700,7 @@ void DrawZones(const SRZone &zones[], const int zoneCount,
       string label = OBJ_PREFIX + "T" + IntegerToString(z);
       ObjectCreate(0, label, OBJ_TEXT, 0, rightEdge, zones[z].center);
       ObjectSetString(0, label, OBJPROP_TEXT,
-                      StringFormat("%s %.0f | %d touches | %.1fxATR", role, zones[z].score,
+                      StringFormat("%s %.0f | %d touches | react %.1fx", role, zones[z].score,
                                    zones[z].touches, zones[z].reaction));
       ObjectSetString(0, label, OBJPROP_FONT, "Arial");
       ObjectSetInteger(0, label, OBJPROP_FONTSIZE, 8);
@@ -730,7 +818,7 @@ int OnCalculate(const int rates_total,
         }
       if(needRebuild)
         {
-         zoneCount   = BuildZones(active, activeCount, i, scanStart, high, low, zones);
+         zoneCount   = BuildZones(active, activeCount, i, scanStart, high, low, close, zones);
          needRebuild = false;
         }
       if(zoneCount == 0)
@@ -792,7 +880,7 @@ int OnCalculate(const int rates_total,
      }
 
    // refresh the zone set with the latest ATR for drawing and for the levels
-   zoneCount = BuildZones(active, activeCount, lastClosed, scanStart, high, low, zones);
+   zoneCount = BuildZones(active, activeCount, lastClosed, scanStart, high, low, close, zones);
 
    double lastCloseValue = close[lastClosed];
    double sup = EMPTY_VALUE, res = EMPTY_VALUE;
