@@ -3,19 +3,16 @@
 """
 ICT / SMC Intraday Bot  --  single file  (Gold / XAUUSD)
 
-Strategy (default mode = v2; pass --mode v1 for the original single-MSS logic):
+Strategy (default mode = v1; pass --mode v2 for the EQH/EQL + CHoCH->BOS + OB upgrade):
     H1  -> context (with-trend / reversal-correction), label only.
-    M15 -> liquidity sweep of a swing OR an EQH/EQL pool (equal highs/lows =
-           stronger liquidity), break then close back.
-    M5  -> CHoCH (first structure break after the sweep) then BOS (second break
-           in the trade direction); Displacement must accompany the BOS.
-    M1  -> entry zone = Order Block (last opposite candle before the
-           displacement) + FVG, preferring their confluence; refined on M1.
-    then retracement into the zone = entry.
+    M15 -> liquidity sweep (break a high/low then close back).
+    M5  -> MSS + Displacement + FVG.
+    then retracement into the FVG = entry.
     SL beyond the sweep extreme. TP = nearest opposing liquidity that gives
     RR >= rr_min. RR too small or no target far enough -> NO TRADE.
 
-    v1 keeps the original M5 pipeline: MSS + Displacement + FVG.
+    v2 adds: EQH/EQL liquidity on M15, a two-stage CHoCH->BOS confirmation on
+    M5, an Order-Block + FVG confluence entry zone, and an M1-refined entry.
 
 Honest backtest:
     Setups are detected on M5/M15/H1, but each trade's WIN/LOSS is resolved on
@@ -113,7 +110,7 @@ class Params:
     win_h1: int = 200
 
     # --- v2 upgrade: EQH/EQL liquidity + CHoCH->BOS + OB/FVG confluence + M1 entry ---
-    mode: str = "v2"             # "v2" = upgraded pipeline, "v1" = original single-MSS
+    mode: str = "v1"             # "v1" = original single-MSS (default), "v2" = upgraded pipeline
     eq_tol_atr: float = 0.10     # EQH/EQL: two swings are "equal" within this * M15 ATR
     bos_window: int = 40         # BOS must close-through within N M5 candles after the CHoCH
     entry_m1_window: int = 180   # search this many M1 candles after BOS for the M1 entry FVG
@@ -1025,7 +1022,7 @@ def main():
     ap.add_argument("--sw-m15", type=int, dest="sw_m15")
     ap.add_argument("--sw-m5", type=int, dest="sw_m5")
     ap.add_argument("--mode", choices=["v1", "v2"],
-                    help="v2 (default): EQH/EQL + CHoCH->BOS + OB/FVG confluence + M1 entry; v1: original MSS")
+                    help="v1 (default): original MSS; v2: EQH/EQL + CHoCH->BOS + OB/FVG confluence + M1 entry")
     ap.add_argument("--eq-tol-atr", type=float, dest="eq_tol_atr", help="EQH/EQL tolerance as * M15 ATR (v2)")
     ap.add_argument("--bos-window", type=int, dest="bos_window", help="M5 candles allowed for BOS after CHoCH (v2)")
     ap.add_argument("--entry-m1-window", type=int, dest="entry_m1_window", help="M1 candles scanned for the entry FVG (v2)")
