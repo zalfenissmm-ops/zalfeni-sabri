@@ -34,6 +34,14 @@ enum ENUM_MITIGATION
    MIT_CLOSE_IN   = 2       // إغلاق داخل الزون
   };
 
+enum ENUM_PRESET
+  {
+   PRESET_CUSTOM   = 0,   // Custom   — استعمل الإعدادات اللي تحت كيما هي
+   PRESET_STRICT   = 1,   // Strict   — الشروط 5 كامل إجبارية (أقل زونات، أنقى)
+   PRESET_BALANCED = 2,   // Balanced — sweep + displacement + كسر (FVG = نقطة قوة)
+   PRESET_LOOSE    = 3    // Loose    — كسر + displacement برك (أكثر زونات)
+  };
+
 enum ENUM_STRENGTH_FILTER
   {
    SF_ALL    = 0,           // اعرض الكل
@@ -55,8 +63,10 @@ input int                  InpMaxLegBars      = 12;             // أقصى طو
 input int                  InpAvgPeriod       = 14;             // فترة متوسط المدى (مرجع القوة)
 
 input group                "=== 2) الشروط ==="
+input ENUM_PRESET          InpPreset          = PRESET_BALANCED; // الوضع — يتحكّم في اللي تحت
 input bool                 InpRequireSweep    = true;           // 1) لازم Liquidity sweep
 input int                  InpSweepLookback   = 12;             // نافذة البحث على الـ sweep
+input int                  InpSweepCloseBars  = 2;              // كم شمعة مسموح باش يرجع يسكّر داخل
 input double               InpEqualTolerance  = 0.15;           // تفاوت equal highs/lows (× متوسط المدى)
 input bool                 InpRequireDisp     = true;           // 2) لازم Displacement
 input double               InpDispMult        = 1.8;            // قوة الحركة (× متوسط المدى)
@@ -179,6 +189,11 @@ int               g_obN = 0;
 datetime          g_lastBar = 0;
 datetime          g_alertForm[];
 datetime          g_alertTap[];
+//--- الإعدادات الفعّالة (يعمّرها الـ preset)
+bool              g_reqSweep, g_reqDisp, g_reqFVG, g_reqMSS;
+double            g_dispMult, g_minBody, g_minFVG;
+int               g_maxDispBars, g_swingWin, g_sweepClose, g_maxLeg;
+int               g_maxOBCandles, g_sweepLB;
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -242,6 +257,18 @@ bool IsOpposite(const int i, const bool bull)
    return(g_rates[i].close > g_rates[i].open);      // شمعة صاعدة قبل حركة هبوط
   }
 
+//--- السعر رجع سكّر داخل المستوى المكنوس في ظرف g_sweepClose شمعة
+bool Reclaimed(const int b, const int limit, const double level, const bool bull)
+  {
+   int last = (int)MathMin(b + g_sweepClose, limit);
+   for(int q = b; q <= last && q < g_n; q++)
+     {
+      if(bull  && g_rates[q].close > level) return(true);
+      if(!bull && g_rates[q].close < level) return(true);
+     }
+   return(false);
+  }
+
 bool Overlap(const double a1, const double a2, const double b1, const double b2)
   {
    double aLo = MathMin(a1, a2), aHi = MathMax(a1, a2);
@@ -250,12 +277,57 @@ bool Overlap(const double a1, const double a2, const double b1, const double b2)
   }
 
 //+------------------------------------------------------------------+
+//| الإعدادات الفعّالة حسب الـ preset                                  |
+//+------------------------------------------------------------------+
+string ApplyPreset()
+  {
+   //--- الأساس: اللي كتبو المستخدم
+   g_reqSweep     = InpRequireSweep;
+   g_reqDisp      = InpRequireDisp;
+   g_reqFVG       = InpRequireFVG;
+   g_reqMSS       = InpRequireMSS;
+   g_dispMult     = InpDispMult;
+   g_minBody      = InpMinBodyRatio;
+   g_minFVG       = InpMinFVGRatio;
+   g_maxDispBars  = (int)MathMax(1, InpMaxDispBars);
+   g_swingWin     = (int)MathMax(1, InpSwingWindow);
+   g_sweepClose   = (int)MathMax(0, InpSweepCloseBars);
+   g_maxLeg       = (int)MathMax(2, InpMaxLegBars);
+   g_maxOBCandles = (int)MathMax(1, InpMaxOBCandles);
+   g_sweepLB      = (int)MathMax(1, InpSweepLookback);
+
+   switch(InpPreset)
+     {
+      case PRESET_STRICT:
+         g_reqSweep = true;  g_reqDisp = true;  g_reqFVG = true;
+         g_dispMult = 2.0;   g_minBody = 0.55;  g_maxDispBars = 4;
+         g_swingWin = 3;
+         return("STRICT");
+      case PRESET_BALANCED:
+         //--- الـ FVG يولّي نقطة قوة موش شرط رفض: "بدون FVG الـ OB ضعيف"
+         g_reqSweep = true;  g_reqDisp = true;  g_reqFVG = false;
+         g_dispMult = 1.5;   g_minBody = 0.45;  g_maxDispBars = 6;
+         g_swingWin = 2;     g_sweepClose = 3;
+         return("BALANCED");
+      case PRESET_LOOSE:
+         g_reqSweep = false; g_reqDisp = true;  g_reqFVG = false;
+         g_dispMult = 1.2;   g_minBody = 0.40;  g_maxDispBars = 8;
+         g_swingWin = 2;     g_sweepClose = 3;  g_sweepLB = 20;
+         return("LOOSE");
+      default:
+         return("CUSTOM");
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Init / Deinit                                                    |
 //+------------------------------------------------------------------+
 int OnInit()
   {
    g_detTF = (InpDetectTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpDetectTF;
-   IndicatorSetString(INDICATOR_SHORTNAME, "SMC OrderBlock [" + TFName(g_detTF) + "]");
+   string mode = ApplyPreset();
+   IndicatorSetString(INDICATOR_SHORTNAME,
+                      "SMC OrderBlock [" + TFName(g_detTF) + " / " + mode + "]");
    ObjectsDeleteAll(0, g_prefix);
    ArrayResize(g_alertForm, 0);
    ArrayResize(g_alertTap, 0);
@@ -335,7 +407,7 @@ void Recompute()
 //+------------------------------------------------------------------+
 void FindSwings()
   {
-   int k = (int)MathMax(1, InpSwingWindow);
+   int k = g_swingWin;
 
    ArrayResize(g_isSH, g_n);
    ArrayResize(g_isSL, g_n);
@@ -386,7 +458,7 @@ void FindSwings()
 //+------------------------------------------------------------------+
 void ScanStructure()
   {
-   int k = (int)MathMax(1, InpSwingWindow);
+   int k = g_swingWin;
 
    int    actHi = -1, actLo = -1;
    double actHiPx = 0.0, actLoPx = 0.0;
@@ -469,18 +541,21 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
    ob.score      = 0;      ob.grade = "C";  ob.tags = "";
 
    //--- 3) MSS فقط إذا مطلوب
-   if(InpRequireMSS && !isMSS)
+   if(g_reqMSS && !isMSS)
       return(false);
 
    //--- ارجع من نقطة الكسر لور: أوّل شمعة معاكسة
    int j     = breakIdx;
    int guard = 0;
-   while(j > 0 && IsWithMove(j, bull) && guard < InpMaxLegBars)
+   //--- إذا شمعة الكسر روحها معاكسة، ابدا الرجوع من اللي قبلها
+   if(!IsWithMove(j, bull))
+      j--;
+   while(j > 0 && IsWithMove(j, bull) && guard < g_maxLeg)
      {
       j--;
       guard++;
      }
-   if(j == breakIdx)          // شمعة الكسر روحها معاكسة => ما فماش displacement نظيف
+   if(j < 0 || j >= breakIdx)
       return(false);
    if(!IsOpposite(j, bull))   // ما لقيناش شمعة معاكسة في المدى المسموح
       return(false);
@@ -489,7 +564,7 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
    int obStart = obEnd;
    int cnt     = 1;
    //--- شمعتين ولا ثلاثة معاكسين متتاليين = كتلة وحدة
-   while(obStart > 0 && cnt < (int)MathMax(1, InpMaxOBCandles) && IsOpposite(obStart - 1, bull))
+   while(obStart > 0 && cnt < g_maxOBCandles && IsOpposite(obStart - 1, bull))
      {
       obStart--;
       cnt++;
@@ -552,10 +627,10 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
    ob.dispBars   = legBars;
    ob.dispRatio  = (avg > 0.0) ? (legHigh - legLow) / avg : 0.0;
    ob.bodyRatio  = (rangeSum > 0.0) ? bodySum / rangeSum : 0.0;
-   ob.hasDisp    = (legBars <= (int)MathMax(1, InpMaxDispBars) &&
-                    ob.dispRatio >= InpDispMult &&
-                    ob.bodyRatio >= InpMinBodyRatio);
-   if(InpRequireDisp && !ob.hasDisp)
+   ob.hasDisp    = (legBars <= g_maxDispBars &&
+                    ob.dispRatio >= g_dispMult &&
+                    ob.bodyRatio >= g_minBody);
+   if(g_reqDisp && !ob.hasDisp)
      {
       if(InpPrintLog)
          PrintFormat("%s OB @%s رُفض: displacement ضعيف (bars=%d ratio=%.2f body=%.2f)",
@@ -588,7 +663,7 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
            }
         }
       double sz = gTop - gBot;
-      if(sz > 0.0 && sz > bestSize && (avg <= 0.0 || sz >= InpMinFVGRatio * avg))
+      if(sz > 0.0 && sz > bestSize && (avg <= 0.0 || sz >= g_minFVG * avg))
         {
          bestSize     = sz;
          ob.hasFVG    = true;
@@ -598,7 +673,7 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
          ob.fvgT2     = g_rates[(int)MathMin(m + 1, g_n - 1)].time;
         }
      }
-   if(InpRequireFVG && !ob.hasFVG)
+   if(g_reqFVG && !ob.hasFVG)
      {
       if(InpPrintLog)
          PrintFormat("%s OB @%s رُفض: ما فماش FVG في الحركة",
@@ -607,7 +682,7 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
      }
 
    //--- 1) Liquidity sweep قبل الـ OB
-   int wFrom = (int)MathMax((int)MathMax(1, InpSwingWindow), obStart - (int)MathMax(1, InpSweepLookback));
+   int wFrom = (int)MathMax(g_swingWin, obStart - g_sweepLB);
    for(int b = obEnd; b >= wFrom && !ob.hasSweep; b--)
      {
       if(bull)
@@ -617,11 +692,11 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
             int si = g_slIdx[s];
             if(si >= b)
                continue;
-            if(si + InpSwingWindow > b)      // مازال ما تأكدش وقت الكنس
+            if(si + g_swingWin > b)      // مازال ما تأكدش وقت الكنس
                continue;
-            if(b - si > InpSweepLookback + InpMaxOBCandles + InpSwingWindow)
+            if(b - si > g_sweepLB + g_maxOBCandles + g_swingWin)
                break;
-            if(g_rates[b].low < g_slPx[s] && g_rates[b].close > g_slPx[s])
+            if(g_rates[b].low < g_slPx[s] && Reclaimed(b, breakIdx, g_slPx[s], true))
               {
                ob.hasSweep   = true;
                ob.sweepLevel = g_slPx[s];
@@ -644,11 +719,11 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
             int si = g_shIdx[s];
             if(si >= b)
                continue;
-            if(si + InpSwingWindow > b)
+            if(si + g_swingWin > b)
                continue;
-            if(b - si > InpSweepLookback + InpMaxOBCandles + InpSwingWindow)
+            if(b - si > g_sweepLB + g_maxOBCandles + g_swingWin)
                break;
-            if(g_rates[b].high > g_shPx[s] && g_rates[b].close < g_shPx[s])
+            if(g_rates[b].high > g_shPx[s] && Reclaimed(b, breakIdx, g_shPx[s], false))
               {
                ob.hasSweep   = true;
                ob.sweepLevel = g_shPx[s];
@@ -665,7 +740,7 @@ bool BuildOB(const int breakIdx, const bool bull, const bool isMSS,
            }
         }
      }
-   if(InpRequireSweep && !ob.hasSweep)
+   if(g_reqSweep && !ob.hasSweep)
      {
       if(InpPrintLog)
          PrintFormat("%s OB @%s رُفض: ما كنستش سيولة قبلها",
