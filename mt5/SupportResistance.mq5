@@ -23,7 +23,9 @@
 input int    InpLookback     = 600;            // Bars to analyse
 input int    InpSwing        = 3;              // Swing window (bars each side)
 input int    InpAtrPeriod    = 14;             // ATR period
-input double InpMerge        = 0.5;            // Zone merge distance (x ATR)
+input double InpMerge        = 0.35;           // Zone merge distance (x ATR)
+input double InpMaxWidthATR  = 0.7;            // Hard cap on zone width (x ATR)
+input int    InpMaxWidthPts  = 0;              // Hard cap on zone width (points, 0 = off)
 input int    InpMinTouches   = 1;              // Minimum touches to keep a zone
 input int    InpMinGap       = 5;              // Min bars between two touches
 input int    InpReactWindow  = 10;             // Bars used to measure a reaction
@@ -64,6 +66,7 @@ struct Pivot
   {
    int      index;        // bar the pivot sits on
    int      confirmed;    // first bar it could be known on
+   int      kind;         // +1 swing high, -1 swing low
    double   top;          // wick-to-body band
    double   bottom;
   };
@@ -73,6 +76,8 @@ struct Zone
    double     top;
    double     bottom;
    int        born;
+   int        highs;        // pivots of each kind that formed it: the dominant
+   int        lows;         // side is the edge that must survive a width clamp
    int        touches;      // revisits; the formation counts on top of these
    double     react_sum;
    int        react_n;
@@ -94,6 +99,8 @@ int    g_lookback;
 int    g_swing;
 int    g_atr_period;
 double g_merge;
+double g_max_width_atr;
+double g_max_width_pts;
 int    g_min_touches;
 int    g_min_gap;
 int    g_react_window;
@@ -108,6 +115,8 @@ int OnInit()
    g_swing        = (int)MathMax(1, InpSwing);
    g_atr_period   = (int)MathMax(2, InpAtrPeriod);
    g_merge        = MathMax(0.01, InpMerge);
+   g_max_width_atr = MathMax(0.05, InpMaxWidthATR);
+   g_max_width_pts = MathMax(0.0, (double)InpMaxWidthPts);
    g_min_touches  = (int)MathMax(1, InpMinTouches);
    g_min_gap      = (int)MathMax(1, InpMinGap);
    g_react_window = (int)MathMax(1, InpReactWindow);
@@ -194,6 +203,7 @@ int BuildPivots(const int bars, Pivot &out[])
          ArrayResize(out, n + 1);
          out[n].index     = i;
          out[n].confirmed = i + g_swing;
+         out[n].kind      = 1;
          out[n].top       = g_rates[i].high;
          out[n].bottom    = MathMax(g_rates[i].open, g_rates[i].close);
          n++;
@@ -203,6 +213,7 @@ int BuildPivots(const int bars, Pivot &out[])
          ArrayResize(out, n + 1);
          out[n].index     = i;
          out[n].confirmed = i + g_swing;
+         out[n].kind      = -1;
          out[n].top       = MathMin(g_rates[i].open, g_rates[i].close);
          out[n].bottom    = g_rates[i].low;
          n++;
@@ -212,22 +223,62 @@ int BuildPivots(const int bars, Pivot &out[])
   }
 
 //+------------------------------------------------------------------+
-//| A pivot with no wick would give a zero-width zone; give every    |
-//| zone a minimum thickness so it can actually be touched.          |
+//| The widest a zone is allowed to be. A zone thicker than this is  |
+//| not a level any more, it is a region, and price can sit inside   |
+//| it without telling you anything.                                 |
 //+------------------------------------------------------------------+
-int PushZone(double bottom, double top, const int born, const double gap, const int n)
+double MaxWidth(const double unit)
   {
-   double missing = 0.2 * gap - (top - bottom);
+   double limit = g_max_width_atr * unit;
+   if(g_max_width_pts > 0.0)
+      limit = MathMin(limit, g_max_width_pts * _Point);
+   return(limit);
+  }
+
+//+------------------------------------------------------------------+
+//| Store a finished cluster as a zone.                              |
+//|                                                                  |
+//| Two corrections happen here. A pivot with no wick would give a    |
+//| zero-width zone, so every zone gets a minimum thickness. And a    |
+//| cluster of tall candles can span far more than a level should, so |
+//| the zone is clamped to MaxWidth() — anchored on the side its      |
+//| pivots agree on, because that extreme IS the level: for a cluster |
+//| of swing highs the high must survive and the body edge gives way. |
+//+------------------------------------------------------------------+
+int PushZone(double bottom, double top, const int born, const double gap,
+             const double unit, const int highs, const int lows, const int n)
+  {
+   double limit = MaxWidth(unit);
+
+   double minimum = MathMin(0.2 * gap, limit);
+   double missing = minimum - (top - bottom);
    if(missing > 0)
      {
       top    += missing / 2.0;
       bottom -= missing / 2.0;
      }
 
+   double excess = (top - bottom) - limit;
+   if(excess > 0)
+     {
+      if(highs > lows)
+         bottom = top - limit;            // keep the swing high
+      else
+         if(lows > highs)
+            top = bottom + limit;         // keep the swing low
+         else
+           {
+            top    -= excess / 2.0;       // no dominant side: shrink evenly
+            bottom += excess / 2.0;
+           }
+     }
+
    ArrayResize(g_zones, n + 1);
    g_zones[n].top         = top;
    g_zones[n].bottom      = bottom;
    g_zones[n].born        = born;
+   g_zones[n].highs       = highs;
+   g_zones[n].lows        = lows;
    g_zones[n].touches     = 0;
    g_zones[n].react_sum   = 0.0;
    g_zones[n].react_n     = 0;
@@ -276,38 +327,50 @@ int BuildZones(Pivot &pivots[], const int count)
 
    int    n = 0;
    bool   open_zone = false;
-   double cur_top = 0.0, cur_bottom = 0.0, last_gap = 0.0;
-   int    cur_born = 0;
+   double cur_top = 0.0, cur_bottom = 0.0, last_gap = 0.0, last_unit = 0.0;
+   int    cur_born = 0, cur_highs = 0, cur_lows = 0;
 
    for(int i = 0; i < count; i++)
      {
-      Pivot p = pivots[order[i]];
-      double gap = g_merge * Unit(p.index);
+      Pivot  p    = pivots[order[i]];
+      double unit = Unit(p.index);
+      double gap  = g_merge * unit;
 
+      // A pivot joins the open zone only if it is close enough AND the zone
+      // stays inside the width cap: merging must never widen a level past the
+      // point where it stops being one.
       bool joins = open_zone
                    && (p.bottom - cur_top) <= gap
-                   && (MathMax(cur_top, p.top) - cur_bottom) <= 2.0 * gap;
+                   && (MathMax(cur_top, p.top) - MathMin(cur_bottom, p.bottom)) <= MaxWidth(unit);
 
       if(joins)
         {
          cur_top    = MathMax(cur_top, p.top);
          cur_bottom = MathMin(cur_bottom, p.bottom);
          cur_born   = MathMin(cur_born, p.confirmed);
+         if(p.kind > 0)
+            cur_highs++;
+         else
+            cur_lows++;
         }
       else
         {
          if(open_zone)
-            n = PushZone(cur_bottom, cur_top, cur_born, last_gap, n);
+            n = PushZone(cur_bottom, cur_top, cur_born, last_gap, last_unit, cur_highs, cur_lows, n);
          cur_top    = p.top;
          cur_bottom = p.bottom;
          cur_born   = p.confirmed;
+         cur_highs  = (p.kind > 0) ? 1 : 0;
+         cur_lows   = (p.kind > 0) ? 0 : 1;
          open_zone  = true;
         }
-      last_gap = gap;
+
+      last_gap  = gap;
+      last_unit = unit;
      }
 
    if(open_zone)
-      n = PushZone(cur_bottom, cur_top, cur_born, last_gap, n);
+      n = PushZone(cur_bottom, cur_top, cur_born, last_gap, last_unit, cur_highs, cur_lows, n);
    return(n);
   }
 
