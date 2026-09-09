@@ -24,6 +24,12 @@
 #define TP_DAY      1
 #define TP_WEEK     2
 
+//--- signal kinds
+#define SIG_BUILD   0   // equal high/low forming on the live bar - instant
+#define SIG_NEW     1   // a fractal confirmed a pool - RightBars behind by nature
+#define SIG_RAID    2   // the live bar is piercing a pool - instant
+#define SIG_SWEEP   3   // the raid closed back inside - confirmed on bar close
+
 input group             "=== Detection ==="
 input int    InpLeftBars       = 3;      // Swing: bars to the left
 input int    InpRightBars      = 3;      // Swing: bars to the right (confirmation lag)
@@ -51,8 +57,20 @@ input bool   InpShowLabels     = true;   // Text label on each pool
 input int    InpLabelShiftBars = 2;      // Push labels this many bars right of price
 input bool   InpShowPanel      = true;   // Corner panel with the nearest pools
 
-input group             "=== Alerts ==="
-input bool   InpAlertOnRaid    = false;  // Alert when a pool starts being raided
+input group             "=== Signals ==="
+input bool   InpSigBuilding    = true;   // Liquidity BUILDING now (equal high/low forming) - tick level
+input bool   InpSigNewPool     = true;   // New pool confirmed - lags RightBars, unavoidable
+input bool   InpSigRaid        = true;   // Pool being raided right now - tick level
+input bool   InpSigSweep       = true;   // Sweep completed on the bar close
+input double InpSigMinScore    = 0.0;    // Only signal pools scoring at least this (0-100)
+input bool   InpSigMarkers     = true;   // Leave a marker on the chart at each signal
+
+input group             "=== Alert channels ==="
+input bool   InpAlertPopup     = true;   // Popup window
+input bool   InpAlertPush      = false;  // Push to the MT5 mobile app
+input bool   InpAlertMail      = false;  // Email (set it up in Tools > Options > Email)
+input bool   InpAlertSound     = false;  // Play a sound
+input string InpSoundFile      = "alert.wav";
 
 struct Pool
 {
@@ -69,12 +87,33 @@ struct Pool
    int      bar_end;       // bar that swept / claimed it
    double   score;         // 0..100 quality
    double   pull;          // score / (1 + distance in ATR) = live magnet strength
-   bool     alerted;
    bool     draw;
    bool     used;          // scratch flag for ranking
 };
 
+//--- one entry per signal already sent, so a rebuild never re-fires it
+struct Fired
+{
+   int      kind;
+   int      side;
+   long     lvl;      // level in points - integer, so comparison is exact
+   int      tag;      // touch count at fire time: x2 and x3 are different events
+   datetime when;
+   string   marker;
+};
+
+struct Pending
+{
+   int      kind;
+   int      pool;
+};
+
 Pool     g_pools[];
+Fired    g_fired[];
+Pending  g_queue[];
+bool     g_warmed     = false;  // suppresses the signal storm on first attach
+int      g_last_closed = -1;
+string   g_sig_prefix = "LQS_";
 int      g_atr_handle = INVALID_HANDLE;
 double   g_atr        = 0.0;   // ATR of the last closed bar
 double   g_tol        = 0.0;   // tolerance at the current bar
@@ -104,8 +143,11 @@ int OnInit()
       return(INIT_FAILED);
    }
 
-   g_prefix = StringFormat("LQM%d_%d_", InpLeftBars, InpRightBars);
-   g_last_bar = 0;
+   g_prefix     = StringFormat("LQM%d_%d_", InpLeftBars, InpRightBars);
+   g_sig_prefix = StringFormat("LQS%d_%d_", InpLeftBars, InpRightBars);
+   g_last_bar   = 0;
+   g_warmed     = false;
+   ArrayResize(g_fired, 0);
    IndicatorSetString(INDICATOR_SHORTNAME, StringFormat("LiquidityMap(%d/%d)", InpLeftBars, InpRightBars));
    return(INIT_SUCCEEDED);
 }
@@ -114,6 +156,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    ObjectsDeleteAll(0, g_prefix);
+   ObjectsDeleteAll(0, g_sig_prefix);
    if(g_atr_handle != INVALID_HANDLE)
       IndicatorRelease(g_atr_handle);
    ChartRedraw();
@@ -152,6 +195,8 @@ int OnCalculate(const int rates_total,
       return(prev_calculated);
    g_tol = g_atr * InpEqTolATR;
 
+   ArrayResize(g_queue, 0);
+
    bool changed = false;
    if(prev_calculated == 0 || time[rates_total - 1] != g_last_bar)
    {
@@ -167,6 +212,8 @@ int OnCalculate(const int rates_total,
    //--- the objects themselves are only rebuilt when something moved
    double price_now = close[rates_total - 1];
    ScorePools(rates_total, price_now);
+   FlushSignals(time[rates_total - 1],
+                (g_last_closed >= 0) ? time[g_last_closed] : time[rates_total - 1]);
 
    if(changed)
    {
@@ -179,7 +226,172 @@ int OnCalculate(const int rates_total,
       ChartRedraw();
    }
 
+   //--- the first pass replays the whole history; nothing from it is news,
+   //--- so signals only start counting from the second pass onward
+   g_warmed = true;
    return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Signal engine.                                                    |
+//|                                                                   |
+//| BuildPools() wipes and rebuilds every pool on each new bar, so    |
+//| pools carry no identity across rebuilds. Without a ledger the     |
+//| same event would alert again every single bar. Keys are (kind,    |
+//| side, level, touch count) with the level matched inside the       |
+//| pool's own tolerance, so a merge that nudges the level by a tick  |
+//| does not read as a fresh event - while x2 -> x3 on the same       |
+//| level does, because that genuinely is new liquidity.              |
+//+------------------------------------------------------------------+
+bool AlreadyFired(const int kind, const int side, const long lvl,
+                  const long tol_pts, const int tag)
+{
+   for(int i = ArraySize(g_fired) - 1; i >= 0; i--)
+   {
+      if(g_fired[i].kind != kind) continue;
+      if(g_fired[i].side != side) continue;
+      if(g_fired[i].tag  != tag)  continue;
+      if(MathAbs(g_fired[i].lvl - lvl) <= tol_pts)
+         return(true);
+   }
+   return(false);
+}
+
+void PruneFired()
+{
+   int n = ArraySize(g_fired);
+   if(n <= 400)
+      return;
+   int drop = n - 300;
+   for(int i = 0; i < drop; i++)
+      if(g_fired[i].marker != "")
+         ObjectDelete(0, g_fired[i].marker);
+   for(int i = 0; i + drop < n; i++)
+      g_fired[i] = g_fired[i + drop];
+   ArrayResize(g_fired, n - drop);
+}
+
+void QueueSignal(const int kind, const int pool)
+{
+   if(!g_warmed)              // first pass walks all of history - stay quiet
+      return;
+   int n = ArraySize(g_queue);
+   if(ArrayResize(g_queue, n + 1) != n + 1)
+      return;
+   g_queue[n].kind = kind;
+   g_queue[n].pool = pool;
+}
+
+string SignalText(const int kind, const int k)
+{
+   string side_txt = (g_pools[k].side > 0) ? "BUY-SIDE" : "SELL-SIDE";
+   string what;
+   switch(kind)
+   {
+      case SIG_BUILD:
+         what = StringFormat("liquidity BUILDING (equal %s x%d forming)",
+                             (g_pools[k].side > 0 ? "highs" : "lows"), g_pools[k].touches);
+         break;
+      case SIG_NEW:
+         what = (g_pools[k].touches > 1)
+                ? StringFormat("pool CONFIRMED x%d", g_pools[k].touches)
+                : "new pool";
+         break;
+      case SIG_RAID:  what = "being RAIDED right now";     break;
+      case SIG_SWEEP: what = "SWEPT (wick took it)";       break;
+      default:        what = "event";                      break;
+   }
+   return(StringFormat("%s %s | %s %s @ %s | score %.0f",
+                       _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+                       side_txt, what,
+                       DoubleToString(g_pools[k].level, _Digits),
+                       g_pools[k].score));
+}
+
+void DrawMarker(const int kind, const int k, const datetime when, const string name)
+{
+   if(!InpSigMarkers)
+      return;
+   if(!ObjectCreate(0, name, OBJ_ARROW, 0, when, g_pools[k].level))
+      return;
+
+   int code = 159;                                   // BUILD: dot
+   if(kind == SIG_NEW)   code = 158;                 // small square
+   if(kind == SIG_RAID)  code = 161;                 // circle outline
+   if(kind == SIG_SWEEP) code = 251;                 // cross
+
+   color col = (kind == SIG_RAID || kind == SIG_SWEEP)
+               ? InpRaidColor
+               : ((g_pools[k].side > 0) ? InpBuySideColor : InpSellSideColor);
+
+   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, code);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_CENTER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP, SignalText(kind, k));
+}
+
+//+------------------------------------------------------------------+
+//| Send everything queued this pass. Scores are known by now, so the |
+//| quality filter and the alert text both have real numbers in them. |
+//+------------------------------------------------------------------+
+void FlushSignals(const datetime t_live, const datetime t_closed)
+{
+   bool fired_any = false;
+   int  q = ArraySize(g_queue);
+   for(int i = 0; i < q; i++)
+   {
+      int kind = g_queue[i].kind;
+      int k    = g_queue[i].pool;
+      if(k < 0 || k >= ArraySize(g_pools))
+         continue;
+
+      if(kind == SIG_BUILD && !InpSigBuilding) continue;
+      if(kind == SIG_NEW   && !InpSigNewPool)  continue;
+      if(kind == SIG_RAID  && !InpSigRaid)     continue;
+      if(kind == SIG_SWEEP && !InpSigSweep)    continue;
+      if(g_pools[k].score < InpSigMinScore)    continue;
+
+      double pt = (_Point > 0.0) ? _Point : 1.0;
+      long lvl     = (long)MathRound(g_pools[k].level / pt);
+      long tol_pts = (long)MathRound(MathAbs(g_pools[k].trigger - g_pools[k].level) / pt);
+      if(tol_pts < 1)
+         tol_pts = 1;
+
+      if(AlreadyFired(kind, g_pools[k].side, lvl, tol_pts, g_pools[k].touches))
+         continue;
+
+      datetime when = (kind == SIG_BUILD || kind == SIG_RAID) ? t_live : t_closed;
+      string   txt  = SignalText(kind, k);
+      string   name = StringFormat("%s%d_%d_%I64d_%d", g_sig_prefix, kind,
+                                   g_pools[k].side, lvl, g_pools[k].touches);
+
+      int n = ArraySize(g_fired);
+      if(ArrayResize(g_fired, n + 1) == n + 1)
+      {
+         g_fired[n].kind   = kind;
+         g_fired[n].side   = g_pools[k].side;
+         g_fired[n].lvl    = lvl;
+         g_fired[n].tag    = g_pools[k].touches;
+         g_fired[n].when   = when;
+         g_fired[n].marker = InpSigMarkers ? name : "";
+      }
+
+      DrawMarker(kind, k, when, name);
+
+      Print("LiquidityMap: ", txt);
+      if(InpAlertPopup) Alert(txt);
+      if(InpAlertPush)  SendNotification(txt);
+      if(InpAlertMail)  SendMail("LiquidityMap signal", txt);
+      if(InpAlertSound) PlaySound(InpSoundFile);
+      fired_any = true;
+   }
+   ArrayResize(g_queue, 0);
+   PruneFired();
+   if(fired_any)
+      ChartRedraw();      // a marker drawn on a quiet tick must show at once
 }
 
 //+------------------------------------------------------------------+
@@ -213,6 +425,7 @@ void BuildPools(const int rates_total,
       first = InpLeftBars;
 
    int last_closed = rates_total - 2;      // the forming bar is handled by UpdateLive()
+   g_last_closed = last_closed;
    if(last_closed <= first + InpRightBars)
       return;
 
@@ -327,6 +540,8 @@ void ResolveBar(const int bar, const double h, const double l, const double c)
          {
             g_pools[k].state   = (c > g_pools[k].trigger) ? ST_CLAIMED : ST_SWEPT;
             g_pools[k].bar_end = bar;
+            if(g_pools[k].state == ST_SWEPT && bar == g_last_closed)
+               QueueSignal(SIG_SWEEP, k);
          }
       }
       else
@@ -335,6 +550,8 @@ void ResolveBar(const int bar, const double h, const double l, const double c)
          {
             g_pools[k].state   = (c < g_pools[k].trigger) ? ST_CLAIMED : ST_SWEPT;
             g_pools[k].bar_end = bar;
+            if(g_pools[k].state == ST_SWEPT && bar == g_last_closed)
+               QueueSignal(SIG_SWEEP, k);
          }
       }
    }
@@ -360,6 +577,8 @@ void AddSwing(const int side, const double price, const int bar_swing,
       g_pools[k].trigger = (side > 0) ? g_pools[k].hi + tol : g_pools[k].lo - tol;
       g_pools[k].touches++;
       g_pools[k].bar_confirm = bar_conf;
+      if(bar_conf == g_last_closed)
+         QueueSignal(SIG_NEW, k);      // equal high/low just became official
       return;
    }
    NewPool(side, TP_SWING, price, bar_swing, bar_conf, tol);
@@ -386,9 +605,11 @@ void NewPool(const int side, const int type, const double price,
    g_pools[n].bar_end     = -1;
    g_pools[n].score       = 0.0;
    g_pools[n].pull        = 0.0;
-   g_pools[n].alerted     = false;
    g_pools[n].draw        = false;
    g_pools[n].used        = false;
+
+   if(bar_conf == g_last_closed)
+      QueueSignal(SIG_NEW, n);
 }
 
 //+------------------------------------------------------------------+
@@ -407,23 +628,34 @@ bool UpdateLive(const int rates_total, const double &high[], const double &low[]
       if(g_pools[k].bar_confirm >= last)
          continue;
 
-      bool raid = (g_pools[k].side > 0) ? (high[last] > g_pools[k].trigger)
-                                        : (low[last]  < g_pools[k].trigger);
+      //--- the pool's own equality band, both sides of the level
+      double tolp = MathAbs(g_pools[k].trigger - g_pools[k].level);
+      bool   raid, building;
+
+      if(g_pools[k].side > 0)
+      {
+         raid     = (high[last] > g_pools[k].trigger);
+         building = (!raid && high[last] >= g_pools[k].level - tolp);
+      }
+      else
+      {
+         raid     = (low[last] < g_pools[k].trigger);
+         building = (!raid && low[last] <= g_pools[k].level + tolp);
+      }
+
       int want = raid ? ST_RAIDING : ST_LIVE;
       if(g_pools[k].state != want)
       {
          g_pools[k].state = want;
          changed = true;
       }
-      if(raid && InpAlertOnRaid && !g_pools[k].alerted)
-      {
-         g_pools[k].alerted = true;
-         Alert(StringFormat("%s %s  |  %s liquidity being raided at %s",
-                            _Symbol,
-                            EnumToString((ENUM_TIMEFRAMES)_Period),
-                            (g_pools[k].side > 0 ? "Buy-side" : "Sell-side"),
-                            DoubleToString(g_pools[k].level, _Digits)));
-      }
+
+      //--- price is back inside the band without breaking it: another equal
+      //--- high/low is being printed, i.e. liquidity is stacking up right
+      //--- now. This is the one formation event that needs no confirmation
+      //--- lag - it is true the moment the tick arrives.
+      if(raid)          QueueSignal(SIG_RAID,  k);
+      else if(building) QueueSignal(SIG_BUILD, k);
    }
    return(changed);
 }
