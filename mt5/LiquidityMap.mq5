@@ -29,6 +29,14 @@
 #define SIG_NEW     1   // a fractal confirmed a pool - RightBars behind by nature
 #define SIG_RAID    2   // the live bar is piercing a pool - instant
 #define SIG_SWEEP   3   // the raid closed back inside - confirmed on bar close
+#define SIG_ZONE    4   // sweep -> CHoCH -> OB/FVG completed: a zone exists
+#define SIG_ENTRY   5   // price traded into that zone - instant
+
+//--- entry zone lifecycle
+#define ZS_WAITING  0   // zone drawn, price has not come back to it
+#define ZS_ACTIVE   1   // price is inside it
+#define ZS_DONE     2   // target reached
+#define ZS_INVALID  3   // closed beyond the sweep extreme
 
 input group             "=== Detection ==="
 input int    InpLeftBars       = 3;      // Swing: bars to the left
@@ -62,11 +70,23 @@ input bool   InpShowLabels     = true;   // Text label on each pool
 input int    InpLabelShiftBars = 2;      // Push labels this many bars right of price
 input bool   InpShowPanel      = true;   // Corner panel with the nearest pools
 
+input group             "=== Entry zones ==="
+input bool   InpZones          = true;   // Build zones from sweep -> CHoCH -> OB/FVG
+input int    InpZoneChochBars  = 30;     // Max bars allowed from the sweep to the CHoCH
+input int    InpZoneLookback   = 60;     // Lookback for the swing the CHoCH must break
+input double InpZonePoolScore  = 40.0;   // Only from sweeps of pools scoring at least this
+input double InpZoneMinRR      = 1.5;    // Hide zones whose reward:risk is below this
+input int    InpZoneMax        = 3;      // Max live zones per direction
+input color  InpZoneLongColor  = clrSeaGreen;
+input color  InpZoneShortColor = clrIndianRed;
+
 input group             "=== Signals ==="
 input bool   InpSigBuilding    = true;   // Liquidity BUILDING now (equal high/low forming) - tick level
 input bool   InpSigNewPool     = true;   // New pool confirmed - lags RightBars, unavoidable
 input bool   InpSigRaid        = true;   // Pool being raided right now - tick level
 input bool   InpSigSweep       = true;   // Sweep completed on the bar close
+input bool   InpSigZone        = true;   // An entry zone just formed
+input bool   InpSigEntry       = true;   // Price entered a zone - the entry trigger
 input double InpSigMinScore    = 0.0;    // Only signal pools scoring at least this (0-100)
 input bool   InpSigMarkers     = true;   // Leave a marker on the chart at each signal
 
@@ -114,7 +134,29 @@ struct Pending
    int      pool;
 };
 
+//--- An entry zone only exists when the whole sequence happened, in order:
+//--- liquidity swept -> structure broken the other way (CHoCH) -> an order
+//--- block or fair value gap left behind by the impulse that broke it.
+struct Zone
+{
+   int      dir;         // +1 long (after a sell-side sweep), -1 short
+   double   top;
+   double   bottom;
+   double   invalid;     // the sweep wick: beyond it the read is wrong
+   double   target;      // nearest untapped pool on the other side
+   double   rr;
+   int      bar_sweep;
+   int      bar_choch;
+   int      bar_end;
+   int      state;
+   bool     has_ob;
+   bool     has_fvg;
+   int      htf;         // timeframe of the pool that got swept, 0 = this chart
+   double   pool_score;
+};
+
 Pool     g_pools[];
+Zone     g_zones[];
 Fired    g_fired[];
 Pending  g_queue[];
 bool     g_warmed     = false;  // suppresses the signal storm on first attach
@@ -222,12 +264,13 @@ int OnCalculate(const int rates_total,
 
    ArrayResize(g_queue, 0);
 
-   bool changed = false;
+   bool changed = false, rebuilt = false;
    if(prev_calculated == 0 || time[rates_total - 1] != g_last_bar)
    {
       g_last_bar = time[rates_total - 1];
       BuildPools(rates_total, time, high, low, close);
       changed = true;
+      rebuilt = true;
    }
 
    if(UpdateLive(rates_total, high, low))
@@ -237,6 +280,13 @@ int OnCalculate(const int rates_total,
    //--- the objects themselves are only rebuilt when something moved
    double price_now = close[rates_total - 1];
    ScorePools(rates_total, price_now);
+
+   //--- zones need the pool scores, so they are built after scoring
+   if(rebuilt)
+      BuildZones(rates_total, time, open, high, low, close);
+   if(UpdateZonesLive(price_now, time[rates_total - 1]))
+      changed = true;
+
    FlushSignals(time[rates_total - 1],
                 (g_last_closed >= 0) ? time[g_last_closed] : time[rates_total - 1]);
 
@@ -546,6 +596,300 @@ void BuildPools(const int rates_total,
    //--- and what the bigger timeframes are still holding above and below
    for(int t = 0; t < 3; t++)
       ScanHigherTF(g_htf[t], g_htf_atr[t], rates_total, time);
+}
+
+//+------------------------------------------------------------------+
+//| Last confirmed fractal at or before `upto`. This is the swing the |
+//| CHoCH has to break - taken from before the sweep, so the sweep    |
+//| itself can never be what "confirms" the shift.                    |
+//+------------------------------------------------------------------+
+int LastFractal(const int side, const int upto, const int lookback,
+                const double &high[], const double &low[])
+{
+   int lo = MathMax(InpLeftBars, upto - lookback);
+   for(int i = upto - InpRightBars; i >= lo; i--)
+   {
+      bool ok = true;
+      for(int j = i - InpLeftBars; j <= i + InpRightBars; j++)
+      {
+         if(j == i) continue;
+         if(side > 0 && high[j] > high[i]) { ok = false; break; }
+         if(side < 0 && low[j]  < low[i])  { ok = false; break; }
+      }
+      if(ok)
+         return(i);
+   }
+   return(-1);
+}
+
+//+------------------------------------------------------------------+
+//| First close beyond `ref` after the sweep = change of character.   |
+//+------------------------------------------------------------------+
+int FindCHoCH(const int dir, const int sb, const int last_closed,
+              const double ref, const double &close[])
+{
+   int stop = MathMin(last_closed, sb + InpZoneChochBars);
+   for(int i = sb + 1; i <= stop; i++)
+   {
+      if(dir > 0 && close[i] > ref) return(i);
+      if(dir < 0 && close[i] < ref) return(i);
+   }
+   return(-1);
+}
+
+//+------------------------------------------------------------------+
+//| Order block: the last candle against the impulse, before the move |
+//| that broke structure. Fair value gap: the 3-candle imbalance that |
+//| same move left behind.                                            |
+//+------------------------------------------------------------------+
+int FindOB(const int dir, const int sb, const int cb,
+           const double &open[], const double &close[])
+{
+   for(int i = cb; i >= sb; i--)
+   {
+      if(dir > 0 && close[i] < open[i]) return(i);
+      if(dir < 0 && close[i] > open[i]) return(i);
+   }
+   return(-1);
+}
+
+bool FindFVG(const int dir, const int sb, const int cb,
+             const double &high[], const double &low[],
+             double &f_bot, double &f_top)
+{
+   for(int i = cb - 2; i >= sb; i--)
+   {
+      if(dir > 0 && high[i] < low[i + 2])
+      {
+         f_bot = high[i];
+         f_top = low[i + 2];
+         return(true);
+      }
+      if(dir < 0 && low[i] > high[i + 2])
+      {
+         f_bot = high[i + 2];
+         f_top = low[i];
+         return(true);
+      }
+   }
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| The target comes free: the nearest liquidity still resting on the |
+//| other side is exactly what the move is reaching for.              |
+//+------------------------------------------------------------------+
+double NearestPool(const int side, const double from_price)
+{
+   double best = 0.0;
+   for(int k = 0; k < ArraySize(g_pools); k++)
+   {
+      if(g_pools[k].side != side)
+         continue;
+      if(g_pools[k].state != ST_LIVE && g_pools[k].state != ST_RAIDING)
+         continue;
+      if(side > 0 && g_pools[k].level <= from_price) continue;
+      if(side < 0 && g_pools[k].level >= from_price) continue;
+      if(best == 0.0 ||
+         MathAbs(g_pools[k].level - from_price) < MathAbs(best - from_price))
+         best = g_pools[k].level;
+   }
+   return(best);
+}
+
+//+------------------------------------------------------------------+
+//| Fire a zone signal. Reuses the same ledger as pool signals, keyed |
+//| on the zone mid-price, so a rebuild never re-alerts the same one. |
+//+------------------------------------------------------------------+
+void EmitZone(const int kind, const int z, const datetime when)
+{
+   if(!g_warmed || g_quiet)
+      return;
+   if(kind == SIG_ZONE  && !InpSigZone)  return;
+   if(kind == SIG_ENTRY && !InpSigEntry) return;
+
+   double pt  = (_Point > 0.0) ? _Point : 1.0;
+   double mid = (g_zones[z].top + g_zones[z].bottom) / 2.0;
+   long   lvl = (long)MathRound(mid / pt);
+   long   tol = (long)MathRound((g_zones[z].top - g_zones[z].bottom) / pt);
+   if(tol < 1) tol = 1;
+
+   if(AlreadyFired(kind, g_zones[z].dir, lvl, tol, 0))
+      return;
+
+   int n = ArraySize(g_fired);
+   if(ArrayResize(g_fired, n + 1) == n + 1)
+   {
+      g_fired[n].kind   = kind;
+      g_fired[n].side   = g_zones[z].dir;
+      g_fired[n].lvl    = lvl;
+      g_fired[n].tag    = 0;
+      g_fired[n].when   = when;
+      g_fired[n].marker = "";
+   }
+
+   string txt = StringFormat("%s %s | %s %s ZONE %s - %s | invalid %s | target %s | R:R %.1f%s",
+                             _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+                             (kind == SIG_ENTRY ? "PRICE IN" : "NEW"),
+                             (g_zones[z].dir > 0 ? "LONG" : "SHORT"),
+                             DoubleToString(g_zones[z].bottom, _Digits),
+                             DoubleToString(g_zones[z].top, _Digits),
+                             DoubleToString(g_zones[z].invalid, _Digits),
+                             DoubleToString(g_zones[z].target, _Digits),
+                             g_zones[z].rr,
+                             (g_zones[z].htf != 0 ? " | swept " + TFName(g_zones[z].htf) : ""));
+
+   Print("LiquidityMap: ", txt);
+   if(InpAlertPopup) Alert(txt);
+   if(InpAlertPush)  SendNotification(txt);
+   if(InpAlertMail)  SendMail("LiquidityMap zone", txt);
+   if(InpAlertSound) PlaySound(InpSoundFile);
+}
+
+//+------------------------------------------------------------------+
+//| Walk every swept pool and see whether the rest of the sequence    |
+//| followed. A sweep on its own is not a setup - without the CHoCH   |
+//| it is just as likely continuation.                                |
+//+------------------------------------------------------------------+
+void BuildZones(const int rates_total, const datetime &time[], const double &open[],
+                const double &high[], const double &low[], const double &close[])
+{
+   ArrayResize(g_zones, 0);
+   if(!InpZones)
+      return;
+
+   int last_closed = rates_total - 2;
+   int longs = 0, shorts = 0;
+
+   //--- newest sweeps first: those are the setups still in play
+   for(int k = ArraySize(g_pools) - 1; k >= 0; k--)
+   {
+      if(g_pools[k].state != ST_SWEPT || g_pools[k].bar_end < 0)
+         continue;
+      if(g_pools[k].score < InpZonePoolScore)
+         continue;
+
+      int dir = -g_pools[k].side;            // sell-side swept -> look long
+      if(dir > 0 && longs  >= InpZoneMax) continue;
+      if(dir < 0 && shorts >= InpZoneMax) continue;
+
+      int sb = g_pools[k].bar_end;
+      if(sb <= InpLeftBars + InpRightBars || sb >= last_closed)
+         continue;
+
+      //--- structure has to break the other way, and soon
+      int ref_bar = LastFractal(dir, sb, InpZoneLookback, high, low);
+      if(ref_bar < 0)
+         continue;
+      double ref = (dir > 0) ? high[ref_bar] : low[ref_bar];
+
+      int cb = FindCHoCH(dir, sb, last_closed, ref, close);
+      if(cb < 0)
+         continue;
+
+      //--- what the impulse left behind
+      double z_top = 0.0, z_bot = 0.0, f_top = 0.0, f_bot = 0.0;
+      bool   has_ob = false, has_fvg = false;
+
+      int ob = FindOB(dir, sb, cb, open, close);
+      if(ob >= 0)
+      {
+         z_top  = high[ob];
+         z_bot  = low[ob];
+         has_ob = true;
+      }
+      if(FindFVG(dir, sb, cb, high, low, f_bot, f_top))
+         has_fvg = true;
+
+      if(has_ob && has_fvg && f_bot < z_top && f_top > z_bot)
+      {
+         z_top = MathMin(z_top, f_top);      // the overlap is the tight zone
+         z_bot = MathMax(z_bot, f_bot);
+      }
+      else if(!has_ob && has_fvg)
+      {
+         z_top = f_top;
+         z_bot = f_bot;
+      }
+      else if(!has_ob && !has_fvg)
+         continue;
+
+      if(z_top <= z_bot)
+         continue;
+
+      //--- beyond the sweep wick the whole read is wrong
+      double invalid = (dir > 0) ? low[sb] : high[sb];
+      double mid     = (z_top + z_bot) / 2.0;
+      double risk    = MathAbs(mid - invalid);
+      if(risk <= 0.0)
+         continue;
+
+      double target = NearestPool(dir, mid);
+      if(target == 0.0)
+         continue;
+      double rr = MathAbs(target - mid) / risk;
+      if(rr < InpZoneMinRR)
+         continue;
+
+      //--- how it has fared since
+      int state = ZS_WAITING, bar_end = -1;
+      for(int i = cb + 1; i <= last_closed; i++)
+      {
+         if(dir > 0 && close[i] < invalid) { state = ZS_INVALID; bar_end = i; break; }
+         if(dir < 0 && close[i] > invalid) { state = ZS_INVALID; bar_end = i; break; }
+         if(dir > 0 && high[i] >= target)  { state = ZS_DONE;    bar_end = i; break; }
+         if(dir < 0 && low[i]  <= target)  { state = ZS_DONE;    bar_end = i; break; }
+         if(dir > 0 && low[i]  <= z_top && high[i] >= z_bot) state = ZS_ACTIVE;
+         if(dir < 0 && high[i] >= z_bot && low[i]  <= z_top) state = ZS_ACTIVE;
+      }
+      if(state == ZS_INVALID || state == ZS_DONE)
+         continue;
+
+      int n = ArraySize(g_zones);
+      if(ArrayResize(g_zones, n + 1) != n + 1)
+         return;
+      g_zones[n].dir        = dir;
+      g_zones[n].top        = z_top;
+      g_zones[n].bottom     = z_bot;
+      g_zones[n].invalid    = invalid;
+      g_zones[n].target     = target;
+      g_zones[n].rr         = rr;
+      g_zones[n].bar_sweep  = sb;
+      g_zones[n].bar_choch  = cb;
+      g_zones[n].bar_end    = bar_end;
+      g_zones[n].state      = state;
+      g_zones[n].has_ob     = has_ob;
+      g_zones[n].has_fvg    = has_fvg;
+      g_zones[n].htf        = g_pools[k].htf;
+      g_zones[n].pool_score = g_pools[k].score;
+
+      if(dir > 0) longs++; else shorts++;
+      if(cb == last_closed)
+         EmitZone(SIG_ZONE, n, time[cb]);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| The live half: price walking into a zone on the forming bar is    |
+//| the entry trigger, and it is true on the tick.                    |
+//+------------------------------------------------------------------+
+bool UpdateZonesLive(const double price_now, const datetime t_live)
+{
+   bool changed = false;
+   for(int z = 0; z < ArraySize(g_zones); z++)
+   {
+      if(g_zones[z].state != ZS_WAITING && g_zones[z].state != ZS_ACTIVE)
+         continue;
+      bool inside = (price_now <= g_zones[z].top && price_now >= g_zones[z].bottom);
+      if(inside && g_zones[z].state == ZS_WAITING)
+      {
+         g_zones[z].state = ZS_ACTIVE;
+         changed = true;
+      }
+      if(inside)
+         EmitZone(SIG_ENTRY, z, t_live);
+   }
+   return(changed);
 }
 
 //+------------------------------------------------------------------+
@@ -1018,10 +1362,88 @@ void Redraw(const int rates_total, const datetime &time[], const double price_no
       idx++;
    }
 
+   DrawZones(rates_total, time, idx);
+
    if(InpShowPanel)
       DrawPanel(price_now);
 
    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| A zone is drawn as three things, because that is what it is: the  |
+//| area to act in, the level that says the read was wrong, and the   |
+//| liquidity the move is reaching for.                               |
+//+------------------------------------------------------------------+
+void DrawZones(const int rates_total, const datetime &time[], const int start_idx)
+{
+   datetime t_now = time[rates_total - 1];
+   int idx = start_idx;
+
+   for(int z = 0; z < ArraySize(g_zones); z++)
+   {
+      if(g_zones[z].state != ZS_WAITING && g_zones[z].state != ZS_ACTIVE)
+         continue;
+
+      color    col = (g_zones[z].dir > 0) ? InpZoneLongColor : InpZoneShortColor;
+      datetime t1  = time[g_zones[z].bar_choch];
+      string   src = (g_zones[z].has_ob && g_zones[z].has_fvg) ? "OB+FVG"
+                     : (g_zones[z].has_ob ? "OB" : "FVG");
+      string   tip = StringFormat("%s zone %s | %s-%s | invalid %s | target %s | R:R %.1f",
+                                  (g_zones[z].dir > 0 ? "LONG" : "SHORT"), src,
+                                  DoubleToString(g_zones[z].bottom, _Digits),
+                                  DoubleToString(g_zones[z].top, _Digits),
+                                  DoubleToString(g_zones[z].invalid, _Digits),
+                                  DoubleToString(g_zones[z].target, _Digits),
+                                  g_zones[z].rr);
+
+      string zn = g_prefix + "Z" + IntegerToString(idx);
+      if(ObjectCreate(0, zn, OBJ_RECTANGLE, 0, t1, g_zones[z].bottom, t_now, g_zones[z].top))
+      {
+         ObjectSetInteger(0, zn, OBJPROP_COLOR, col);
+         ObjectSetInteger(0, zn, OBJPROP_FILL, true);
+         ObjectSetInteger(0, zn, OBJPROP_BACK, true);
+         ObjectSetInteger(0, zn, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, zn, OBJPROP_HIDDEN, true);
+         ObjectSetString(0, zn, OBJPROP_TOOLTIP, tip);
+      }
+
+      for(int part = 0; part < 2; part++)
+      {
+         double lvl = (part == 0) ? g_zones[z].invalid : g_zones[z].target;
+         string nm  = g_prefix + (part == 0 ? "ZX" : "ZT") + IntegerToString(idx);
+         if(!ObjectCreate(0, nm, OBJ_TREND, 0, t1, lvl, t_now, lvl))
+            continue;
+         ObjectSetInteger(0, nm, OBJPROP_COLOR, (part == 0) ? InpSweptColor : col);
+         ObjectSetInteger(0, nm, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, nm, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(0, nm, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+         ObjectSetString(0, nm, OBJPROP_TOOLTIP, tip);
+      }
+
+      if(InpShowLabels)
+      {
+         string tl = g_prefix + "ZL" + IntegerToString(idx);
+         if(ObjectCreate(0, tl, OBJ_TEXT, 0, t_now, g_zones[z].top))
+         {
+            ObjectSetString(0, tl, OBJPROP_TEXT,
+                            StringFormat("%s %s  R:R %.1f%s",
+                                         (g_zones[z].dir > 0 ? "LONG" : "SHORT"), src,
+                                         g_zones[z].rr,
+                                         (g_zones[z].state == ZS_ACTIVE ? "  << IN ZONE" : "")));
+            ObjectSetString(0, tl, OBJPROP_FONT, "Arial");
+            ObjectSetInteger(0, tl, OBJPROP_FONTSIZE, 8);
+            ObjectSetInteger(0, tl, OBJPROP_COLOR, col);
+            ObjectSetInteger(0, tl, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+            ObjectSetInteger(0, tl, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, tl, OBJPROP_HIDDEN, true);
+         }
+      }
+      idx++;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1059,8 +1481,8 @@ void DrawPanel(const double price_now)
       }
    }
 
-   string lines[5];
-   color  cols[5];
+   string lines[6];
+   color  cols[6];
 
    lines[0] = StringFormat("Liquidity map  %d/%d   ATR %s",
                            InpLeftBars, InpRightBars, DoubleToString(g_atr, _Digits));
@@ -1123,7 +1545,33 @@ void DrawPanel(const double price_now)
       cols[4]  = clrSilver;
    }
 
-   for(int i = 0; i < 5; i++)
+   int zbest = -1;
+   for(int z = 0; z < ArraySize(g_zones); z++)
+   {
+      if(g_zones[z].state != ZS_WAITING && g_zones[z].state != ZS_ACTIVE)
+         continue;
+      if(zbest < 0 || g_zones[z].state == ZS_ACTIVE)
+         zbest = z;
+      if(g_zones[z].state == ZS_ACTIVE)
+         break;
+   }
+   if(zbest >= 0)
+   {
+      lines[5] = StringFormat("%-5s ZONE   %s-%s   R:R %.1f%s",
+                              (g_zones[zbest].dir > 0 ? "LONG" : "SHORT"),
+                              DoubleToString(g_zones[zbest].bottom, _Digits),
+                              DoubleToString(g_zones[zbest].top, _Digits),
+                              g_zones[zbest].rr,
+                              (g_zones[zbest].state == ZS_ACTIVE ? "   << IN ZONE" : ""));
+      cols[5]  = (g_zones[zbest].dir > 0) ? InpZoneLongColor : InpZoneShortColor;
+   }
+   else
+   {
+      lines[5] = "ZONE         -";
+      cols[5]  = clrSilver;
+   }
+
+   for(int i = 0; i < 6; i++)
    {
       string nm = g_prefix + "P" + IntegerToString(i);
       if(ObjectFind(0, nm) < 0)
