@@ -43,6 +43,11 @@ input double InpMinScore       = 0.0;    // Hide pools scoring below this (0-100
 input group             "=== Higher timeframe liquidity ==="
 input bool   InpShowPrevDay    = true;   // Previous day high/low (PDH/PDL)
 input bool   InpShowPrevWeek   = true;   // Previous week high/low (PWH/PWL)
+input ENUM_TIMEFRAMES InpHTF1  = PERIOD_H1;   // Higher timeframe 1 (CURRENT = off)
+input ENUM_TIMEFRAMES InpHTF2  = PERIOD_H4;   // Higher timeframe 2 (CURRENT = off)
+input ENUM_TIMEFRAMES InpHTF3  = PERIOD_D1;   // Higher timeframe 3 (CURRENT = off)
+input int    InpHTFBars        = 600;    // Bars to scan on each higher timeframe
+input int    InpHTFMaxPools    = 3;      // Max pools kept per side per timeframe
 
 input group             "=== Display ==="
 input color  InpBuySideColor   = clrDodgerBlue;  // Buy-side liquidity (BSL, above)
@@ -76,6 +81,7 @@ struct Pool
 {
    int      side;          // +1 = buy-side (above), -1 = sell-side (below)
    int      type;          // TP_SWING / TP_DAY / TP_WEEK
+   int      htf;           // 0 = this chart, else the ENUM_TIMEFRAMES it came from
    double   level;         // the extreme where stops rest
    double   lo;            // cluster low
    double   hi;            // cluster high
@@ -112,6 +118,9 @@ Pool     g_pools[];
 Fired    g_fired[];
 Pending  g_queue[];
 bool     g_warmed     = false;  // suppresses the signal storm on first attach
+bool     g_quiet      = false;  // higher-timeframe scans must not raise signals
+ENUM_TIMEFRAMES g_htf[3];
+int      g_htf_atr[3];
 int      g_last_closed = -1;
 string   g_sig_prefix = "LQS_";
 int      g_atr_handle = INVALID_HANDLE;
@@ -143,6 +152,19 @@ int OnInit()
       return(INIT_FAILED);
    }
 
+   g_htf[0] = InpHTF1;
+   g_htf[1] = InpHTF2;
+   g_htf[2] = InpHTF3;
+   for(int i = 0; i < 3; i++)
+   {
+      g_htf_atr[i] = INVALID_HANDLE;
+      if(g_htf[i] == PERIOD_CURRENT)
+         continue;
+      if(PeriodSeconds(g_htf[i]) <= PeriodSeconds(_Period))
+         continue;                       // only strictly higher timeframes
+      g_htf_atr[i] = iATR(_Symbol, g_htf[i], InpAtrPeriod);
+   }
+
    g_prefix     = StringFormat("LQM%d_%d_", InpLeftBars, InpRightBars);
    g_sig_prefix = StringFormat("LQS%d_%d_", InpLeftBars, InpRightBars);
    g_last_bar   = 0;
@@ -159,6 +181,9 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, g_sig_prefix);
    if(g_atr_handle != INVALID_HANDLE)
       IndicatorRelease(g_atr_handle);
+   for(int i = 0; i < 3; i++)
+      if(g_htf_atr[i] != INVALID_HANDLE)
+         IndicatorRelease(g_htf_atr[i]);
    ChartRedraw();
 }
 
@@ -273,7 +298,7 @@ void PruneFired()
 
 void QueueSignal(const int kind, const int pool)
 {
-   if(!g_warmed)              // first pass walks all of history - stay quiet
+   if(!g_warmed || g_quiet)   // first pass, and HTF scans, stay quiet
       return;
    int n = ArraySize(g_queue);
    if(ArrayResize(g_queue, n + 1) != n + 1)
@@ -451,7 +476,7 @@ void BuildPools(const int rates_total,
    for(int i = first; i <= last_closed; i++)
    {
       //--- 1) settle raids / breaks of every pool that already existed
-      ResolveBar(i, high[i], low[i], close[i]);
+      ResolveBar(g_pools, i, high[i], low[i], close[i]);
 
       //--- 2) day / week rollover: the period that just ended leaves its
       //---    high and low behind as liquidity
@@ -466,8 +491,8 @@ void BuildPools(const int rates_total,
          {
             if(weekly && w_ready)
             {
-               NewPool(+1, TP_WEEK, w_hi, i, i, TolAt(i));
-               NewPool(-1, TP_WEEK, w_lo, i, i, TolAt(i));
+               NewPool(g_pools, +1, TP_WEEK, w_hi, i, i, TolAt(i));
+               NewPool(g_pools, -1, TP_WEEK, w_lo, i, i, TolAt(i));
             }
             w_ready = true;
             w_hi = high[i];
@@ -483,8 +508,8 @@ void BuildPools(const int rates_total,
          {
             if(daily && d_ready)
             {
-               NewPool(+1, TP_DAY, d_hi, i, i, TolAt(i));
-               NewPool(-1, TP_DAY, d_lo, i, i, TolAt(i));
+               NewPool(g_pools, +1, TP_DAY, d_hi, i, i, TolAt(i));
+               NewPool(g_pools, -1, TP_DAY, d_lo, i, i, TolAt(i));
             }
             d_ready = true;
             d_hi = high[i];
@@ -513,8 +538,121 @@ void BuildPools(const int rates_total,
             if(low[j]  < low[s])  sw_low  = false;
          }
          double tol_s = TolAt(s);
-         if(sw_high) AddSwing(+1, high[s], s, i, tol_s);
-         if(sw_low)  AddSwing(-1, low[s],  s, i, tol_s);
+         if(sw_high) AddSwing(g_pools, +1, high[s], s, i, tol_s);
+         if(sw_low)  AddSwing(g_pools, -1, low[s],  s, i, tol_s);
+      }
+   }
+
+   //--- and what the bigger timeframes are still holding above and below
+   for(int t = 0; t < 3; t++)
+      ScanHigherTF(g_htf[t], g_htf_atr[t], rates_total, time);
+}
+
+//+------------------------------------------------------------------+
+string TFName(const int tf)
+{
+   string t = EnumToString((ENUM_TIMEFRAMES)tf);
+   StringReplace(t, "PERIOD_", "");
+   return(t);
+}
+
+//+------------------------------------------------------------------+
+//| Chart bar that was open at time t. The chart's time[] is ascending |
+//| so a binary search beats walking 1500 bars per imported pool.      |
+//+------------------------------------------------------------------+
+int ChartIndexOf(const datetime t, const int rates_total, const datetime &ctime[])
+{
+   if(t <= ctime[0])                return(0);
+   if(t >= ctime[rates_total - 1])  return(rates_total - 1);
+   int lo = 0, hi = rates_total - 1;
+   while(lo < hi)
+   {
+      int mid = (lo + hi + 1) / 2;
+      if(ctime[mid] <= t) lo = mid;
+      else                hi = mid - 1;
+   }
+   return(lo);
+}
+
+//+------------------------------------------------------------------+
+//| Read liquidity off a higher timeframe and project it onto this     |
+//| chart. The sweep/claim walk runs on the higher timeframe's OWN     |
+//| bars: an H4 level is taken when an H4 candle closes through it,    |
+//| not when one M15 candle pokes past. Only untapped pools are        |
+//| imported - a level H4 already ate is not resistance any more.      |
+//+------------------------------------------------------------------+
+void ScanHigherTF(const ENUM_TIMEFRAMES tf, const int atr_handle,
+                  const int rates_total, const datetime &ctime[])
+{
+   if(tf == PERIOD_CURRENT || atr_handle == INVALID_HANDLE)
+      return;
+   if(PeriodSeconds(tf) <= PeriodSeconds(_Period))
+      return;
+
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int n = CopyRates(_Symbol, tf, 0, InpHTFBars, r);
+   if(n < InpAtrPeriod + InpLeftBars + InpRightBars + 5)
+      return;                       // history not loaded yet - try again next tick
+
+   double atr[];
+   ArraySetAsSeries(atr, false);
+   if(CopyBuffer(atr_handle, 0, 0, n, atr) != n)
+      return;
+
+   int first       = InpLeftBars;
+   int last_closed = n - 2;
+   if(last_closed <= first + InpRightBars)
+      return;
+
+   Pool tmp[];
+   ArrayResize(tmp, 0);
+
+   g_quiet = true;                  // context, not a trigger: no alerts from here
+   for(int i = first; i <= last_closed; i++)
+   {
+      ResolveBar(tmp, i, r[i].high, r[i].low, r[i].close);
+
+      int sw = i - InpRightBars;
+      if(sw < first)
+         continue;
+
+      bool sw_high = true, sw_low = true;
+      for(int j = sw - InpLeftBars; j <= sw + InpRightBars; j++)
+      {
+         if(j == sw) continue;
+         if(r[j].high > r[sw].high) sw_high = false;
+         if(r[j].low  < r[sw].low)  sw_low  = false;
+      }
+      double tol = (atr[sw] > 0.0) ? atr[sw] * InpEqTolATR : g_tol;
+      if(sw_high) AddSwing(tmp, +1, r[sw].high, sw, i, tol);
+      if(sw_low)  AddSwing(tmp, -1, r[sw].low,  sw, i, tol);
+   }
+   g_quiet = false;
+
+   //--- newest untapped levels first: those are the ones price is working on
+   for(int side = 1; side >= -1; side -= 2)
+   {
+      int kept = 0;
+      for(int k = ArraySize(tmp) - 1; k >= 0 && kept < InpHTFMaxPools; k--)
+      {
+         if(tmp[k].side != side || tmp[k].state != ST_LIVE)
+            continue;
+
+         int dst = ArraySize(g_pools);
+         if(ArrayResize(g_pools, dst + 1) != dst + 1)
+            return;
+
+         g_pools[dst] = tmp[k];
+         g_pools[dst].htf         = (int)tf;
+         g_pools[dst].bar_first   = ChartIndexOf(r[tmp[k].bar_first].time, rates_total, ctime);
+         g_pools[dst].bar_confirm = ChartIndexOf(r[tmp[k].bar_confirm].time, rates_total, ctime);
+         if(g_pools[dst].bar_confirm > rates_total - 2)
+            g_pools[dst].bar_confirm = rates_total - 2;   // let it go live immediately
+         g_pools[dst].bar_end = -1;
+         g_pools[dst].draw    = false;
+         g_pools[dst].used    = false;
+         kept++;
       }
    }
 }
@@ -524,33 +662,35 @@ void BuildPools(const int rates_total,
 //| Piercing the trigger and closing back  = swept (liquidity grab).  |
 //| Closing beyond it                      = claimed (level is gone). |
 //+------------------------------------------------------------------+
-void ResolveBar(const int bar, const double h, const double l, const double c)
+void ResolveBar(Pool &arr[], const int bar, const double h, const double l, const double c)
 {
-   int n = ArraySize(g_pools);
+   int n = ArraySize(arr);
    for(int k = 0; k < n; k++)
    {
-      if(g_pools[k].state != ST_LIVE)
+      if(arr[k].state != ST_LIVE)
          continue;
-      if(g_pools[k].bar_confirm >= bar)      // not knowable yet at this bar
+      if(arr[k].htf != 0)                // settled on its own timeframe already
+         continue;
+      if(arr[k].bar_confirm >= bar)      // not knowable yet at this bar
          continue;
 
-      if(g_pools[k].side > 0)
+      if(arr[k].side > 0)
       {
-         if(h > g_pools[k].trigger)
+         if(h > arr[k].trigger)
          {
-            g_pools[k].state   = (c > g_pools[k].trigger) ? ST_CLAIMED : ST_SWEPT;
-            g_pools[k].bar_end = bar;
-            if(g_pools[k].state == ST_SWEPT && bar == g_last_closed)
+            arr[k].state   = (c > arr[k].trigger) ? ST_CLAIMED : ST_SWEPT;
+            arr[k].bar_end = bar;
+            if(arr[k].state == ST_SWEPT && bar == g_last_closed)
                QueueSignal(SIG_SWEEP, k);
          }
       }
       else
       {
-         if(l < g_pools[k].trigger)
+         if(l < arr[k].trigger)
          {
-            g_pools[k].state   = (c < g_pools[k].trigger) ? ST_CLAIMED : ST_SWEPT;
-            g_pools[k].bar_end = bar;
-            if(g_pools[k].state == ST_SWEPT && bar == g_last_closed)
+            arr[k].state   = (c < arr[k].trigger) ? ST_CLAIMED : ST_SWEPT;
+            arr[k].bar_end = bar;
+            if(arr[k].state == ST_SWEPT && bar == g_last_closed)
                QueueSignal(SIG_SWEEP, k);
          }
       }
@@ -561,52 +701,53 @@ void ResolveBar(const int bar, const double h, const double l, const double c)
 //| Add a swing, merging it into a still-live cluster when it sits    |
 //| within tolerance: three equal highs are ONE strong pool, not two. |
 //+------------------------------------------------------------------+
-void AddSwing(const int side, const double price, const int bar_swing,
+void AddSwing(Pool &arr[], const int side, const double price, const int bar_swing,
               const int bar_conf, const double tol)
 {
-   for(int k = ArraySize(g_pools) - 1; k >= 0; k--)
+   for(int k = ArraySize(arr) - 1; k >= 0; k--)
    {
-      if(g_pools[k].type  != TP_SWING) continue;
-      if(g_pools[k].side  != side)     continue;
-      if(g_pools[k].state != ST_LIVE)  continue;
-      if(MathAbs(g_pools[k].level - price) > tol) continue;
+      if(arr[k].type  != TP_SWING) continue;
+      if(arr[k].side  != side)     continue;
+      if(arr[k].state != ST_LIVE)  continue;
+      if(MathAbs(arr[k].level - price) > tol) continue;
 
-      g_pools[k].hi      = MathMax(g_pools[k].hi, price);
-      g_pools[k].lo      = MathMin(g_pools[k].lo, price);
-      g_pools[k].level   = (side > 0) ? g_pools[k].hi : g_pools[k].lo;
-      g_pools[k].trigger = (side > 0) ? g_pools[k].hi + tol : g_pools[k].lo - tol;
-      g_pools[k].touches++;
-      g_pools[k].bar_confirm = bar_conf;
+      arr[k].hi      = MathMax(arr[k].hi, price);
+      arr[k].lo      = MathMin(arr[k].lo, price);
+      arr[k].level   = (side > 0) ? arr[k].hi : arr[k].lo;
+      arr[k].trigger = (side > 0) ? arr[k].hi + tol : arr[k].lo - tol;
+      arr[k].touches++;
+      arr[k].bar_confirm = bar_conf;
       if(bar_conf == g_last_closed)
          QueueSignal(SIG_NEW, k);      // equal high/low just became official
       return;
    }
-   NewPool(side, TP_SWING, price, bar_swing, bar_conf, tol);
+   NewPool(arr, side, TP_SWING, price, bar_swing, bar_conf, tol);
 }
 
 //+------------------------------------------------------------------+
-void NewPool(const int side, const int type, const double price,
+void NewPool(Pool &arr[], const int side, const int type, const double price,
              const int bar_first, const int bar_conf, const double tol)
 {
-   int n = ArraySize(g_pools);
-   if(ArrayResize(g_pools, n + 1) != n + 1)
+   int n = ArraySize(arr);
+   if(ArrayResize(arr, n + 1) != n + 1)
       return;
 
-   g_pools[n].side        = side;
-   g_pools[n].type        = type;
-   g_pools[n].level       = price;
-   g_pools[n].hi          = price;
-   g_pools[n].lo          = price;
-   g_pools[n].trigger     = (side > 0) ? price + tol : price - tol;
-   g_pools[n].touches     = 1;
-   g_pools[n].state       = ST_LIVE;
-   g_pools[n].bar_first   = bar_first;
-   g_pools[n].bar_confirm = bar_conf;
-   g_pools[n].bar_end     = -1;
-   g_pools[n].score       = 0.0;
-   g_pools[n].pull        = 0.0;
-   g_pools[n].draw        = false;
-   g_pools[n].used        = false;
+   arr[n].side        = side;
+   arr[n].type        = type;
+   arr[n].htf         = 0;
+   arr[n].level       = price;
+   arr[n].hi          = price;
+   arr[n].lo          = price;
+   arr[n].trigger     = (side > 0) ? price + tol : price - tol;
+   arr[n].touches     = 1;
+   arr[n].state       = ST_LIVE;
+   arr[n].bar_first   = bar_first;
+   arr[n].bar_confirm = bar_conf;
+   arr[n].bar_end     = -1;
+   arr[n].score       = 0.0;
+   arr[n].pull        = 0.0;
+   arr[n].draw        = false;
+   arr[n].used        = false;
 
    if(bar_conf == g_last_closed)
       QueueSignal(SIG_NEW, n);
@@ -686,6 +827,16 @@ void ScorePools(const int rates_total, const double price_now)
       if(g_pools[k].type == TP_DAY)  s += 15.0;
       if(g_pools[k].type == TP_WEEK) s += 25.0;
 
+      // a level read off a bigger timeframe scales with how much bigger it is:
+      // 4x the chart = +12, 16x = +24, capped so it never fully drowns local structure
+      if(g_pools[k].htf != 0)
+      {
+         double ratio = (double)PeriodSeconds((ENUM_TIMEFRAMES)g_pools[k].htf) /
+                        (double)PeriodSeconds(_Period);
+         if(ratio > 1.0)
+            s += MathMin(35.0, 12.0 * MathLog(ratio) / MathLog(4.0));
+      }
+
       // a pool that survives keeps collecting stops
       double age = (double)(last - g_pools[k].bar_first);
       s += 10.0 * MathMin(1.0, age / 100.0);
@@ -722,7 +873,8 @@ void SelectPools(const int rates_total)
             if(g_pools[k].used)          continue;
             if(g_pools[k].side != side)  continue;
             if(g_pools[k].state != ST_LIVE && g_pools[k].state != ST_RAIDING) continue;
-            if(g_pools[k].type == TP_SWING && g_pools[k].touches < InpMinTouches) continue;
+            if(g_pools[k].type == TP_SWING && g_pools[k].htf == 0 &&
+               g_pools[k].touches < InpMinTouches) continue;
             if(g_pools[k].score < InpMinScore) continue;
             if(best < 0 || g_pools[k].pull > g_pools[best].pull)
                best = k;
@@ -801,6 +953,12 @@ void Redraw(const int rates_total, const datetime &time[], const double price_no
       string type_tag = "";
       if(g_pools[k].type == TP_DAY)  type_tag = " PD";
       if(g_pools[k].type == TP_WEEK) type_tag = " PW";
+      if(g_pools[k].htf != 0)
+      {
+         type_tag = " " + TFName(g_pools[k].htf);
+         if(g_pools[k].state == ST_LIVE)
+            width = InpLineWidth + 1;      // bigger timeframe, heavier line
+      }
       double dist_atr = MathAbs(g_pools[k].level - price_now) / g_atr;
 
       string tip = StringFormat("%s%s  %s  |  touches %d  |  score %.0f  |  pull %.0f  |  %.2f ATR away",
@@ -872,7 +1030,7 @@ void Redraw(const int rates_total, const datetime &time[], const double price_no
 //+------------------------------------------------------------------+
 void DrawPanel(const double price_now)
 {
-   int best_up = -1, best_dn = -1, raiding = -1;
+   int best_up = -1, best_dn = -1, raiding = -1, best_htf = -1;
 
    for(int k = 0; k < ArraySize(g_pools); k++)
    {
@@ -883,6 +1041,11 @@ void DrawPanel(const double price_now)
 
       if(g_pools[k].state == ST_RAIDING && raiding < 0)
          raiding = k;
+
+      if(g_pools[k].htf != 0)
+         if(best_htf < 0 ||
+            MathAbs(g_pools[k].level - price_now) < MathAbs(g_pools[best_htf].level - price_now))
+            best_htf = k;
 
       if(g_pools[k].side > 0 && g_pools[k].level > price_now)
       {
@@ -896,8 +1059,8 @@ void DrawPanel(const double price_now)
       }
    }
 
-   string lines[4];
-   color  cols[4];
+   string lines[5];
+   color  cols[5];
 
    lines[0] = StringFormat("Liquidity map  %d/%d   ATR %s",
                            InpLeftBars, InpRightBars, DoubleToString(g_atr, _Digits));
@@ -931,20 +1094,36 @@ void DrawPanel(const double price_now)
       cols[2]  = clrSilver;
    }
 
-   if(raiding >= 0)
+   if(best_htf >= 0)
    {
-      lines[3] = StringFormat("RAID NOW     %s %s",
-                              (g_pools[raiding].side > 0 ? "BSL" : "SSL"),
-                              DoubleToString(g_pools[raiding].level, _Digits));
-      cols[3]  = InpRaidColor;
+      lines[3] = StringFormat("HTF %-4s     %s   %s%.2f ATR   S%.0f",
+                              TFName(g_pools[best_htf].htf),
+                              DoubleToString(g_pools[best_htf].level, _Digits),
+                              (g_pools[best_htf].level > price_now ? "+" : "-"),
+                              MathAbs(g_pools[best_htf].level - price_now) / g_atr,
+                              g_pools[best_htf].score);
+      cols[3]  = (g_pools[best_htf].side > 0) ? InpBuySideColor : InpSellSideColor;
    }
    else
    {
-      lines[3] = "RAID NOW     -";
+      lines[3] = "HTF          -";
       cols[3]  = clrSilver;
    }
 
-   for(int i = 0; i < 4; i++)
+   if(raiding >= 0)
+   {
+      lines[4] = StringFormat("RAID NOW     %s %s",
+                              (g_pools[raiding].side > 0 ? "BSL" : "SSL"),
+                              DoubleToString(g_pools[raiding].level, _Digits));
+      cols[4]  = InpRaidColor;
+   }
+   else
+   {
+      lines[4] = "RAID NOW     -";
+      cols[4]  = clrSilver;
+   }
+
+   for(int i = 0; i < 5; i++)
    {
       string nm = g_prefix + "P" + IntegerToString(i);
       if(ObjectFind(0, nm) < 0)
