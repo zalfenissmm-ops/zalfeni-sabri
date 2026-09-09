@@ -1,0 +1,734 @@
+//+------------------------------------------------------------------+
+//|                                                  LiquidityMap.mq5 |
+//|   Live buy-side / sell-side liquidity map for MetaTrader 5.       |
+//|   Draws resting liquidity only - no entries, no signals, no SL/TP |
+//+------------------------------------------------------------------+
+#property copyright "zalfeni-sabri"
+#property link      "https://github.com/zalfenissmm-ops/zalfeni-sabri"
+#property version   "1.00"
+#property description "Live liquidity map: equal highs/lows, swing liquidity, PDH/PDL, PWH/PWL."
+#property description "Shows what is still untapped, what is being raided right now, and what got swept."
+#property description "Mapping tool only - it draws no entries and gives no trade signals."
+#property indicator_chart_window
+#property indicator_buffers 0
+#property indicator_plots   0
+
+//--- pool lifecycle
+#define ST_LIVE     0   // untapped - liquidity still resting there
+#define ST_RAIDING  1   // the forming bar is piercing it right now (provisional)
+#define ST_SWEPT    2   // wick took it and price closed back = liquidity grabbed
+#define ST_CLAIMED  3   // closed beyond it = taken and held, no longer a pool
+
+//--- pool origin
+#define TP_SWING    0
+#define TP_DAY      1
+#define TP_WEEK     2
+
+input group             "=== Detection ==="
+input int    InpLeftBars       = 3;      // Swing: bars to the left
+input int    InpRightBars      = 3;      // Swing: bars to the right (confirmation lag)
+input int    InpMaxBarsBack    = 1500;   // History depth in bars (0 = all)
+input int    InpAtrPeriod      = 14;     // ATR period (drives tolerance + distance)
+input double InpEqTolATR       = 0.15;   // Equal-highs/lows tolerance, in ATR
+input int    InpMinTouches     = 1;      // 1 = single swings too, 2 = equal highs/lows only
+input int    InpMaxPools       = 12;     // Max pools drawn per side
+input double InpMinScore       = 0.0;    // Hide pools scoring below this (0-100)
+
+input group             "=== Higher timeframe liquidity ==="
+input bool   InpShowPrevDay    = true;   // Previous day high/low (PDH/PDL)
+input bool   InpShowPrevWeek   = true;   // Previous week high/low (PWH/PWL)
+
+input group             "=== Display ==="
+input color  InpBuySideColor   = clrDodgerBlue;  // Buy-side liquidity (BSL, above)
+input color  InpSellSideColor  = clrOrangeRed;   // Sell-side liquidity (SSL, below)
+input color  InpRaidColor      = clrGold;        // Being raided right now
+input color  InpSweptColor     = clrDimGray;     // Already swept
+input int    InpLineWidth      = 1;      // Line width
+input bool   InpShowZoneBox    = false;  // Draw the pool as a band instead of a line
+input bool   InpShowSwept      = true;   // Keep recently swept pools on the chart
+input int    InpSweptKeepBars  = 30;     // ... for how many bars
+input bool   InpShowLabels     = true;   // Text label on each pool
+input int    InpLabelShiftBars = 2;      // Push labels this many bars right of price
+input bool   InpShowPanel      = true;   // Corner panel with the nearest pools
+
+input group             "=== Alerts ==="
+input bool   InpAlertOnRaid    = false;  // Alert when a pool starts being raided
+
+struct Pool
+{
+   int      side;          // +1 = buy-side (above), -1 = sell-side (below)
+   int      type;          // TP_SWING / TP_DAY / TP_WEEK
+   double   level;         // the extreme where stops rest
+   double   lo;            // cluster low
+   double   hi;            // cluster high
+   double   trigger;       // price that counts as a raid of this pool
+   int      touches;       // how many swings built the cluster
+   int      state;         // ST_*
+   int      bar_first;     // bar of the first swing in the cluster
+   int      bar_confirm;   // bar at which the pool became known (no look-ahead)
+   int      bar_end;       // bar that swept / claimed it
+   double   score;         // 0..100 quality
+   double   pull;          // score / (1 + distance in ATR) = live magnet strength
+   bool     alerted;
+   bool     draw;
+   bool     used;          // scratch flag for ranking
+};
+
+Pool     g_pools[];
+int      g_atr_handle = INVALID_HANDLE;
+double   g_atr        = 0.0;   // ATR of the last closed bar
+double   g_tol        = 0.0;   // tolerance at the current bar
+double   g_atrbuf[];           // per-bar ATR over the working window
+int      g_atr_off    = 0;     // bar index that g_atrbuf[0] belongs to
+datetime g_last_bar   = 0;
+string   g_prefix     = "LQM_";
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(InpLeftBars < 1 || InpRightBars < 1)
+   {
+      Print("LiquidityMap: LeftBars and RightBars must both be >= 1");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(InpAtrPeriod < 2)
+   {
+      Print("LiquidityMap: ATR period must be >= 2");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   g_atr_handle = iATR(_Symbol, _Period, InpAtrPeriod);
+   if(g_atr_handle == INVALID_HANDLE)
+   {
+      Print("LiquidityMap: could not create the ATR handle");
+      return(INIT_FAILED);
+   }
+
+   g_prefix = StringFormat("LQM%d_%d_", InpLeftBars, InpRightBars);
+   g_last_bar = 0;
+   IndicatorSetString(INDICATOR_SHORTNAME, StringFormat("LiquidityMap(%d/%d)", InpLeftBars, InpRightBars));
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, g_prefix);
+   if(g_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_atr_handle);
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   int need = InpLeftBars + InpRightBars + InpAtrPeriod + 5;
+   if(rates_total < need)
+      return(0);
+
+   //--- force plain indexing: 0 = oldest, rates_total-1 = the forming bar
+   ArraySetAsSeries(time,  false);
+   ArraySetAsSeries(open,  false);
+   ArraySetAsSeries(high,  false);
+   ArraySetAsSeries(low,   false);
+   ArraySetAsSeries(close, false);
+
+   //--- ATR of the last closed bar: stable, does not jitter tick by tick
+   double atr_buf[];
+   ArraySetAsSeries(atr_buf, true);
+   if(CopyBuffer(g_atr_handle, 0, 0, 2, atr_buf) < 2)
+      return(prev_calculated);
+   g_atr = atr_buf[1];
+   if(g_atr <= 0.0)
+      return(prev_calculated);
+   g_tol = g_atr * InpEqTolATR;
+
+   bool changed = false;
+   if(prev_calculated == 0 || time[rates_total - 1] != g_last_bar)
+   {
+      g_last_bar = time[rates_total - 1];
+      BuildPools(rates_total, time, high, low, close);
+      changed = true;
+   }
+
+   if(UpdateLive(rates_total, high, low))
+      changed = true;
+
+   //--- distances are re-measured every tick so the readout stays live;
+   //--- the objects themselves are only rebuilt when something moved
+   double price_now = close[rates_total - 1];
+   ScorePools(rates_total, price_now);
+
+   if(changed)
+   {
+      SelectPools(rates_total);
+      Redraw(rates_total, time, price_now);
+   }
+   else if(InpShowPanel)
+   {
+      DrawPanel(price_now);
+      ChartRedraw();
+   }
+
+   return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Tolerance measured with the volatility of THAT bar, not today's.  |
+//| A 20-pip cluster is tight in a storm and sloppy in a dead session; |
+//| using one global ATR would misjudge every older pool on the chart. |
+//+------------------------------------------------------------------+
+double TolAt(const int bar)
+{
+   int idx = bar - g_atr_off;
+   if(idx >= 0 && idx < ArraySize(g_atrbuf) && g_atrbuf[idx] > 0.0)
+      return(g_atrbuf[idx] * InpEqTolATR);
+   return(g_tol);
+}
+
+//+------------------------------------------------------------------+
+//| Rebuild every pool from scratch, walking bars in chronological    |
+//| order so a pool's state only ever depends on bars that came       |
+//| after it was confirmed. Nothing repaints from the future.         |
+//+------------------------------------------------------------------+
+void BuildPools(const int rates_total,
+                const datetime &time[],
+                const double &high[],
+                const double &low[],
+                const double &close[])
+{
+   ArrayResize(g_pools, 0);
+
+   int first = (InpMaxBarsBack > 0) ? rates_total - InpMaxBarsBack : 0;
+   if(first < InpLeftBars)
+      first = InpLeftBars;
+
+   int last_closed = rates_total - 2;      // the forming bar is handled by UpdateLive()
+   if(last_closed <= first + InpRightBars)
+      return;
+
+   //--- ATR for every bar in the window, aligned so g_atrbuf[0] == bar `first`
+   int want = rates_total - first;
+   ArraySetAsSeries(g_atrbuf, false);
+   g_atr_off = first;
+   if(CopyBuffer(g_atr_handle, 0, 0, want, g_atrbuf) != want)
+      ArrayResize(g_atrbuf, 0);           // TolAt() falls back to the current ATR
+
+   bool daily  = (InpShowPrevDay  && _Period < PERIOD_D1);
+   bool weekly = (InpShowPrevWeek && _Period < PERIOD_W1);
+
+   MqlDateTime dt, prev_dt;
+   TimeToStruct(time[first], prev_dt);
+
+   double d_hi = high[first], d_lo = low[first];
+   double w_hi = high[first], w_lo = low[first];
+   //--- the first day/week in the window is cut off by the window itself,
+   //--- so its high/low are not real period extremes - skip that one
+   bool d_ready = false, w_ready = false;
+
+   for(int i = first; i <= last_closed; i++)
+   {
+      //--- 1) settle raids / breaks of every pool that already existed
+      ResolveBar(i, high[i], low[i], close[i]);
+
+      //--- 2) day / week rollover: the period that just ended leaves its
+      //---    high and low behind as liquidity
+      if(i > first)
+      {
+         TimeToStruct(time[i], dt);
+         bool new_day  = (dt.day != prev_dt.day || dt.mon != prev_dt.mon || dt.year != prev_dt.year);
+         bool new_week = (dt.day_of_week < prev_dt.day_of_week) ||
+                         (time[i] - time[i - 1] > 2 * 24 * 60 * 60);
+
+         if(new_week)
+         {
+            if(weekly && w_ready)
+            {
+               NewPool(+1, TP_WEEK, w_hi, i, i, TolAt(i));
+               NewPool(-1, TP_WEEK, w_lo, i, i, TolAt(i));
+            }
+            w_ready = true;
+            w_hi = high[i];
+            w_lo = low[i];
+         }
+         else
+         {
+            w_hi = MathMax(w_hi, high[i]);
+            w_lo = MathMin(w_lo, low[i]);
+         }
+
+         if(new_day)
+         {
+            if(daily && d_ready)
+            {
+               NewPool(+1, TP_DAY, d_hi, i, i, TolAt(i));
+               NewPool(-1, TP_DAY, d_lo, i, i, TolAt(i));
+            }
+            d_ready = true;
+            d_hi = high[i];
+            d_lo = low[i];
+         }
+         else
+         {
+            d_hi = MathMax(d_hi, high[i]);
+            d_lo = MathMin(d_lo, low[i]);
+         }
+
+         prev_dt = dt;
+      }
+
+      //--- 3) a fractal closes its right-hand window exactly at this bar,
+      //---    so this is the first bar at which we are allowed to know it
+      int s = i - InpRightBars;
+      if(s >= first)
+      {
+         bool sw_high = true, sw_low = true;
+         for(int j = s - InpLeftBars; j <= s + InpRightBars; j++)
+         {
+            if(j == s)
+               continue;
+            if(high[j] > high[s]) sw_high = false;
+            if(low[j]  < low[s])  sw_low  = false;
+         }
+         double tol_s = TolAt(s);
+         if(sw_high) AddSwing(+1, high[s], s, i, tol_s);
+         if(sw_low)  AddSwing(-1, low[s],  s, i, tol_s);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| One bar against every live pool.                                  |
+//| Piercing the trigger and closing back  = swept (liquidity grab).  |
+//| Closing beyond it                      = claimed (level is gone). |
+//+------------------------------------------------------------------+
+void ResolveBar(const int bar, const double h, const double l, const double c)
+{
+   int n = ArraySize(g_pools);
+   for(int k = 0; k < n; k++)
+   {
+      if(g_pools[k].state != ST_LIVE)
+         continue;
+      if(g_pools[k].bar_confirm >= bar)      // not knowable yet at this bar
+         continue;
+
+      if(g_pools[k].side > 0)
+      {
+         if(h > g_pools[k].trigger)
+         {
+            g_pools[k].state   = (c > g_pools[k].trigger) ? ST_CLAIMED : ST_SWEPT;
+            g_pools[k].bar_end = bar;
+         }
+      }
+      else
+      {
+         if(l < g_pools[k].trigger)
+         {
+            g_pools[k].state   = (c < g_pools[k].trigger) ? ST_CLAIMED : ST_SWEPT;
+            g_pools[k].bar_end = bar;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Add a swing, merging it into a still-live cluster when it sits    |
+//| within tolerance: three equal highs are ONE strong pool, not two. |
+//+------------------------------------------------------------------+
+void AddSwing(const int side, const double price, const int bar_swing,
+              const int bar_conf, const double tol)
+{
+   for(int k = ArraySize(g_pools) - 1; k >= 0; k--)
+   {
+      if(g_pools[k].type  != TP_SWING) continue;
+      if(g_pools[k].side  != side)     continue;
+      if(g_pools[k].state != ST_LIVE)  continue;
+      if(MathAbs(g_pools[k].level - price) > tol) continue;
+
+      g_pools[k].hi      = MathMax(g_pools[k].hi, price);
+      g_pools[k].lo      = MathMin(g_pools[k].lo, price);
+      g_pools[k].level   = (side > 0) ? g_pools[k].hi : g_pools[k].lo;
+      g_pools[k].trigger = (side > 0) ? g_pools[k].hi + tol : g_pools[k].lo - tol;
+      g_pools[k].touches++;
+      g_pools[k].bar_confirm = bar_conf;
+      return;
+   }
+   NewPool(side, TP_SWING, price, bar_swing, bar_conf, tol);
+}
+
+//+------------------------------------------------------------------+
+void NewPool(const int side, const int type, const double price,
+             const int bar_first, const int bar_conf, const double tol)
+{
+   int n = ArraySize(g_pools);
+   if(ArrayResize(g_pools, n + 1) != n + 1)
+      return;
+
+   g_pools[n].side        = side;
+   g_pools[n].type        = type;
+   g_pools[n].level       = price;
+   g_pools[n].hi          = price;
+   g_pools[n].lo          = price;
+   g_pools[n].trigger     = (side > 0) ? price + tol : price - tol;
+   g_pools[n].touches     = 1;
+   g_pools[n].state       = ST_LIVE;
+   g_pools[n].bar_first   = bar_first;
+   g_pools[n].bar_confirm = bar_conf;
+   g_pools[n].bar_end     = -1;
+   g_pools[n].score       = 0.0;
+   g_pools[n].pull        = 0.0;
+   g_pools[n].alerted     = false;
+   g_pools[n].draw        = false;
+   g_pools[n].used        = false;
+}
+
+//+------------------------------------------------------------------+
+//| The forming bar. A raid here is provisional - it is re-settled    |
+//| into swept or claimed once the bar closes.                        |
+//+------------------------------------------------------------------+
+bool UpdateLive(const int rates_total, const double &high[], const double &low[])
+{
+   int  last    = rates_total - 1;
+   bool changed = false;
+
+   for(int k = 0; k < ArraySize(g_pools); k++)
+   {
+      if(g_pools[k].state != ST_LIVE && g_pools[k].state != ST_RAIDING)
+         continue;
+      if(g_pools[k].bar_confirm >= last)
+         continue;
+
+      bool raid = (g_pools[k].side > 0) ? (high[last] > g_pools[k].trigger)
+                                        : (low[last]  < g_pools[k].trigger);
+      int want = raid ? ST_RAIDING : ST_LIVE;
+      if(g_pools[k].state != want)
+      {
+         g_pools[k].state = want;
+         changed = true;
+      }
+      if(raid && InpAlertOnRaid && !g_pools[k].alerted)
+      {
+         g_pools[k].alerted = true;
+         Alert(StringFormat("%s %s  |  %s liquidity being raided at %s",
+                            _Symbol,
+                            EnumToString((ENUM_TIMEFRAMES)_Period),
+                            (g_pools[k].side > 0 ? "Buy-side" : "Sell-side"),
+                            DoubleToString(g_pools[k].level, _Digits)));
+      }
+   }
+   return(changed);
+}
+
+//+------------------------------------------------------------------+
+//| score = how much liquidity should be resting there (0-100)        |
+//| pull  = how strong a magnet it is RIGHT NOW, distance-adjusted    |
+//+------------------------------------------------------------------+
+void ScorePools(const int rates_total, const double price_now)
+{
+   int last = rates_total - 1;
+
+   for(int k = 0; k < ArraySize(g_pools); k++)
+   {
+      double s = 0.0;
+
+      // stacked stops: every extra equal high/low is another wall of them
+      s += MathMin(g_pools[k].touches, 4) * 10.0;
+
+      // tightness: the closer the highs are to truly equal, the cleaner the pool
+      double tol_k = TolAt(g_pools[k].bar_confirm);
+      if(g_pools[k].touches > 1 && tol_k > 0.0)
+         s += 20.0 * MathMax(0.0, 1.0 - (g_pools[k].hi - g_pools[k].lo) / tol_k);
+      else
+         s += 8.0;
+
+      // higher-timeframe levels carry far more resting orders
+      if(g_pools[k].type == TP_DAY)  s += 15.0;
+      if(g_pools[k].type == TP_WEEK) s += 25.0;
+
+      // a pool that survives keeps collecting stops
+      double age = (double)(last - g_pools[k].bar_first);
+      s += 10.0 * MathMin(1.0, age / 100.0);
+
+      if(s > 100.0) s = 100.0;
+      g_pools[k].score = s;
+
+      double dist_atr = MathAbs(g_pools[k].level - price_now) / g_atr;
+      g_pools[k].pull = s / (1.0 + dist_atr);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Keep the chart readable: best pools per side by live pull, with   |
+//| near-duplicate levels collapsed into the stronger one.            |
+//+------------------------------------------------------------------+
+void SelectPools(const int rates_total)
+{
+   int n = ArraySize(g_pools);
+   for(int k = 0; k < n; k++)
+   {
+      g_pools[k].draw = false;
+      g_pools[k].used = false;
+   }
+
+   for(int side = 1; side >= -1; side -= 2)
+   {
+      int drawn = 0;
+      while(drawn < InpMaxPools)
+      {
+         int best = -1;
+         for(int k = 0; k < n; k++)
+         {
+            if(g_pools[k].used)          continue;
+            if(g_pools[k].side != side)  continue;
+            if(g_pools[k].state != ST_LIVE && g_pools[k].state != ST_RAIDING) continue;
+            if(g_pools[k].type == TP_SWING && g_pools[k].touches < InpMinTouches) continue;
+            if(g_pools[k].score < InpMinScore) continue;
+            if(best < 0 || g_pools[k].pull > g_pools[best].pull)
+               best = k;
+         }
+         if(best < 0)
+            break;
+
+         g_pools[best].used = true;
+
+         bool dup = false;
+         for(int k = 0; k < n; k++)
+         {
+            if(!g_pools[k].draw)        continue;
+            if(g_pools[k].side != side) continue;
+            if(MathAbs(g_pools[k].level - g_pools[best].level) <= g_tol)
+            {
+               dup = true;
+               break;
+            }
+         }
+         if(!dup)
+         {
+            g_pools[best].draw = true;
+            drawn++;
+         }
+      }
+   }
+
+   if(InpShowSwept)
+   {
+      int last = rates_total - 1;
+      for(int k = 0; k < n; k++)
+         if(g_pools[k].state == ST_SWEPT && g_pools[k].bar_end >= 0 &&
+            (last - g_pools[k].bar_end) <= InpSweptKeepBars)
+            g_pools[k].draw = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+void Redraw(const int rates_total, const datetime &time[], const double price_now)
+{
+   ObjectsDeleteAll(0, g_prefix);
+
+   datetime t_now = time[rates_total - 1];
+   datetime t_lbl = (datetime)(t_now + (long)PeriodSeconds() * InpLabelShiftBars);
+   int idx = 0;
+
+   for(int k = 0; k < ArraySize(g_pools); k++)
+   {
+      if(!g_pools[k].draw)
+         continue;
+
+      color           col   = (g_pools[k].side > 0) ? InpBuySideColor : InpSellSideColor;
+      int             width = InpLineWidth;
+      ENUM_LINE_STYLE style = STYLE_SOLID;
+      string          tag   = "";
+
+      if(g_pools[k].state == ST_RAIDING)
+      {
+         col   = InpRaidColor;
+         width = InpLineWidth + 1;
+         tag   = "  RAID";
+      }
+      else if(g_pools[k].state == ST_SWEPT)
+      {
+         col   = InpSweptColor;
+         style = STYLE_DOT;
+         tag   = "  swept";
+      }
+
+      datetime t1 = time[g_pools[k].bar_first];
+      datetime t2 = (g_pools[k].state == ST_SWEPT) ? time[g_pools[k].bar_end] : t_now;
+      bool     ray = (g_pools[k].state != ST_SWEPT);
+
+      string side_tag = (g_pools[k].side > 0) ? "BSL" : "SSL";
+      string type_tag = "";
+      if(g_pools[k].type == TP_DAY)  type_tag = " PD";
+      if(g_pools[k].type == TP_WEEK) type_tag = " PW";
+      double dist_atr = MathAbs(g_pools[k].level - price_now) / g_atr;
+
+      string tip = StringFormat("%s%s  %s  |  touches %d  |  score %.0f  |  pull %.0f  |  %.2f ATR away",
+                                side_tag, type_tag,
+                                DoubleToString(g_pools[k].level, _Digits),
+                                g_pools[k].touches, g_pools[k].score,
+                                g_pools[k].pull, dist_atr);
+
+      if(InpShowZoneBox)
+      {
+         double b1 = (g_pools[k].side > 0) ? g_pools[k].lo : g_pools[k].trigger;
+         double b2 = (g_pools[k].side > 0) ? g_pools[k].trigger : g_pools[k].hi;
+         string bx = g_prefix + "B" + IntegerToString(idx);
+         if(ObjectCreate(0, bx, OBJ_RECTANGLE, 0, t1, b1, t2, b2))
+         {
+            ObjectSetInteger(0, bx, OBJPROP_COLOR, col);
+            ObjectSetInteger(0, bx, OBJPROP_FILL, true);
+            ObjectSetInteger(0, bx, OBJPROP_BACK, true);
+            ObjectSetInteger(0, bx, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, bx, OBJPROP_HIDDEN, true);
+            ObjectSetString(0, bx, OBJPROP_TOOLTIP, tip);
+         }
+      }
+
+      string ln = g_prefix + "L" + IntegerToString(idx);
+      if(ObjectCreate(0, ln, OBJ_TREND, 0, t1, g_pools[k].level, t2, g_pools[k].level))
+      {
+         ObjectSetInteger(0, ln, OBJPROP_COLOR, col);
+         ObjectSetInteger(0, ln, OBJPROP_WIDTH, width);
+         ObjectSetInteger(0, ln, OBJPROP_STYLE, style);
+         ObjectSetInteger(0, ln, OBJPROP_RAY_RIGHT, ray);
+         ObjectSetInteger(0, ln, OBJPROP_RAY_LEFT, false);
+         ObjectSetInteger(0, ln, OBJPROP_BACK, true);
+         ObjectSetInteger(0, ln, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, ln, OBJPROP_HIDDEN, true);
+         ObjectSetString(0, ln, OBJPROP_TOOLTIP, tip);
+      }
+
+      if(InpShowLabels)
+      {
+         string tx = g_prefix + "T" + IntegerToString(idx);
+         if(ObjectCreate(0, tx, OBJ_TEXT, 0, t_lbl, g_pools[k].level))
+         {
+            ObjectSetString(0, tx, OBJPROP_TEXT,
+                            StringFormat("%s%s x%d  S%.0f  %.1fATR%s",
+                                         side_tag, type_tag, g_pools[k].touches,
+                                         g_pools[k].score, dist_atr, tag));
+            ObjectSetString(0, tx, OBJPROP_FONT, "Arial");
+            ObjectSetInteger(0, tx, OBJPROP_FONTSIZE, 7);
+            ObjectSetInteger(0, tx, OBJPROP_COLOR, col);
+            ObjectSetInteger(0, tx, OBJPROP_ANCHOR, ANCHOR_LEFT);
+            ObjectSetInteger(0, tx, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, tx, OBJPROP_HIDDEN, true);
+         }
+      }
+
+      idx++;
+   }
+
+   if(InpShowPanel)
+      DrawPanel(price_now);
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Corner readout: what is closest above, what is closest below,     |
+//| and whether anything is being raided at this very moment.         |
+//+------------------------------------------------------------------+
+void DrawPanel(const double price_now)
+{
+   int best_up = -1, best_dn = -1, raiding = -1;
+
+   for(int k = 0; k < ArraySize(g_pools); k++)
+   {
+      if(!g_pools[k].draw)
+         continue;
+      if(g_pools[k].state != ST_LIVE && g_pools[k].state != ST_RAIDING)
+         continue;
+
+      if(g_pools[k].state == ST_RAIDING && raiding < 0)
+         raiding = k;
+
+      if(g_pools[k].side > 0 && g_pools[k].level > price_now)
+      {
+         if(best_up < 0 || g_pools[k].level < g_pools[best_up].level)
+            best_up = k;
+      }
+      if(g_pools[k].side < 0 && g_pools[k].level < price_now)
+      {
+         if(best_dn < 0 || g_pools[k].level > g_pools[best_dn].level)
+            best_dn = k;
+      }
+   }
+
+   string lines[4];
+   color  cols[4];
+
+   lines[0] = StringFormat("Liquidity map  %d/%d   ATR %s",
+                           InpLeftBars, InpRightBars, DoubleToString(g_atr, _Digits));
+   cols[0]  = clrSilver;
+
+   if(best_up >= 0)
+   {
+      lines[1] = StringFormat("Nearest BSL  %s   +%.2f ATR   S%.0f x%d",
+                              DoubleToString(g_pools[best_up].level, _Digits),
+                              (g_pools[best_up].level - price_now) / g_atr,
+                              g_pools[best_up].score, g_pools[best_up].touches);
+      cols[1] = InpBuySideColor;
+   }
+   else
+   {
+      lines[1] = "Nearest BSL  -";
+      cols[1]  = clrSilver;
+   }
+
+   if(best_dn >= 0)
+   {
+      lines[2] = StringFormat("Nearest SSL  %s   -%.2f ATR   S%.0f x%d",
+                              DoubleToString(g_pools[best_dn].level, _Digits),
+                              (price_now - g_pools[best_dn].level) / g_atr,
+                              g_pools[best_dn].score, g_pools[best_dn].touches);
+      cols[2] = InpSellSideColor;
+   }
+   else
+   {
+      lines[2] = "Nearest SSL  -";
+      cols[2]  = clrSilver;
+   }
+
+   if(raiding >= 0)
+   {
+      lines[3] = StringFormat("RAID NOW     %s %s",
+                              (g_pools[raiding].side > 0 ? "BSL" : "SSL"),
+                              DoubleToString(g_pools[raiding].level, _Digits));
+      cols[3]  = InpRaidColor;
+   }
+   else
+   {
+      lines[3] = "RAID NOW     -";
+      cols[3]  = clrSilver;
+   }
+
+   for(int i = 0; i < 4; i++)
+   {
+      string nm = g_prefix + "P" + IntegerToString(i);
+      if(ObjectFind(0, nm) < 0)
+      {
+         if(!ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0))
+            continue;
+         ObjectSetInteger(0, nm, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+         ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, 10);
+         ObjectSetInteger(0, nm, OBJPROP_YDISTANCE, 18 + i * 14);
+         ObjectSetInteger(0, nm, OBJPROP_FONTSIZE, 8);
+         ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+         ObjectSetString(0, nm, OBJPROP_FONT, "Consolas");
+      }
+      ObjectSetInteger(0, nm, OBJPROP_COLOR, cols[i]);
+      ObjectSetString(0, nm, OBJPROP_TEXT, lines[i]);
+   }
+}
+//+------------------------------------------------------------------+
