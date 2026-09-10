@@ -7,11 +7,12 @@
 //|  3) Break of Structure as the target (كسر هيكلي)                  |
 //|                                                                  |
 //|  Keeps the chart as clean as the video: one trade, the gap that   |
-//|  produced it, and the two levels -- nothing else.                 |
+//|  produced it, and the two levels -- nothing else. The chart's own |
+//|  colors are never touched.                                        |
 //|  Works on every symbol and every timeframe (nothing hardcoded).   |
 //+------------------------------------------------------------------+
 #property copyright   "zalfeni-sabri"
-#property version     "1.10"
+#property version     "1.20"
 #property description "SMC: Fair Value Gap + Liquidity sweep + Break of Structure target."
 #property description "Draws the FVG, the LQ/BOS levels and the trade box, exactly like the video."
 #property indicator_chart_window
@@ -19,7 +20,6 @@
 #property indicator_plots   0
 
 #define PREFIX  "SMCV_"
-#define GVKEY   "SMCVtheme_"
 
 //--- Setup detection ------------------------------------------------
 input int    InpLookbackBars   = 600;    // Bars analysed
@@ -35,7 +35,6 @@ input double InpMinRR          = 0.0;    // Minimum reward:risk (0 = no filter)
 input double InpBufferPercent  = 25.0;   // SL/TP buffer (% of FVG height)
 input double InpTP1Percent     = 50.0;   // TP #1 (% of the distance to the target)
 //--- Look -----------------------------------------------------------
-input bool   InpApplyVideoTheme= true;   // Set the chart colors like the video (undone on remove)
 input bool   InpAutoContrast   = true;   // Adapt the palette to a light chart background
 input int    InpMaxSetups      = 1;      // Trades drawn (1 = only the latest, like the video)
 input int    InpTradeBoxBars   = 30;     // Trade box width in bars
@@ -109,62 +108,8 @@ datetime    g_lastAlertTime = 0;
 color c_fvgFill,c_fvgText,c_fvgMid,c_level,c_label,c_profit,c_risk,c_tp,c_sl,c_entry,c_win,c_loss,c_open;
 
 //+------------------------------------------------------------------+
-//| Chart theme (the dark TradingView look used in the video)         |
+//| Palette (the indicator never touches the chart colors)            |
 //+------------------------------------------------------------------+
-string ThemeKey()
-  {
-   return(GVKEY+IntegerToString((int)ChartID()));
-  }
-
-void SaveAndApplyTheme()
-  {
-   string k=ThemeKey();
-   if(!GlobalVariableCheck(k+"_bg"))
-     {
-      GlobalVariableSet(k+"_bg",  (double)ChartGetInteger(0,CHART_COLOR_BACKGROUND));
-      GlobalVariableSet(k+"_fg",  (double)ChartGetInteger(0,CHART_COLOR_FOREGROUND));
-      GlobalVariableSet(k+"_gr",  (double)ChartGetInteger(0,CHART_COLOR_GRID));
-      GlobalVariableSet(k+"_up",  (double)ChartGetInteger(0,CHART_COLOR_CHART_UP));
-      GlobalVariableSet(k+"_dn",  (double)ChartGetInteger(0,CHART_COLOR_CHART_DOWN));
-      GlobalVariableSet(k+"_bu",  (double)ChartGetInteger(0,CHART_COLOR_CANDLE_BULL));
-      GlobalVariableSet(k+"_be",  (double)ChartGetInteger(0,CHART_COLOR_CANDLE_BEAR));
-      GlobalVariableSet(k+"_ln",  (double)ChartGetInteger(0,CHART_COLOR_CHART_LINE));
-      GlobalVariableSet(k+"_sg",  (double)ChartGetInteger(0,CHART_SHOW_GRID));
-      GlobalVariableSet(k+"_md",  (double)ChartGetInteger(0,CHART_MODE));
-     }
-   ChartSetInteger(0,CHART_MODE,CHART_CANDLES);
-   ChartSetInteger(0,CHART_COLOR_BACKGROUND,clrBlack);
-   ChartSetInteger(0,CHART_COLOR_FOREGROUND,clrWhiteSmoke);
-   ChartSetInteger(0,CHART_SHOW_GRID,false);
-   ChartSetInteger(0,CHART_COLOR_GRID,C'25,25,25');
-   ChartSetInteger(0,CHART_COLOR_CHART_UP,C'38,166,154');
-   ChartSetInteger(0,CHART_COLOR_CHART_DOWN,C'239,83,80');
-   ChartSetInteger(0,CHART_COLOR_CANDLE_BULL,C'38,166,154');
-   ChartSetInteger(0,CHART_COLOR_CANDLE_BEAR,C'239,83,80');
-   ChartSetInteger(0,CHART_COLOR_CHART_LINE,clrSilver);
-  }
-
-void RestoreTheme()
-  {
-   string k=ThemeKey();
-   if(!GlobalVariableCheck(k+"_bg"))
-      return;
-   ChartSetInteger(0,CHART_COLOR_BACKGROUND, (long)GlobalVariableGet(k+"_bg"));
-   ChartSetInteger(0,CHART_COLOR_FOREGROUND, (long)GlobalVariableGet(k+"_fg"));
-   ChartSetInteger(0,CHART_COLOR_GRID,       (long)GlobalVariableGet(k+"_gr"));
-   ChartSetInteger(0,CHART_COLOR_CHART_UP,   (long)GlobalVariableGet(k+"_up"));
-   ChartSetInteger(0,CHART_COLOR_CHART_DOWN, (long)GlobalVariableGet(k+"_dn"));
-   ChartSetInteger(0,CHART_COLOR_CANDLE_BULL,(long)GlobalVariableGet(k+"_bu"));
-   ChartSetInteger(0,CHART_COLOR_CANDLE_BEAR,(long)GlobalVariableGet(k+"_be"));
-   ChartSetInteger(0,CHART_COLOR_CHART_LINE, (long)GlobalVariableGet(k+"_ln"));
-   ChartSetInteger(0,CHART_SHOW_GRID,        (long)GlobalVariableGet(k+"_sg"));
-   ChartSetInteger(0,CHART_MODE,             (long)GlobalVariableGet(k+"_md"));
-   GlobalVariableDel(k+"_bg"); GlobalVariableDel(k+"_fg"); GlobalVariableDel(k+"_gr");
-   GlobalVariableDel(k+"_up"); GlobalVariableDel(k+"_dn"); GlobalVariableDel(k+"_bu");
-   GlobalVariableDel(k+"_be"); GlobalVariableDel(k+"_ln"); GlobalVariableDel(k+"_sg");
-   GlobalVariableDel(k+"_md");
-  }
-
 bool DarkBackground()
   {
    long bg=ChartGetInteger(0,CHART_COLOR_BACKGROUND);
@@ -214,10 +159,6 @@ int OnInit()
   {
    IndicatorSetString(INDICATOR_SHORTNAME,"SMC Video Strategy");
    ObjectsDeleteAll(0,PREFIX);
-   if(InpApplyVideoTheme)
-      SaveAndApplyTheme();
-   else
-      RestoreTheme();          // theme switched off in the settings
    ResolvePalette();
 //--- symbol / timeframe may have changed: force a full recalculation
    g_lastBarTime=0;
@@ -229,8 +170,6 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    ObjectsDeleteAll(0,PREFIX);
-   if(reason==REASON_REMOVE || reason==REASON_CHARTCLOSE || reason==REASON_CHARTCHANGE)
-      RestoreTheme();
    ChartRedraw();
   }
 
