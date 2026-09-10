@@ -37,6 +37,7 @@
 #define ZS_ACTIVE   1   // price is inside it
 #define ZS_DONE     2   // target reached
 #define ZS_INVALID  3   // closed beyond the sweep extreme
+#define ZS_TRIGGER  4   // price came into it and left again, still valid
 
 input group             "=== Detection ==="
 input int    InpLeftBars       = 3;      // Swing: bars to the left
@@ -149,6 +150,7 @@ struct Zone
    int      bar_choch;
    int      bar_end;
    int      state;
+   bool     touched;     // price has been inside it at least once
    bool     has_ob;
    bool     has_fvg;
    int      htf;         // timeframe of the pool that got swept, 0 = this chart
@@ -832,17 +834,24 @@ void BuildZones(const int rates_total, const datetime &time[], const double &ope
          continue;
 
       //--- how it has fared since
-      int state = ZS_WAITING, bar_end = -1;
+      int  state = ZS_WAITING, bar_end = -1;
+      bool touched = false;
       for(int i = cb + 1; i <= last_closed; i++)
       {
          if(dir > 0 && close[i] < invalid) { state = ZS_INVALID; bar_end = i; break; }
          if(dir < 0 && close[i] > invalid) { state = ZS_INVALID; bar_end = i; break; }
          if(dir > 0 && high[i] >= target)  { state = ZS_DONE;    bar_end = i; break; }
          if(dir < 0 && low[i]  <= target)  { state = ZS_DONE;    bar_end = i; break; }
-         if(dir > 0 && low[i]  <= z_top && high[i] >= z_bot) state = ZS_ACTIVE;
-         if(dir < 0 && high[i] >= z_bot && low[i]  <= z_top) state = ZS_ACTIVE;
+         if(low[i] <= z_top && high[i] >= z_bot)
+            touched = true;
       }
       if(state == ZS_INVALID || state == ZS_DONE)
+         continue;
+
+      //--- price already took the zone and ran: the entry is gone, even if
+      //--- the target has not printed yet. Showing it as live is a lie.
+      double away = (dir > 0) ? (z_bot - close[last_closed]) : (close[last_closed] - z_top);
+      if(touched && away > 2.0 * g_atr)
          continue;
 
       int n = ArraySize(g_zones);
@@ -858,6 +867,7 @@ void BuildZones(const int rates_total, const datetime &time[], const double &ope
       g_zones[n].bar_choch  = cb;
       g_zones[n].bar_end    = bar_end;
       g_zones[n].state      = state;
+      g_zones[n].touched    = touched;
       g_zones[n].has_ob     = has_ob;
       g_zones[n].has_fvg    = has_fvg;
       g_zones[n].htf        = g_pools[k].htf;
@@ -878,16 +888,23 @@ bool UpdateZonesLive(const double price_now, const datetime t_live)
    bool changed = false;
    for(int z = 0; z < ArraySize(g_zones); z++)
    {
-      if(g_zones[z].state != ZS_WAITING && g_zones[z].state != ZS_ACTIVE)
+      if(g_zones[z].state == ZS_DONE || g_zones[z].state == ZS_INVALID)
          continue;
+
       bool inside = (price_now <= g_zones[z].top && price_now >= g_zones[z].bottom);
-      if(inside && g_zones[z].state == ZS_WAITING)
+      int  want   = inside ? ZS_ACTIVE
+                           : (g_zones[z].touched ? ZS_TRIGGER : ZS_WAITING);
+
+      if(g_zones[z].state != want)
       {
-         g_zones[z].state = ZS_ACTIVE;
+         g_zones[z].state = want;
          changed = true;
       }
       if(inside)
+      {
+         g_zones[z].touched = true;
          EmitZone(SIG_ENTRY, z, t_live);
+      }
    }
    return(changed);
 }
@@ -1382,7 +1399,7 @@ void DrawZones(const int rates_total, const datetime &time[], const int start_id
 
    for(int z = 0; z < ArraySize(g_zones); z++)
    {
-      if(g_zones[z].state != ZS_WAITING && g_zones[z].state != ZS_ACTIVE)
+      if(g_zones[z].state == ZS_DONE || g_zones[z].state == ZS_INVALID)
          continue;
 
       color    col = (g_zones[z].dir > 0) ? InpZoneLongColor : InpZoneShortColor;
@@ -1433,7 +1450,8 @@ void DrawZones(const int rates_total, const datetime &time[], const int start_id
                             StringFormat("%s %s  R:R %.1f%s",
                                          (g_zones[z].dir > 0 ? "LONG" : "SHORT"), src,
                                          g_zones[z].rr,
-                                         (g_zones[z].state == ZS_ACTIVE ? "  << IN ZONE" : "")));
+                                         (g_zones[z].state == ZS_ACTIVE ? "  << IN ZONE"
+                                          : (g_zones[z].state == ZS_TRIGGER ? "  (entry gone)" : ""))));
             ObjectSetString(0, tl, OBJPROP_FONT, "Arial");
             ObjectSetInteger(0, tl, OBJPROP_FONTSIZE, 8);
             ObjectSetInteger(0, tl, OBJPROP_COLOR, col);
@@ -1548,7 +1566,7 @@ void DrawPanel(const double price_now)
    int zbest = -1;
    for(int z = 0; z < ArraySize(g_zones); z++)
    {
-      if(g_zones[z].state != ZS_WAITING && g_zones[z].state != ZS_ACTIVE)
+      if(g_zones[z].state == ZS_DONE || g_zones[z].state == ZS_INVALID)
          continue;
       if(zbest < 0 || g_zones[z].state == ZS_ACTIVE)
          zbest = z;
@@ -1562,7 +1580,8 @@ void DrawPanel(const double price_now)
                               DoubleToString(g_zones[zbest].bottom, _Digits),
                               DoubleToString(g_zones[zbest].top, _Digits),
                               g_zones[zbest].rr,
-                              (g_zones[zbest].state == ZS_ACTIVE ? "   << IN ZONE" : ""));
+                              (g_zones[zbest].state == ZS_ACTIVE ? "   << IN ZONE"
+                               : (g_zones[zbest].state == ZS_TRIGGER ? "   (entry gone)" : "")));
       cols[5]  = (g_zones[zbest].dir > 0) ? InpZoneLongColor : InpZoneShortColor;
    }
    else
