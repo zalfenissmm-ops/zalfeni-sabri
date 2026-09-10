@@ -57,6 +57,7 @@ input ENUM_TIMEFRAMES InpHTF2  = PERIOD_H4;   // Higher timeframe 2 (CURRENT = o
 input ENUM_TIMEFRAMES InpHTF3  = PERIOD_D1;   // Higher timeframe 3 (CURRENT = off)
 input int    InpHTFBars        = 600;    // Bars to scan on each higher timeframe
 input int    InpHTFMaxPools    = 3;      // Max pools kept per side per timeframe
+input int    InpHTFSweptBars   = 12;     // Also import HTF pools swept this recently (0 = off)
 
 input group             "=== Display ==="
 input color  InpBuySideColor   = clrDodgerBlue;  // Buy-side liquidity (BSL, above)
@@ -1014,6 +1015,39 @@ void ScanHigherTF(const ENUM_TIMEFRAMES tf, const int atr_handle,
          g_pools[dst].draw    = false;
          g_pools[dst].used    = false;
          kept++;
+      }
+   }
+
+   //--- Swept higher-timeframe pools were being dropped here, and they are
+   //--- the single best thing a zone can be built on: an H4 level taken and
+   //--- rejected is a far stronger read than any sweep on the chart itself.
+   //--- Import them too, with the sweep mapped to the chart bar that was
+   //--- open when the higher-timeframe candle CLOSED - that is the moment
+   //--- the sweep is actually confirmed.
+   if(InpHTFSweptBars > 0)
+   {
+      int swept_kept = 0;
+      for(int k = ArraySize(tmp) - 1; k >= 0 && swept_kept < InpHTFMaxPools; k--)
+      {
+         if(tmp[k].state != ST_SWEPT || tmp[k].bar_end < 0)
+            continue;
+         if(last_closed - tmp[k].bar_end > InpHTFSweptBars)
+            continue;
+
+         int dst = ArraySize(g_pools);
+         if(ArrayResize(g_pools, dst + 1) != dst + 1)
+            return;
+
+         datetime t_conf = (datetime)(r[tmp[k].bar_end].time + (long)PeriodSeconds(tf));
+
+         g_pools[dst] = tmp[k];
+         g_pools[dst].htf         = (int)tf;
+         g_pools[dst].bar_first   = ChartIndexOf(r[tmp[k].bar_first].time, rates_total, ctime);
+         g_pools[dst].bar_confirm = ChartIndexOf(r[tmp[k].bar_confirm].time, rates_total, ctime);
+         g_pools[dst].bar_end     = ChartIndexOf(t_conf, rates_total, ctime);
+         g_pools[dst].draw        = false;
+         g_pools[dst].used        = false;
+         swept_kept++;
       }
    }
 }
