@@ -11,15 +11,8 @@
 //|  colors are never touched.                                        |
 //|  Works on every symbol and every timeframe (nothing hardcoded).   |
 //+------------------------------------------------------------------+
-#property copyright   "zalfeni-sabri"
-#property version     "1.50"
-#property description "SMC: Fair Value Gap + Liquidity sweep + Break of Structure target."
-#property description "Draws the FVG, the LQ/BOS levels and the trade box, exactly like the video."
-#property indicator_chart_window
-#property indicator_buffers 0
-#property indicator_plots   0
 
-#define PREFIX  "SMCV_"
+#define PREFIX  std::string("SMCV_")
 
 //--- trade outcome codes (always compare with ==, never with >)
 #define RES_RUNNING   0
@@ -27,42 +20,42 @@
 #define RES_STOP     (-1)
 
 //--- Setup detection ------------------------------------------------
-input int    InpLookbackBars   = 600;    // Bars analysed
-input int    InpSwingWindow    = 3;      // Swing (fractal) window
-input int    InpReclaimBars    = 3;      // Bars the stop order at the swept level stays valid
-input int    InpAtrPeriod      = 14;     // ATR period (used to size the gaps)
-input double InpMinFvgAtrPct   = 30.0;   // Minimum FVG height (% of ATR) - kills micro gaps
-input bool   InpRequireCE      = false;  // Require the wick to reach the FVG mid (CE)
-input bool   InpAllowBuys      = true;   // Detect buy setups
-input bool   InpAllowSells     = true;   // Detect sell setups
-input double InpMinRR          = 0.0;    // Minimum reward:risk (0 = no filter)
-input bool   InpEntryAtClose   = false;  // true = fill at the reclaim bar's close instead of at the level
+int    InpLookbackBars   = 600;    // Bars analysed
+int    InpSwingWindow    = 3;      // Swing (fractal) window
+int    InpReclaimBars    = 3;      // Bars the stop order at the swept level stays valid
+int    InpAtrPeriod      = 14;     // ATR period (used to size the gaps)
+double InpMinFvgAtrPct   = 30.0;   // Minimum FVG height (% of ATR) - kills micro gaps
+bool   InpRequireCE      = false;  // Require the wick to reach the FVG mid (CE)
+bool   InpAllowBuys      = true;   // Detect buy setups
+bool   InpAllowSells     = true;   // Detect sell setups
+double InpMinRR          = 0.0;    // Minimum reward:risk (0 = no filter)
+bool   InpEntryAtClose   = false;  // true = fill at the reclaim bar's close instead of at the level
 //--- Trade levels ---------------------------------------------------
-input double InpBufferPercent  = 25.0;   // SL/TP buffer (% of FVG height)
-input double InpTP1Percent     = 50.0;   // TP #1 (% of the distance to the target)
+double InpBufferPercent  = 25.0;   // SL/TP buffer (% of FVG height)
+double InpTP1Percent     = 50.0;   // TP #1 (% of the distance to the target)
 //--- Look -----------------------------------------------------------
-input bool   InpAutoContrast   = true;   // Adapt the palette to a light chart background
-input int    InpMaxSetups      = 1;      // Trades drawn (1 = only the latest, like the video)
-input int    InpTradeBoxBars   = 30;     // Trade box width in bars
-input bool   InpShowFvgBoxes   = true;   // Draw the nearest valid FVG zones
-input int    InpMaxFvgBoxes    = 1;      // How many of them (the trade's own gap counts too)
-input int    InpFvgMaxAgeBars  = 300;    // Ignore gaps older than this
-input bool   InpShowLevels     = true;   // Draw the current LQ / BOS levels
-input bool   InpShowPanel      = false;  // Checklist panel (top-left)
-input double InpPipSize        = 0.0;    // Pip size for the result label (0 = auto)
+bool   InpAutoContrast   = true;   // Adapt the palette to a light chart background
+int    InpMaxSetups      = 1;      // Trades drawn (1 = only the latest, like the video)
+int    InpTradeBoxBars   = 30;     // Trade box width in bars
+bool   InpShowFvgBoxes   = true;   // Draw the nearest valid FVG zones
+int    InpMaxFvgBoxes    = 1;      // How many of them (the trade's own gap counts too)
+int    InpFvgMaxAgeBars  = 300;    // Ignore gaps older than this
+bool   InpShowLevels     = true;   // Draw the current LQ / BOS levels
+bool   InpShowPanel      = false;  // Checklist panel (top-left)
+double InpPipSize        = 0.0;    // Pip size for the result label (0 = auto)
 //--- Alerts ---------------------------------------------------------
-input bool   InpAlertPopup     = true;   // Popup alert on a new setup
-input bool   InpAlertPush      = false;  // Push notification on a new setup
+bool   InpAlertPopup     = true;   // Popup alert on a new setup
+bool   InpAlertPush      = false;  // Push notification on a new setup
 //--- Colors used on a dark chart (a light chart auto-adapts) --------
-input color  InpFvgFill        = C'38,38,38';   // FVG box
-input color  InpFvgText        = clrLimeGreen;  // "FVG" text
-input color  InpLevelColor     = clrWhite;      // LQ / BOS lines
-input color  InpLabelColor     = clrRoyalBlue;  // LQ / BOS / TP#1 labels
-input color  InpProfitFill     = C'0,58,44';    // Profit box
-input color  InpRiskFill       = C'66,18,29';   // Risk box
-input color  InpTpColor        = clrKhaki;      // TP lines
-input color  InpSlColor        = clrCrimson;    // SL line
-input color  InpEntryColor     = clrSilver;     // Entry line
+color  InpFvgFill        = MQLCOLOR(38,38,38);   // FVG box
+color  InpFvgText        = clrLimeGreen;  // "FVG" text
+color  InpLevelColor     = clrWhite;      // LQ / BOS lines
+color  InpLabelColor     = clrRoyalBlue;  // LQ / BOS / TP#1 labels
+color  InpProfitFill     = MQLCOLOR(0,58,44);    // Profit box
+color  InpRiskFill       = MQLCOLOR(66,18,29);   // Risk box
+color  InpTpColor        = clrKhaki;      // TP lines
+color  InpSlColor        = clrCrimson;    // SL line
+color  InpEntryColor     = clrSilver;     // Entry line
 
 //+------------------------------------------------------------------+
 //| Data structures                                                   |
@@ -98,10 +91,10 @@ struct TradeSetup
    datetime entryTime;
   };
 
-SwingPoint  g_swings[];
-FvgZone     g_fvg[];
-TradeSetup  g_setups[];
-double      g_atr[];
+MqlArray<SwingPoint> g_swings;
+MqlArray<FvgZone> g_fvg;
+MqlArray<TradeSetup> g_setups;
+MqlArray<double> g_atr;
 
 double      g_curLq   = 0.0;   // last confirmed swing low  (liquidity for buys)
 double      g_curBos  = 0.0;   // last confirmed swing high (target for buys)
@@ -131,24 +124,24 @@ void ResolvePalette()
    if(InpAutoContrast && !DarkBackground())
      {
       //--- light chart: pale fills, dark text - same layout, readable
-      c_fvgFill = C'222,222,222';
-      c_fvgText = C'0,110,60';
-      c_fvgMid  = C'150,150,150';
-      c_level   = C'60,60,60';
-      c_label   = C'20,60,160';
-      c_profit  = C'198,232,219';
-      c_risk    = C'248,214,218';
-      c_tp      = C'150,120,0';
+      c_fvgFill = MQLCOLOR(222,222,222);
+      c_fvgText = MQLCOLOR(0,110,60);
+      c_fvgMid  = MQLCOLOR(150,150,150);
+      c_level   = MQLCOLOR(60,60,60);
+      c_label   = MQLCOLOR(20,60,160);
+      c_profit  = MQLCOLOR(198,232,219);
+      c_risk    = MQLCOLOR(248,214,218);
+      c_tp      = MQLCOLOR(150,120,0);
       c_sl      = clrCrimson;
-      c_entry   = C'90,90,90';
-      c_win     = C'0,130,70';
-      c_loss    = C'190,40,40';
-      c_open    = C'80,80,80';
+      c_entry   = MQLCOLOR(90,90,90);
+      c_win     = MQLCOLOR(0,130,70);
+      c_loss    = MQLCOLOR(190,40,40);
+      c_open    = MQLCOLOR(80,80,80);
       return;
      }
    c_fvgFill = InpFvgFill;
    c_fvgText = InpFvgText;
-   c_fvgMid  = C'150,150,150';
+   c_fvgMid  = MQLCOLOR(150,150,150);
    c_level   = InpLevelColor;
    c_label   = InpLabelColor;
    c_profit  = InpProfitFill;
@@ -193,7 +186,7 @@ double PipSize()
    return(_Point);
   }
 
-string PipsText(const double diff)
+std::string PipsText(const double diff)
   {
    double ps=PipSize();
    if(ps<=0.0)
@@ -201,12 +194,12 @@ string PipsText(const double diff)
    return(DoubleToString(diff/ps,0));
   }
 
-string Px(const double price)
+std::string Px(const double price)
   {
    return(DoubleToString(price,_Digits));
   }
 
-void StyleObject(const string name)
+void StyleObject(const std::string name)
   {
    ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
    ObjectSetInteger(0,name,OBJPROP_SELECTED,false);
@@ -214,7 +207,7 @@ void StyleObject(const string name)
    ObjectSetInteger(0,name,OBJPROP_ZORDER,0);
   }
 
-void PutBox(const string name,const datetime t1,const double p1,
+void PutBox(const std::string name,const datetime t1,const double p1,
             const datetime t2,const double p2,const color clr)
   {
    if(ObjectFind(0,name)<0)
@@ -231,7 +224,7 @@ void PutBox(const string name,const datetime t1,const double p1,
    StyleObject(name);
   }
 
-void PutSegment(const string name,const datetime t1,const datetime t2,const double price,
+void PutSegment(const std::string name,const datetime t1,const datetime t2,const double price,
                 const color clr,const ENUM_LINE_STYLE style,const int width)
   {
    if(ObjectFind(0,name)<0)
@@ -249,7 +242,7 @@ void PutSegment(const string name,const datetime t1,const datetime t2,const doub
    StyleObject(name);
   }
 
-void PutText(const string name,const datetime t,const double price,const string txt,
+void PutText(const std::string name,const datetime t,const double price,const std::string txt,
              const color clr,const int size,const ENUM_ANCHOR_POINT anchor)
   {
    if(ObjectFind(0,name)<0)
@@ -264,7 +257,7 @@ void PutText(const string name,const datetime t,const double price,const string 
    StyleObject(name);
   }
 
-void PutPanelLine(const string name,const int x,const int y,const string txt,const color clr)
+void PutPanelLine(const std::string name,const int x,const int y,const std::string txt,const color clr)
   {
    if(ObjectFind(0,name)<0)
       ObjectCreate(0,name,OBJ_LABEL,0,0,0);
@@ -291,7 +284,7 @@ void AddSwing(const int idx,const double price,const bool isHigh)
   }
 
 void AddFvg(const int formed,const double top,const double bottom,const bool bullish,
-            const int n,const double &close[])
+            const int n,const MqlArray<double>& close)
   {
    FvgZone z;
    z.formed=formed;
@@ -309,7 +302,7 @@ void AddFvg(const int formed,const double top,const double bottom,const bool bul
    g_fvg[sz]=z;
   }
 
-void BuildAtr(const int n,const double &high[],const double &low[],const double &close[])
+void BuildAtr(const int n,const MqlArray<double>& high,const MqlArray<double>& low,const MqlArray<double>& close)
   {
    int period=InpAtrPeriod;
    if(period<2) period=2;
@@ -348,8 +341,8 @@ void BuildAtr(const int n,const double &high[],const double &low[],const double 
 bool TryBuildSetup(const bool bullish,const int k,
                    const double lqLevel,const int lqIdx,
                    const double bosLevel,const int bosIdx,
-                   const int n,const datetime &time[],
-                   const double &high[],const double &low[],const double &close[],
+                   const int n,const MqlArray<datetime>& time,
+                   const MqlArray<double>& high,const MqlArray<double>& low,const MqlArray<double>& close,
                    TradeSetup &out)
   {
 //--- 2) liquidity: the bar must run through the last swing level
@@ -497,8 +490,8 @@ bool TryBuildSetup(const bool bullish,const int k,
    return(true);
   }
 
-void Analyse(const int n,const datetime &time[],const double &high[],
-             const double &low[],const double &close[])
+void Analyse(const int n,const MqlArray<datetime>& time,const MqlArray<double>& high,
+             const MqlArray<double>& low,const MqlArray<double>& close)
   {
    int w=InpSwingWindow;
    if(w<1) w=1;
@@ -590,7 +583,7 @@ void Analyse(const int n,const datetime &time[],const double &high[],
 //+------------------------------------------------------------------+
 //| Drawing                                                           |
 //+------------------------------------------------------------------+
-datetime BarTime(const int idx,const int n,const datetime &time[])
+datetime BarTime(const int idx,const int n,const MqlArray<datetime>& time)
   {
    if(idx<0)
       return(time[0]);
@@ -599,11 +592,11 @@ datetime BarTime(const int idx,const int n,const datetime &time[])
    return(time[n-1]+(datetime)(PeriodSeconds()*(idx-(n-1))));
   }
 
-void DrawFvgBox(const int fvgIdx,const int n,const datetime &time[],const datetime rightEdge)
+void DrawFvgBox(const int fvgIdx,const int n,const MqlArray<datetime>& time,const datetime rightEdge)
   {
    if(fvgIdx<0 || fvgIdx>=ArraySize(g_fvg))
       return;
-   string id=PREFIX+"FVG"+IntegerToString(g_fvg[fvgIdx].formed);
+   std::string id=PREFIX+"FVG"+IntegerToString(g_fvg[fvgIdx].formed);
    int leftIdx=g_fvg[fvgIdx].formed-2;
    if(leftIdx<0) leftIdx=0;
    datetime t1=BarTime(leftIdx,n,time);
@@ -614,9 +607,9 @@ void DrawFvgBox(const int fvgIdx,const int n,const datetime &time[],const dateti
   }
 
 void DrawSetup(const int slot,const TradeSetup &st,const int n,
-               const datetime &time[],const datetime rightEdge)
+               const MqlArray<datetime>& time,const datetime rightEdge)
   {
-   string id=PREFIX+"S"+IntegerToString(slot)+"_";
+   std::string id=PREFIX+"S"+IntegerToString(slot)+"_";
    int width=InpTradeBoxBars;
    if(width<1) width=1;
    datetime t0=BarTime(st.entryIdx,n,time);
@@ -637,7 +630,7 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
    PutSegment(id+"tp",t0,t1,st.tp,c_tp,STYLE_DOT,1);
    PutSegment(id+"sl",t0,t1,st.sl,c_sl,STYLE_DOT,1);
 
-   string side=st.bullish ? "BUY" : "SELL";
+   std::string side=st.bullish ? "BUY" : "SELL";
    PutText(id+"eT",t1,st.entry,side+"  "+Px(st.entry),c_entry,8,ANCHOR_LEFT);
    PutText(id+"t1T",t1,st.tp1,"TP #1  "+Px(st.tp1),c_label,8,ANCHOR_LEFT);
    PutText(id+"tT",t1,st.tp,"TP  "+Px(st.tp),c_tp,8,ANCHOR_LEFT);
@@ -646,8 +639,8 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
 //--- result, the way the video ends with "378 PIPS"
    double risk   = st.bullish ? st.entry-st.sl : st.sl-st.entry;
    double reward = st.bullish ? st.tp-st.entry : st.entry-st.tp;
-   string rr=DoubleToString(reward/risk,2)+"R";
-   string res;
+   std::string rr=DoubleToString(reward/risk,2)+"R";
+   std::string res;
    color  rc;
    if(st.result==RES_TARGET)       { res="+"+PipsText(reward)+" PIPS   "+rr; rc=c_win;  }
    else if(st.result==RES_STOP)    { res="-"+PipsText(risk)+" PIPS   "+rr;   rc=c_loss; }
@@ -663,7 +656,7 @@ void DrawPanel()
    PutPanelLine(PREFIX+"p1",10,38,"1. FVG zones valid : "+IntegerToString(g_validFvg),c_fvgText);
    PutPanelLine(PREFIX+"p2",10,54,"2. Liquidity (LQ)  : "+(g_curLqIdx>=0?Px(g_curLq):"-"),c_label);
    PutPanelLine(PREFIX+"p3",10,70,"3. Structure (BOS) : "+(g_curBosIdx>=0?Px(g_curBos):"-"),c_label);
-   string last="none";
+   std::string last="none";
    if(total>0)
      {
       TradeSetup s=g_setups[total-1];
@@ -672,7 +665,7 @@ void DrawPanel()
    PutPanelLine(PREFIX+"p4",10,88,"Last setup : "+last,c_level);
   }
 
-void Redraw(const int n,const datetime &time[],const double &close[])
+void Redraw(const int n,const MqlArray<datetime>& time,const MqlArray<double>& close)
   {
    ObjectsDeleteAll(0,PREFIX);
    datetime rightEdge=time[n-1]+(datetime)(PeriodSeconds()*8);
@@ -742,7 +735,7 @@ void CheckAlerts(const int n)
    if(s.entryTime<=g_lastAlertTime)
       return;
    g_lastAlertTime=s.entryTime;
-   string msg=StringFormat("SMC setup  %s %s  %s @ %s   SL %s   TP %s",
+   std::string msg=StringFormat("SMC setup  %s %s  %s @ %s   SL %s   TP %s",
                            _Symbol,EnumToString((ENUM_TIMEFRAMES)_Period),
                            (s.bullish?"BUY":"SELL"),
                            Px(s.entry),Px(s.sl),Px(s.tp));
@@ -755,14 +748,14 @@ void CheckAlerts(const int n)
 //+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
                 const int prev_calculated,
-                const datetime &time[],
-                const double &open[],
-                const double &high[],
-                const double &low[],
-                const double &close[],
-                const long &tick_volume[],
-                const long &volume[],
-                const int &spread[])
+                const MqlArray<datetime>& time,
+                const MqlArray<double>& open,
+                const MqlArray<double>& high,
+                const MqlArray<double>& low,
+                const MqlArray<double>& close,
+                const MqlArray<long>& tick_volume,
+                const MqlArray<long>& volume,
+                const MqlArray<int>& spread)
   {
    if(rates_total<InpSwingWindow*2+20)
       return(rates_total);
