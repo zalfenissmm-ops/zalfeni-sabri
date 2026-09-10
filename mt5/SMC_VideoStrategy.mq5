@@ -6,25 +6,27 @@
 //|  2) Liquidity sweep (سيولة)                                       |
 //|  3) Break of Structure as the target (كسر هيكلي)                  |
 //|                                                                  |
-//|  Draws every condition as soon as it forms, and when the three   |
-//|  line up it draws the trade (entry / SL / TP1 / target) the same  |
-//|  way the long-position tool was drawn in the video.              |
-//|  Works on every symbol and every timeframe (nothing hardcoded).  |
+//|  Keeps the chart as clean as the video: one trade, the gap that   |
+//|  produced it, and the two levels -- nothing else.                 |
+//|  Works on every symbol and every timeframe (nothing hardcoded).   |
 //+------------------------------------------------------------------+
 #property copyright   "zalfeni-sabri"
-#property version     "1.00"
+#property version     "1.10"
 #property description "SMC: Fair Value Gap + Liquidity sweep + Break of Structure target."
-#property description "Draws FVG boxes, LQ/BOS levels and the full trade box on any timeframe."
+#property description "Draws the FVG, the LQ/BOS levels and the trade box, exactly like the video."
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
 
-#define PREFIX "SMCV_"
+#define PREFIX  "SMCV_"
+#define GVKEY   "SMCVtheme_"
 
 //--- Setup detection ------------------------------------------------
 input int    InpLookbackBars   = 600;    // Bars analysed
 input int    InpSwingWindow    = 3;      // Swing (fractal) window
 input int    InpReclaimBars    = 3;      // Bars allowed to reclaim the swept level
+input int    InpAtrPeriod      = 14;     // ATR period (used to size the gaps)
+input double InpMinFvgAtrPct   = 30.0;   // Minimum FVG height (% of ATR) - kills micro gaps
 input bool   InpRequireCE      = false;  // Require the wick to reach the FVG mid (CE)
 input bool   InpAllowBuys      = true;   // Detect buy setups
 input bool   InpAllowSells     = true;   // Detect sell setups
@@ -32,24 +34,27 @@ input double InpMinRR          = 0.0;    // Minimum reward:risk (0 = no filter)
 //--- Trade levels ---------------------------------------------------
 input double InpBufferPercent  = 25.0;   // SL/TP buffer (% of FVG height)
 input double InpTP1Percent     = 50.0;   // TP #1 (% of the distance to the target)
-//--- Drawing --------------------------------------------------------
-input int    InpMaxSetups      = 3;      // Trades drawn (most recent)
+//--- Look -----------------------------------------------------------
+input bool   InpApplyVideoTheme= true;   // Set the chart colors like the video (undone on remove)
+input bool   InpAutoContrast   = true;   // Adapt the palette to a light chart background
+input int    InpMaxSetups      = 1;      // Trades drawn (1 = only the latest, like the video)
 input int    InpTradeBoxBars   = 30;     // Trade box width in bars
-input bool   InpShowFvgBoxes   = true;   // Draw every valid (unmitigated) FVG
-input int    InpMaxFvgBoxes    = 10;     // Max FVG boxes on screen
+input bool   InpShowFvgBoxes   = true;   // Draw the nearest valid FVG zones
+input int    InpMaxFvgBoxes    = 2;      // How many of them
+input int    InpFvgMaxAgeBars  = 300;    // Ignore gaps older than this
 input bool   InpShowLevels     = true;   // Draw the current LQ / BOS levels
 input bool   InpShowPanel      = false;  // Checklist panel (top-left)
 input double InpPipSize        = 0.0;    // Pip size for the result label (0 = auto)
 //--- Alerts ---------------------------------------------------------
 input bool   InpAlertPopup     = true;   // Popup alert on a new setup
 input bool   InpAlertPush      = false;  // Push notification on a new setup
-//--- Colors ---------------------------------------------------------
-input color  InpFvgFill        = C'45,45,45';   // FVG box
+//--- Colors used on a dark chart (a light chart auto-adapts) --------
+input color  InpFvgFill        = C'38,38,38';   // FVG box
 input color  InpFvgText        = clrLimeGreen;  // "FVG" text
 input color  InpLevelColor     = clrWhite;      // LQ / BOS lines
 input color  InpLabelColor     = clrRoyalBlue;  // LQ / BOS / TP#1 labels
-input color  InpProfitFill     = C'0,64,48';    // Profit box
-input color  InpRiskFill       = C'72,20,32';   // Risk box
+input color  InpProfitFill     = C'0,58,44';    // Profit box
+input color  InpRiskFill       = C'66,18,29';   // Risk box
 input color  InpTpColor        = clrKhaki;      // TP lines
 input color  InpSlColor        = clrCrimson;    // SL line
 input color  InpEntryColor     = clrSilver;     // Entry line
@@ -90,20 +95,130 @@ struct TradeSetup
 SwingPoint  g_swings[];
 FvgZone     g_fvg[];
 TradeSetup  g_setups[];
+double      g_atr[];
 
 double      g_curLq   = 0.0;   // last confirmed swing low  (liquidity for buys)
 double      g_curBos  = 0.0;   // last confirmed swing high (target for buys)
 int         g_curLqIdx  = -1;
 int         g_curBosIdx = -1;
-int         g_validFvg = 0;   // unmitigated FVG zones in the lookback window
-datetime    g_lastBarTime  = 0;
+int         g_validFvg  = 0;
+datetime    g_lastBarTime   = 0;
 datetime    g_lastAlertTime = 0;
+
+//--- resolved palette (dark chart -> the inputs, light chart -> readable variants)
+color c_fvgFill,c_fvgText,c_fvgMid,c_level,c_label,c_profit,c_risk,c_tp,c_sl,c_entry,c_win,c_loss,c_open;
+
+//+------------------------------------------------------------------+
+//| Chart theme (the dark TradingView look used in the video)         |
+//+------------------------------------------------------------------+
+string ThemeKey()
+  {
+   return(GVKEY+IntegerToString((int)ChartID()));
+  }
+
+void SaveAndApplyTheme()
+  {
+   string k=ThemeKey();
+   if(!GlobalVariableCheck(k+"_bg"))
+     {
+      GlobalVariableSet(k+"_bg",  (double)ChartGetInteger(0,CHART_COLOR_BACKGROUND));
+      GlobalVariableSet(k+"_fg",  (double)ChartGetInteger(0,CHART_COLOR_FOREGROUND));
+      GlobalVariableSet(k+"_gr",  (double)ChartGetInteger(0,CHART_COLOR_GRID));
+      GlobalVariableSet(k+"_up",  (double)ChartGetInteger(0,CHART_COLOR_CHART_UP));
+      GlobalVariableSet(k+"_dn",  (double)ChartGetInteger(0,CHART_COLOR_CHART_DOWN));
+      GlobalVariableSet(k+"_bu",  (double)ChartGetInteger(0,CHART_COLOR_CANDLE_BULL));
+      GlobalVariableSet(k+"_be",  (double)ChartGetInteger(0,CHART_COLOR_CANDLE_BEAR));
+      GlobalVariableSet(k+"_ln",  (double)ChartGetInteger(0,CHART_COLOR_CHART_LINE));
+      GlobalVariableSet(k+"_sg",  (double)ChartGetInteger(0,CHART_SHOW_GRID));
+      GlobalVariableSet(k+"_md",  (double)ChartGetInteger(0,CHART_MODE));
+     }
+   ChartSetInteger(0,CHART_MODE,CHART_CANDLES);
+   ChartSetInteger(0,CHART_COLOR_BACKGROUND,clrBlack);
+   ChartSetInteger(0,CHART_COLOR_FOREGROUND,clrWhiteSmoke);
+   ChartSetInteger(0,CHART_SHOW_GRID,false);
+   ChartSetInteger(0,CHART_COLOR_GRID,C'25,25,25');
+   ChartSetInteger(0,CHART_COLOR_CHART_UP,C'38,166,154');
+   ChartSetInteger(0,CHART_COLOR_CHART_DOWN,C'239,83,80');
+   ChartSetInteger(0,CHART_COLOR_CANDLE_BULL,C'38,166,154');
+   ChartSetInteger(0,CHART_COLOR_CANDLE_BEAR,C'239,83,80');
+   ChartSetInteger(0,CHART_COLOR_CHART_LINE,clrSilver);
+  }
+
+void RestoreTheme()
+  {
+   string k=ThemeKey();
+   if(!GlobalVariableCheck(k+"_bg"))
+      return;
+   ChartSetInteger(0,CHART_COLOR_BACKGROUND, (long)GlobalVariableGet(k+"_bg"));
+   ChartSetInteger(0,CHART_COLOR_FOREGROUND, (long)GlobalVariableGet(k+"_fg"));
+   ChartSetInteger(0,CHART_COLOR_GRID,       (long)GlobalVariableGet(k+"_gr"));
+   ChartSetInteger(0,CHART_COLOR_CHART_UP,   (long)GlobalVariableGet(k+"_up"));
+   ChartSetInteger(0,CHART_COLOR_CHART_DOWN, (long)GlobalVariableGet(k+"_dn"));
+   ChartSetInteger(0,CHART_COLOR_CANDLE_BULL,(long)GlobalVariableGet(k+"_bu"));
+   ChartSetInteger(0,CHART_COLOR_CANDLE_BEAR,(long)GlobalVariableGet(k+"_be"));
+   ChartSetInteger(0,CHART_COLOR_CHART_LINE, (long)GlobalVariableGet(k+"_ln"));
+   ChartSetInteger(0,CHART_SHOW_GRID,        (long)GlobalVariableGet(k+"_sg"));
+   ChartSetInteger(0,CHART_MODE,             (long)GlobalVariableGet(k+"_md"));
+   GlobalVariableDel(k+"_bg"); GlobalVariableDel(k+"_fg"); GlobalVariableDel(k+"_gr");
+   GlobalVariableDel(k+"_up"); GlobalVariableDel(k+"_dn"); GlobalVariableDel(k+"_bu");
+   GlobalVariableDel(k+"_be"); GlobalVariableDel(k+"_ln"); GlobalVariableDel(k+"_sg");
+   GlobalVariableDel(k+"_md");
+  }
+
+bool DarkBackground()
+  {
+   long bg=ChartGetInteger(0,CHART_COLOR_BACKGROUND);
+   int r=(int)(bg&0xFF);
+   int g=(int)((bg>>8)&0xFF);
+   int b=(int)((bg>>16)&0xFF);
+   return((0.299*r+0.587*g+0.114*b)<128.0);
+  }
+
+void ResolvePalette()
+  {
+   if(InpAutoContrast && !DarkBackground())
+     {
+      //--- light chart: pale fills, dark text - same layout, readable
+      c_fvgFill = C'222,222,222';
+      c_fvgText = C'0,110,60';
+      c_fvgMid  = C'150,150,150';
+      c_level   = C'60,60,60';
+      c_label   = C'20,60,160';
+      c_profit  = C'198,232,219';
+      c_risk    = C'248,214,218';
+      c_tp      = C'150,120,0';
+      c_sl      = clrCrimson;
+      c_entry   = C'90,90,90';
+      c_win     = C'0,130,70';
+      c_loss    = C'190,40,40';
+      c_open    = C'80,80,80';
+      return;
+     }
+   c_fvgFill = InpFvgFill;
+   c_fvgText = InpFvgText;
+   c_fvgMid  = C'150,150,150';
+   c_level   = InpLevelColor;
+   c_label   = InpLabelColor;
+   c_profit  = InpProfitFill;
+   c_risk    = InpRiskFill;
+   c_tp      = InpTpColor;
+   c_sl      = InpSlColor;
+   c_entry   = InpEntryColor;
+   c_win     = clrLime;
+   c_loss    = clrTomato;
+   c_open    = clrSilver;
+  }
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
    IndicatorSetString(INDICATOR_SHORTNAME,"SMC Video Strategy");
    ObjectsDeleteAll(0,PREFIX);
+   if(InpApplyVideoTheme)
+      SaveAndApplyTheme();
+   else
+      RestoreTheme();          // theme switched off in the settings
+   ResolvePalette();
 //--- symbol / timeframe may have changed: force a full recalculation
    g_lastBarTime=0;
    g_lastAlertTime=0;
@@ -114,6 +229,8 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    ObjectsDeleteAll(0,PREFIX);
+   if(reason==REASON_REMOVE || reason==REASON_CHARTCLOSE || reason==REASON_CHARTCHANGE)
+      RestoreTheme();
    ChartRedraw();
   }
 
@@ -125,7 +242,7 @@ double PipSize()
    if(InpPipSize>0.0)
       return(InpPipSize);
    int d=(int)_Digits;
-   if(d==2 || d==3 || d==5)     // gold/JPY-style and 5-digit FX
+   if(d==2 || d==3 || d==5)     // gold-style and 5-digit FX
       return(10.0*_Point);
    return(_Point);
   }
@@ -244,6 +361,41 @@ void AddFvg(const int formed,const double top,const double bottom,const bool bul
    int sz=ArraySize(g_fvg);
    ArrayResize(g_fvg,sz+1);
    g_fvg[sz]=z;
+  }
+
+void BuildAtr(const int n,const double &high[],const double &low[],const double &close[])
+  {
+   int period=InpAtrPeriod;
+   if(period<2) period=2;
+   ArrayResize(g_atr,n);
+   double sum=0.0;
+   for(int i=0; i<n; i++)
+     {
+      double tr=high[i]-low[i];
+      if(i>0)
+        {
+         double a=MathAbs(high[i]-close[i-1]);
+         double b=MathAbs(low[i]-close[i-1]);
+         if(a>tr) tr=a;
+         if(b>tr) tr=b;
+        }
+      sum+=tr;
+      if(i>=period)
+        {
+         double ptr=high[i-period]-low[i-period];
+         if(i-period>0)
+           {
+            double a=MathAbs(high[i-period]-close[i-period-1]);
+            double b=MathAbs(low[i-period]-close[i-period-1]);
+            if(a>ptr) ptr=a;
+            if(b>ptr) ptr=b;
+           }
+         sum-=ptr;
+         g_atr[i]=sum/period;
+        }
+      else
+         g_atr[i]=sum/(i+1);
+     }
   }
 
 //--- one setup: sweep of the liquidity + tap inside the FVG + reclaim
@@ -396,6 +548,8 @@ void Analyse(const int n,const datetime &time[],const double &high[],
    ArrayResize(g_setups,0);
    g_curLq=0.0; g_curBos=0.0; g_curLqIdx=-1; g_curBosIdx=-1;
 
+   BuildAtr(n,high,low,close);
+
 //--- swing highs / lows (fractals)
    for(int i=start+w; i<n-w; i++)
      {
@@ -410,11 +564,14 @@ void Analyse(const int n,const datetime &time[],const double &high[],
       if(isLow)  AddSwing(i,low[i],false);
      }
 
-//--- fair value gaps (3-candle imbalance)
+//--- fair value gaps (3-candle imbalance), only the ones worth trading
    for(int j=start+2; j<n; j++)
      {
-      if(low[j]>high[j-2])  AddFvg(j,low[j],high[j-2],true,n,close);
-      if(high[j]<low[j-2])  AddFvg(j,low[j-2],high[j],false,n,close);
+      double minH=g_atr[j]*InpMinFvgAtrPct/100.0;
+      if(low[j]>high[j-2] && (low[j]-high[j-2])>=minH)
+         AddFvg(j,low[j],high[j-2],true,n,close);
+      if(high[j]<low[j-2] && (low[j-2]-high[j])>=minH)
+         AddFvg(j,low[j-2],high[j],false,n,close);
      }
 
 //--- walk forward, keeping the last confirmed structure, and test each bar
@@ -486,10 +643,10 @@ void DrawFvgBox(const int fvgIdx,const int n,const datetime &time[],const dateti
    int leftIdx=g_fvg[fvgIdx].formed-2;
    if(leftIdx<0) leftIdx=0;
    datetime t1=BarTime(leftIdx,n,time);
-   PutBox(id,t1,g_fvg[fvgIdx].top,rightEdge,g_fvg[fvgIdx].bottom,InpFvgFill);
+   PutBox(id,t1,g_fvg[fvgIdx].top,rightEdge,g_fvg[fvgIdx].bottom,c_fvgFill);
    double mid=(g_fvg[fvgIdx].top+g_fvg[fvgIdx].bottom)*0.5;
-   PutSegment(id+"m",t1,rightEdge,mid,clrGainsboro,STYLE_DASH,1);
-   PutText(id+"t",t1,mid,"FVG",InpFvgText,8,ANCHOR_LEFT);
+   PutSegment(id+"m",t1,rightEdge,mid,c_fvgMid,STYLE_DASH,1);
+   PutText(id+"t",t1,mid,"FVG",c_fvgText,8,ANCHOR_LEFT);
   }
 
 void DrawSetup(const int slot,const TradeSetup &st,const int n,
@@ -503,24 +660,24 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
 
 //--- the conditions that produced this trade
    DrawFvgBox(st.fvgIdx,n,time,rightEdge);
-   PutSegment(id+"lq",BarTime(st.lqIdx,n,time),rightEdge,st.lq,InpLevelColor,STYLE_DOT,1);
-   PutText(id+"lqT",rightEdge,st.lq,"LQ  "+Px(st.lq),InpLabelColor,8,ANCHOR_RIGHT_UPPER);
-   PutSegment(id+"bos",BarTime(st.bosIdx,n,time),rightEdge,st.bos,InpLevelColor,STYLE_DOT,1);
-   PutText(id+"bosT",rightEdge,st.bos,"BOS  "+Px(st.bos),InpLabelColor,8,ANCHOR_RIGHT_UPPER);
+   PutSegment(id+"lq",BarTime(st.lqIdx,n,time),rightEdge,st.lq,c_level,STYLE_DOT,1);
+   PutText(id+"lqT",rightEdge,st.lq,"LQ  "+Px(st.lq),c_label,8,ANCHOR_RIGHT_UPPER);
+   PutSegment(id+"bos",BarTime(st.bosIdx,n,time),rightEdge,st.bos,c_level,STYLE_DOT,1);
+   PutText(id+"bosT",rightEdge,st.bos,"BOS  "+Px(st.bos),c_label,8,ANCHOR_RIGHT_UPPER);
 
 //--- the trade itself (green = target zone, red = risk zone)
-   PutBox(id+"win",t0,st.entry,t1,st.tp,InpProfitFill);
-   PutBox(id+"loss",t0,st.entry,t1,st.sl,InpRiskFill);
-   PutSegment(id+"entry",t0,t1,st.entry,InpEntryColor,STYLE_DOT,1);
-   PutSegment(id+"tp1",t0,t1,st.tp1,InpTpColor,STYLE_DOT,1);
-   PutSegment(id+"tp",t0,t1,st.tp,InpTpColor,STYLE_DOT,1);
-   PutSegment(id+"sl",t0,t1,st.sl,InpSlColor,STYLE_DOT,1);
+   PutBox(id+"win",t0,st.entry,t1,st.tp,c_profit);
+   PutBox(id+"loss",t0,st.entry,t1,st.sl,c_risk);
+   PutSegment(id+"entry",t0,t1,st.entry,c_entry,STYLE_DOT,1);
+   PutSegment(id+"tp1",t0,t1,st.tp1,c_tp,STYLE_DOT,1);
+   PutSegment(id+"tp",t0,t1,st.tp,c_tp,STYLE_DOT,1);
+   PutSegment(id+"sl",t0,t1,st.sl,c_sl,STYLE_DOT,1);
 
    string side=st.bullish ? "BUY" : "SELL";
-   PutText(id+"eT",t1,st.entry,side+"  "+Px(st.entry),InpEntryColor,8,ANCHOR_LEFT);
-   PutText(id+"t1T",t1,st.tp1,"TP #1  "+Px(st.tp1),InpLabelColor,8,ANCHOR_LEFT);
-   PutText(id+"tT",t1,st.tp,"TP  "+Px(st.tp),InpTpColor,8,ANCHOR_LEFT);
-   PutText(id+"sT",t1,st.sl,"SL  "+Px(st.sl),InpSlColor,8,ANCHOR_LEFT);
+   PutText(id+"eT",t1,st.entry,side+"  "+Px(st.entry),c_entry,8,ANCHOR_LEFT);
+   PutText(id+"t1T",t1,st.tp1,"TP #1  "+Px(st.tp1),c_label,8,ANCHOR_LEFT);
+   PutText(id+"tT",t1,st.tp,"TP  "+Px(st.tp),c_tp,8,ANCHOR_LEFT);
+   PutText(id+"sT",t1,st.sl,"SL  "+Px(st.sl),c_sl,8,ANCHOR_LEFT);
 
 //--- result, the way the video ends with "378 PIPS"
    double risk   = st.bullish ? st.entry-st.sl : st.sl-st.entry;
@@ -528,68 +685,83 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
    string rr=DoubleToString(reward/risk,2)+"R";
    string res;
    color  rc;
-   if(st.result>0)      { res="+"+PipsText(reward)+" PIPS   "+rr; rc=clrLime;   }
-   else if(st.result<0) { res="-"+PipsText(risk)+" PIPS   "+rr;   rc=clrTomato; }
-   else                 { res="running   "+rr;                    rc=clrSilver; }
-   double labelPrice = st.bullish ? st.sl-risk*0.30 : st.sl+risk*0.30;
+   if(st.result>0)      { res="+"+PipsText(reward)+" PIPS   "+rr; rc=c_win;  }
+   else if(st.result<0) { res="-"+PipsText(risk)+" PIPS   "+rr;   rc=c_loss; }
+   else                 { res="running   "+rr;                    rc=c_open; }
+   double labelPrice = st.bullish ? st.sl-risk*0.35 : st.sl+risk*0.35;
    PutText(id+"res",t0,labelPrice,res,rc,10,ANCHOR_LEFT);
   }
 
 void DrawPanel()
   {
    int total=ArraySize(g_setups);
-   PutPanelLine(PREFIX+"p0",10,20,"SMC video strategy",clrWhite);
-   PutPanelLine(PREFIX+"p1",10,38,"1. FVG zones valid : "+IntegerToString(g_validFvg),InpFvgText);
-   PutPanelLine(PREFIX+"p2",10,54,"2. Liquidity (LQ)  : "+(g_curLqIdx>=0?Px(g_curLq):"-"),InpLabelColor);
-   PutPanelLine(PREFIX+"p3",10,70,"3. Structure (BOS) : "+(g_curBosIdx>=0?Px(g_curBos):"-"),InpLabelColor);
+   PutPanelLine(PREFIX+"p0",10,20,"SMC video strategy",c_level);
+   PutPanelLine(PREFIX+"p1",10,38,"1. FVG zones valid : "+IntegerToString(g_validFvg),c_fvgText);
+   PutPanelLine(PREFIX+"p2",10,54,"2. Liquidity (LQ)  : "+(g_curLqIdx>=0?Px(g_curLq):"-"),c_label);
+   PutPanelLine(PREFIX+"p3",10,70,"3. Structure (BOS) : "+(g_curBosIdx>=0?Px(g_curBos):"-"),c_label);
    string last="none";
    if(total>0)
      {
       TradeSetup s=g_setups[total-1];
       last=(s.bullish?"BUY ":"SELL ")+Px(s.entry)+"  SL "+Px(s.sl)+"  TP "+Px(s.tp);
      }
-   PutPanelLine(PREFIX+"p4",10,88,"Last setup : "+last,clrWhite);
+   PutPanelLine(PREFIX+"p4",10,88,"Last setup : "+last,c_level);
   }
 
-void Redraw(const int n,const datetime &time[])
+void Redraw(const int n,const datetime &time[],const double &close[])
   {
    ObjectsDeleteAll(0,PREFIX);
    datetime rightEdge=time[n-1]+(datetime)(PeriodSeconds()*8);
 
-//--- every still-valid fair value gap (condition 1 drawn as it forms)
-   if(InpShowFvgBoxes)
+//--- the trades: newest first, one by default (exactly like the video)
+   int total=ArraySize(g_setups);
+   int shown=InpMaxSetups;
+   if(shown<0) shown=0;
+   int from=total-shown;
+   if(from<0) from=0;
+   for(int s=from; s<total; s++)
+      DrawSetup(s,g_setups[s],n,time,rightEdge);
+
+//--- the nearest valid gaps that are still in play (condition 1)
+   if(InpShowFvgBoxes && InpMaxFvgBoxes>0)
      {
-      int drawn=0;
+      double price=close[n-1];
+      double reach=g_atr[n-1]*20.0;
+      int    drawn=0;
       for(int i=ArraySize(g_fvg)-1; i>=0 && drawn<InpMaxFvgBoxes; i--)
         {
-         if(g_fvg[i].mitigated<n)
-            continue;
+         if(g_fvg[i].mitigated<n)                 continue;   // already filled
+         if(n-1-g_fvg[i].formed>InpFvgMaxAgeBars) continue;   // too old
+         double mid=(g_fvg[i].top+g_fvg[i].bottom)*0.5;
+         if(MathAbs(price-mid)>reach)             continue;   // far away from price
          DrawFvgBox(i,n,time,rightEdge);
          drawn++;
         }
      }
 
-//--- current liquidity and structure levels (conditions 2 and 3)
+//--- current liquidity and structure levels (conditions 2 and 3),
+//--- skipped when the drawn trade already shows the same levels
    if(InpShowLevels)
      {
-      if(g_curLqIdx>=0)
+      bool lqShown=false, bosShown=false;
+      for(int s=from; s<total; s++)
         {
-         PutSegment(PREFIX+"curLQ",BarTime(g_curLqIdx,n,time),rightEdge,g_curLq,InpLevelColor,STYLE_DOT,1);
-         PutText(PREFIX+"curLQt",rightEdge,g_curLq,"LQ  "+Px(g_curLq),InpLabelColor,8,ANCHOR_RIGHT_UPPER);
+         if(g_setups[s].lqIdx==g_curLqIdx)   lqShown=true;
+         if(g_setups[s].bosIdx==g_curBosIdx) bosShown=true;
+         if(g_setups[s].lqIdx==g_curBosIdx)  bosShown=true;
+         if(g_setups[s].bosIdx==g_curLqIdx)  lqShown=true;
         }
-      if(g_curBosIdx>=0)
+      if(g_curLqIdx>=0 && !lqShown)
         {
-         PutSegment(PREFIX+"curBOS",BarTime(g_curBosIdx,n,time),rightEdge,g_curBos,InpLevelColor,STYLE_DOT,1);
-         PutText(PREFIX+"curBOSt",rightEdge,g_curBos,"BOS  "+Px(g_curBos),InpLabelColor,8,ANCHOR_RIGHT_UPPER);
+         PutSegment(PREFIX+"curLQ",BarTime(g_curLqIdx,n,time),rightEdge,g_curLq,c_level,STYLE_DOT,1);
+         PutText(PREFIX+"curLQt",rightEdge,g_curLq,"LQ  "+Px(g_curLq),c_label,8,ANCHOR_RIGHT_UPPER);
+        }
+      if(g_curBosIdx>=0 && !bosShown)
+        {
+         PutSegment(PREFIX+"curBOS",BarTime(g_curBosIdx,n,time),rightEdge,g_curBos,c_level,STYLE_DOT,1);
+         PutText(PREFIX+"curBOSt",rightEdge,g_curBos,"BOS  "+Px(g_curBos),c_label,8,ANCHOR_RIGHT_UPPER);
         }
      }
-
-//--- the trades
-   int total=ArraySize(g_setups);
-   int from=total-InpMaxSetups;
-   if(from<0) from=0;
-   for(int s=from; s<total; s++)
-      DrawSetup(s,g_setups[s],n,time,rightEdge);
 
    if(InpShowPanel)
       DrawPanel();
@@ -643,7 +815,7 @@ int OnCalculate(const int rates_total,
    g_lastBarTime=time[rates_total-1];
 
    Analyse(rates_total,time,high,low,close);
-   Redraw(rates_total,time);
+   Redraw(rates_total,time,close);
    CheckAlerts(rates_total);
    ChartRedraw();
    return(rates_total);
