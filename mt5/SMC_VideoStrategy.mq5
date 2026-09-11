@@ -12,7 +12,7 @@
 //|  Works on every symbol and every timeframe (nothing hardcoded).   |
 //+------------------------------------------------------------------+
 #property copyright   "zalfeni-sabri"
-#property version     "2.00"
+#property version     "2.10"
 #property description "SMC: Fair Value Gap + Liquidity sweep + Break of Structure target."
 #property description "Draws the FVG, the LQ/BOS levels and the trade box, exactly like the video."
 #property indicator_chart_window
@@ -37,12 +37,14 @@ input bool   InpRequireCE      = false;  // Require the wick to reach the FVG mi
 input bool   InpAllowBuys      = true;   // Detect buy setups
 input bool   InpAllowSells     = true;   // Detect sell setups
 input double InpMinRR          = 0.0;    // Minimum reward:risk (0 = no filter)
+input bool   InpOneTradeAtATime= true;   // Ignore a new setup while the previous trade is open
 input bool   InpEntryAtClose   = false;  // true = fill at the reclaim bar's close instead of at the level
 //--- Trade levels ---------------------------------------------------
 input double InpBufferPercent  = 25.0;   // SL/TP buffer (% of FVG height)
 input double InpTP1Percent     = 50.0;   // TP #1 (% of the distance to the target)
 //--- Drawing ---------------------------------------------------------
-input int    InpMaxTrades      = 30;     // How many past trades to keep drawn (0 = all)
+input int    InpMaxTrades      = 10;     // How many past trades to keep drawn (0 = all)
+input bool   InpShowPrices     = false;  // Add the price next to every label (crowds the chart)
 input int    InpTradeBoxBars   = 30;     // Trade box width in bars
 input bool   InpShowCurrentLevels = true;// Extend today's LQ / BOS to the right edge
 input bool   InpAutoContrast   = true;   // Adapt the drawing colors to the chart background
@@ -179,14 +181,23 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 //| Helpers                                                           |
 //+------------------------------------------------------------------+
+double g_pip=0.0;
+
+//--- one pip, resolved once per pass from the symbol and the current price:
+//--- metals and other 2/3-digit instruments quoted in the hundreds or more
+//--- (gold at 4,300) use 0.1, 3/5-digit FX uses 10 points, the rest 1 point.
+void ResolvePip(const double price)
+  {
+   if(InpPipSize>0.0)              { g_pip=InpPipSize;     return; }
+   int d=(int)_Digits;
+   if(d<=3 && price>=500.0)        { g_pip=0.1;            return; }
+   if(d==3 || d==5)                { g_pip=10.0*_Point;    return; }
+   g_pip=_Point;
+  }
+
 double PipSize()
   {
-   if(InpPipSize>0.0)
-      return(InpPipSize);
-   int d=(int)_Digits;
-   if(d==2 || d==3 || d==5)     // gold-style and 5-digit FX
-      return(10.0*_Point);
-   return(_Point);
+   return(g_pip>0.0 ? g_pip : _Point);
   }
 
 string PipsText(const double diff)
@@ -496,6 +507,7 @@ void Analyse(const int n,const datetime &time[],const double &high[],
    ArrayResize(g_setups,0);
    g_curLq=0.0; g_curBos=0.0; g_curLqIdx=-1; g_curBosIdx=-1;
 
+   ResolvePip(close[n-1]);
    BuildAtr(n,high,low,close);
 
 //--- swing highs / lows (fractals)
@@ -528,6 +540,7 @@ void Analyse(const int n,const datetime &time[],const double &high[],
    double curHigh=0.0, curLow=0.0;
    int    curHighIdx=-1, curLowIdx=-1;
    int    usedBuyLq=-1, usedSellLq=-1;
+   int    busyUntil=-1;               // no new setup while a trade is still open
    TradeSetup st;
 
    for(int k=start; k<n; k++)
@@ -539,6 +552,9 @@ void Analyse(const int n,const datetime &time[],const double &high[],
          p++;
         }
 
+      if(InpOneTradeAtATime && k<=busyUntil)
+         continue;
+
       if(InpAllowBuys && curLowIdx>=0 && curHighIdx>=0 && curLowIdx!=usedBuyLq)
         {
          if(TryBuildSetup(true,k,curLow,curLowIdx,curHigh,curHighIdx,n,time,high,low,close,st))
@@ -547,6 +563,8 @@ void Analyse(const int n,const datetime &time[],const double &high[],
             ArrayResize(g_setups,sz+1);
             g_setups[sz]=st;
             usedBuyLq=curLowIdx;
+            busyUntil=(st.resultIdx>=0)?st.resultIdx:n;
+            continue;
            }
         }
 
@@ -558,6 +576,7 @@ void Analyse(const int n,const datetime &time[],const double &high[],
             ArrayResize(g_setups,sz+1);
             g_setups[sz]=st;
             usedSellLq=curHighIdx;
+            busyUntil=(st.resultIdx>=0)?st.resultIdx:n;
            }
         }
      }
@@ -605,9 +624,9 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
 
 //--- the two levels
    PutSegment(id+"lq",BarTime(st.lqIdx,n,time),t1,st.lq,c_level,STYLE_DOT,1);
-   PutText(id+"lqT",t1,st.lq,"LQ  "+Px(st.lq),c_label,8,ANCHOR_LEFT);
+   PutText(id+"lqT",t1,st.lq,InpShowPrices?"LQ  "+Px(st.lq):"LQ",c_label,8,ANCHOR_LEFT);
    PutSegment(id+"bos",BarTime(st.bosIdx,n,time),t1,st.bos,c_level,STYLE_DOT,1);
-   PutText(id+"bosT",t1,st.bos,"BOS  "+Px(st.bos),c_label,8,ANCHOR_LEFT);
+   PutText(id+"bosT",t1,st.bos,InpShowPrices?"BOS  "+Px(st.bos):"BOS",c_label,8,ANCHOR_LEFT);
 
 //--- the trade (green = target zone, red = risk zone)
    PutBox(id+"win",t0,st.entry,t1,st.tp,c_profit);
@@ -617,10 +636,13 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
    PutSegment(id+"sl",t0,t1,st.sl,c_sl,STYLE_DOT,1);
 
    string side=st.bullish ? "BUY" : "SELL";
-   PutText(id+"eT",t1,st.entry,side+"  "+Px(st.entry),c_entry,8,ANCHOR_LEFT);
-   PutText(id+"t1T",t1,st.tp1,"TP #1  "+Px(st.tp1),c_label,8,ANCHOR_LEFT);
-   PutText(id+"tT",t1,st.tp,"TP  "+Px(st.tp),c_tp,8,ANCHOR_LEFT);
-   PutText(id+"sT",t1,st.sl,"SL  "+Px(st.sl),c_sl,8,ANCHOR_LEFT);
+   PutText(id+"eT",t1,st.entry,InpShowPrices?side+"  "+Px(st.entry):side,c_entry,8,ANCHOR_LEFT);
+   if(InpShowPrices)
+     {
+      PutText(id+"t1T",t1,st.tp1,"TP #1  "+Px(st.tp1),c_label,8,ANCHOR_LEFT);
+      PutText(id+"tT",t1,st.tp,"TP  "+Px(st.tp),c_tp,8,ANCHOR_LEFT);
+      PutText(id+"sT",t1,st.sl,"SL  "+Px(st.sl),c_sl,8,ANCHOR_LEFT);
+     }
 
 //--- result, the way the video ends with "378 PIPS"
    double risk   = st.bullish ? st.entry-st.sl : st.sl-st.entry;
@@ -653,7 +675,7 @@ void Redraw(const int n,const datetime &time[])
       if(g_curLqIdx>=0)
         {
          PutSegment(PREFIX+"curLQ",BarTime(g_curLqIdx,n,time),rightEdge,g_curLq,c_level,STYLE_DOT,1);
-         PutText(PREFIX+"curLQt",rightEdge,g_curLq,"LQ  "+Px(g_curLq),c_label,8,ANCHOR_RIGHT_UPPER);
+         PutText(PREFIX+"curLQt",rightEdge,g_curLq,"LQ  "+Px(g_curLq),c_label,8,ANCHOR_RIGHT_UPPER);   // current level keeps its price
         }
       if(g_curBosIdx>=0)
         {
