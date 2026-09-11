@@ -12,7 +12,7 @@
 //|  Works on every symbol and every timeframe (nothing hardcoded).   |
 //+------------------------------------------------------------------+
 #property copyright   "zalfeni-sabri"
-#property version     "1.50"
+#property version     "2.00"
 #property description "SMC: Fair Value Gap + Liquidity sweep + Break of Structure target."
 #property description "Draws the FVG, the LQ/BOS levels and the trade box, exactly like the video."
 #property indicator_chart_window
@@ -27,11 +27,12 @@
 #define RES_STOP     (-1)
 
 //--- Setup detection ------------------------------------------------
-input int    InpLookbackBars   = 600;    // Bars analysed
+input int    InpLookbackBars   = 5000;   // Bars analysed (history depth)
 input int    InpSwingWindow    = 3;      // Swing (fractal) window
 input int    InpReclaimBars    = 3;      // Bars the stop order at the swept level stays valid
 input int    InpAtrPeriod      = 14;     // ATR period (used to size the gaps)
 input double InpMinFvgAtrPct   = 30.0;   // Minimum FVG height (% of ATR) - kills micro gaps
+input int    InpFvgMaxAgeBars  = 500;    // Ignore gaps older than this (0 = no limit)
 input bool   InpRequireCE      = false;  // Require the wick to reach the FVG mid (CE)
 input bool   InpAllowBuys      = true;   // Detect buy setups
 input bool   InpAllowSells     = true;   // Detect sell setups
@@ -40,15 +41,11 @@ input bool   InpEntryAtClose   = false;  // true = fill at the reclaim bar's clo
 //--- Trade levels ---------------------------------------------------
 input double InpBufferPercent  = 25.0;   // SL/TP buffer (% of FVG height)
 input double InpTP1Percent     = 50.0;   // TP #1 (% of the distance to the target)
-//--- Look -----------------------------------------------------------
-input bool   InpAutoContrast   = true;   // Adapt the palette to a light chart background
-input int    InpMaxSetups      = 1;      // Trades drawn (1 = only the latest, like the video)
+//--- Drawing ---------------------------------------------------------
+input int    InpMaxTrades      = 30;     // How many past trades to keep drawn (0 = all)
 input int    InpTradeBoxBars   = 30;     // Trade box width in bars
-input bool   InpShowFvgBoxes   = true;   // Draw the nearest valid FVG zones
-input int    InpMaxFvgBoxes    = 1;      // How many of them (the trade's own gap counts too)
-input int    InpFvgMaxAgeBars  = 300;    // Ignore gaps older than this
-input bool   InpShowLevels     = true;   // Draw the current LQ / BOS levels
-input bool   InpShowPanel      = false;  // Checklist panel (top-left)
+input bool   InpShowCurrentLevels = true;// Extend today's LQ / BOS to the right edge
+input bool   InpAutoContrast   = true;   // Adapt the drawing colors to the chart background
 input double InpPipSize        = 0.0;    // Pip size for the result label (0 = auto)
 //--- Alerts ---------------------------------------------------------
 input bool   InpAlertPopup     = true;   // Popup alert on a new setup
@@ -107,7 +104,6 @@ double      g_curLq   = 0.0;   // last confirmed swing low  (liquidity for buys)
 double      g_curBos  = 0.0;   // last confirmed swing high (target for buys)
 int         g_curLqIdx  = -1;
 int         g_curBosIdx = -1;
-int         g_validFvg  = 0;
 datetime    g_lastBarTime   = 0;
 datetime    g_lastAlertTime = 0;
 
@@ -264,20 +260,6 @@ void PutText(const string name,const datetime t,const double price,const string 
    StyleObject(name);
   }
 
-void PutPanelLine(const string name,const int x,const int y,const string txt,const color clr)
-  {
-   if(ObjectFind(0,name)<0)
-      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
-   ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);
-   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
-   ObjectSetString(0,name,OBJPROP_TEXT,txt);
-   ObjectSetString(0,name,OBJPROP_FONT,"Consolas");
-   ObjectSetInteger(0,name,OBJPROP_FONTSIZE,9);
-   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
-   StyleObject(name);
-  }
-
 //+------------------------------------------------------------------+
 //| Analysis                                                          |
 //+------------------------------------------------------------------+
@@ -369,6 +351,8 @@ bool TryBuildSetup(const bool bullish,const int k,
    int    fi=-1;
    for(int i=ArraySize(g_fvg)-1; i>=0; i--)
      {
+      //--- zones are stored oldest first, so once one is too old the rest are too
+      if(InpFvgMaxAgeBars>0 && g_fvg[i].formed<k-InpFvgMaxAgeBars) break;
       if(g_fvg[i].bullish!=bullish)    continue;
       if(g_fvg[i].formed>k-1)          continue;
       if(g_fvg[i].mitigated<=k)        continue;
@@ -580,11 +564,6 @@ void Analyse(const int n,const datetime &time[],const double &high[],
 
    g_curLq=curLow;   g_curLqIdx=curLowIdx;
    g_curBos=curHigh; g_curBosIdx=curHighIdx;
-
-   g_validFvg=0;
-   for(int i=0; i<ArraySize(g_fvg); i++)
-      if(g_fvg[i].mitigated>=n)
-         g_validFvg++;
   }
 
 //+------------------------------------------------------------------+
@@ -599,20 +578,6 @@ datetime BarTime(const int idx,const int n,const datetime &time[])
    return(time[n-1]+(datetime)(PeriodSeconds()*(idx-(n-1))));
   }
 
-void DrawFvgBox(const int fvgIdx,const int n,const datetime &time[],const datetime rightEdge)
-  {
-   if(fvgIdx<0 || fvgIdx>=ArraySize(g_fvg))
-      return;
-   string id=PREFIX+"FVG"+IntegerToString(g_fvg[fvgIdx].formed);
-   int leftIdx=g_fvg[fvgIdx].formed-2;
-   if(leftIdx<0) leftIdx=0;
-   datetime t1=BarTime(leftIdx,n,time);
-   PutBox(id,t1,g_fvg[fvgIdx].top,rightEdge,g_fvg[fvgIdx].bottom,c_fvgFill);
-   double mid=(g_fvg[fvgIdx].top+g_fvg[fvgIdx].bottom)*0.5;
-   PutSegment(id+"m",t1,rightEdge,mid,c_fvgMid,STYLE_DASH,1);
-   PutText(id+"t",t1,mid,"FVG",c_fvgText,8,ANCHOR_LEFT);
-  }
-
 void DrawSetup(const int slot,const TradeSetup &st,const int n,
                const datetime &time[],const datetime rightEdge)
   {
@@ -620,21 +585,35 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
    int width=InpTradeBoxBars;
    if(width<1) width=1;
    datetime t0=BarTime(st.entryIdx,n,time);
+//--- everything for this trade stops at the end of its own box, so old
+//--- trades stay local instead of striping the whole chart. Only a trade
+//--- that is still open keeps running to the right edge.
    datetime t1=BarTime(st.entryIdx+width,n,time);
+   if(st.result==RES_RUNNING && t1<rightEdge)
+      t1=rightEdge;
 
-//--- the conditions that produced this trade
-   DrawFvgBox(st.fvgIdx,n,time,rightEdge);
-   PutSegment(id+"lq",BarTime(st.lqIdx,n,time),rightEdge,st.lq,c_level,STYLE_DOT,1);
-   PutText(id+"lqT",rightEdge,st.lq,"LQ  "+Px(st.lq),c_label,8,ANCHOR_RIGHT_UPPER);
-   PutSegment(id+"bos",BarTime(st.bosIdx,n,time),rightEdge,st.bos,c_level,STYLE_DOT,1);
-   PutText(id+"bosT",rightEdge,st.bos,"BOS  "+Px(st.bos),c_label,8,ANCHOR_RIGHT_UPPER);
+//--- the gap that produced it
+   int fvgLeft=st.fvgIdx>=0 && st.fvgIdx<ArraySize(g_fvg) ? g_fvg[st.fvgIdx].formed-2 : -1;
+   if(fvgLeft>=0)
+     {
+      datetime tf=BarTime(fvgLeft,n,time);
+      PutBox(id+"fvg",tf,st.fvgTop,t1,st.fvgBottom,c_fvgFill);
+      double mid=(st.fvgTop+st.fvgBottom)*0.5;
+      PutSegment(id+"fvgm",tf,t1,mid,c_fvgMid,STYLE_DASH,1);
+      PutText(id+"fvgt",tf,mid,"FVG",c_fvgText,8,ANCHOR_LEFT);
+     }
 
-//--- the trade itself (green = target zone, red = risk zone)
+//--- the two levels
+   PutSegment(id+"lq",BarTime(st.lqIdx,n,time),t1,st.lq,c_level,STYLE_DOT,1);
+   PutText(id+"lqT",t1,st.lq,"LQ  "+Px(st.lq),c_label,8,ANCHOR_LEFT);
+   PutSegment(id+"bos",BarTime(st.bosIdx,n,time),t1,st.bos,c_level,STYLE_DOT,1);
+   PutText(id+"bosT",t1,st.bos,"BOS  "+Px(st.bos),c_label,8,ANCHOR_LEFT);
+
+//--- the trade (green = target zone, red = risk zone)
    PutBox(id+"win",t0,st.entry,t1,st.tp,c_profit);
    PutBox(id+"loss",t0,st.entry,t1,st.sl,c_risk);
    PutSegment(id+"entry",t0,t1,st.entry,c_entry,STYLE_DOT,1);
    PutSegment(id+"tp1",t0,t1,st.tp1,c_tp,STYLE_DOT,1);
-   PutSegment(id+"tp",t0,t1,st.tp,c_tp,STYLE_DOT,1);
    PutSegment(id+"sl",t0,t1,st.sl,c_sl,STYLE_DOT,1);
 
    string side=st.bullish ? "BUY" : "SELL";
@@ -649,86 +628,39 @@ void DrawSetup(const int slot,const TradeSetup &st,const int n,
    string rr=DoubleToString(reward/risk,2)+"R";
    string res;
    color  rc;
-   if(st.result==RES_TARGET)       { res="+"+PipsText(reward)+" PIPS   "+rr; rc=c_win;  }
-   else if(st.result==RES_STOP)    { res="-"+PipsText(risk)+" PIPS   "+rr;   rc=c_loss; }
-   else                            { res="running   "+rr;                    rc=c_open; }
+   if(st.result==RES_TARGET)    { res="+"+PipsText(reward)+" PIPS   "+rr; rc=c_win;  }
+   else if(st.result==RES_STOP) { res="-"+PipsText(risk)+" PIPS   "+rr;   rc=c_loss; }
+   else                         { res="running   "+rr;                    rc=c_open; }
    double labelPrice = st.bullish ? st.sl-risk*0.35 : st.sl+risk*0.35;
-   PutText(id+"res",t0,labelPrice,res,rc,10,ANCHOR_LEFT);
+   PutText(id+"res",t0,labelPrice,res,rc,9,ANCHOR_LEFT);
   }
 
-void DrawPanel()
-  {
-   int total=ArraySize(g_setups);
-   PutPanelLine(PREFIX+"p0",10,20,"SMC video strategy",c_level);
-   PutPanelLine(PREFIX+"p1",10,38,"1. FVG zones valid : "+IntegerToString(g_validFvg),c_fvgText);
-   PutPanelLine(PREFIX+"p2",10,54,"2. Liquidity (LQ)  : "+(g_curLqIdx>=0?Px(g_curLq):"-"),c_label);
-   PutPanelLine(PREFIX+"p3",10,70,"3. Structure (BOS) : "+(g_curBosIdx>=0?Px(g_curBos):"-"),c_label);
-   string last="none";
-   if(total>0)
-     {
-      TradeSetup s=g_setups[total-1];
-      last=(s.bullish?"BUY ":"SELL ")+Px(s.entry)+"  SL "+Px(s.sl)+"  TP "+Px(s.tp);
-     }
-   PutPanelLine(PREFIX+"p4",10,88,"Last setup : "+last,c_level);
-  }
-
-void Redraw(const int n,const datetime &time[],const double &close[])
+void Redraw(const int n,const datetime &time[])
   {
    ObjectsDeleteAll(0,PREFIX);
    datetime rightEdge=time[n-1]+(datetime)(PeriodSeconds()*8);
 
-//--- the trades: newest first, one by default (exactly like the video)
+//--- the trades, newest last; each one draws only its own gap and levels
    int total=ArraySize(g_setups);
-   int shown=InpMaxSetups;
-   if(shown<0) shown=0;
-   int from=total-shown;
+   int from=(InpMaxTrades>0) ? total-InpMaxTrades : 0;
    if(from<0) from=0;
    for(int s=from; s<total; s++)
       DrawSetup(s,g_setups[s],n,time,rightEdge);
 
-//--- the nearest valid gaps that are still in play (condition 1)
-   if(InpShowFvgBoxes && InpMaxFvgBoxes>0)
+//--- where liquidity and structure sit right now (two lines, nothing else)
+   if(InpShowCurrentLevels)
      {
-      double price=close[n-1];
-      double reach=g_atr[n-1]*20.0;
-      int    drawn=total-from;         // the gaps already drawn with the trades
-      for(int i=ArraySize(g_fvg)-1; i>=0 && drawn<InpMaxFvgBoxes; i--)
-        {
-         if(g_fvg[i].mitigated<n)                 continue;   // already filled
-         if(n-1-g_fvg[i].formed>InpFvgMaxAgeBars) continue;   // too old
-         double mid=(g_fvg[i].top+g_fvg[i].bottom)*0.5;
-         if(MathAbs(price-mid)>reach)             continue;   // far away from price
-         DrawFvgBox(i,n,time,rightEdge);
-         drawn++;
-        }
-     }
-
-//--- current liquidity and structure levels (conditions 2 and 3),
-//--- skipped when the drawn trade already shows the same levels
-   if(InpShowLevels)
-     {
-      bool lqShown=false, bosShown=false;
-      for(int s=from; s<total; s++)
-        {
-         if(g_setups[s].lqIdx==g_curLqIdx)   lqShown=true;
-         if(g_setups[s].bosIdx==g_curBosIdx) bosShown=true;
-         if(g_setups[s].lqIdx==g_curBosIdx)  bosShown=true;
-         if(g_setups[s].bosIdx==g_curLqIdx)  lqShown=true;
-        }
-      if(g_curLqIdx>=0 && !lqShown)
+      if(g_curLqIdx>=0)
         {
          PutSegment(PREFIX+"curLQ",BarTime(g_curLqIdx,n,time),rightEdge,g_curLq,c_level,STYLE_DOT,1);
          PutText(PREFIX+"curLQt",rightEdge,g_curLq,"LQ  "+Px(g_curLq),c_label,8,ANCHOR_RIGHT_UPPER);
         }
-      if(g_curBosIdx>=0 && !bosShown)
+      if(g_curBosIdx>=0)
         {
          PutSegment(PREFIX+"curBOS",BarTime(g_curBosIdx,n,time),rightEdge,g_curBos,c_level,STYLE_DOT,1);
          PutText(PREFIX+"curBOSt",rightEdge,g_curBos,"BOS  "+Px(g_curBos),c_label,8,ANCHOR_RIGHT_UPPER);
         }
      }
-
-   if(InpShowPanel)
-      DrawPanel();
   }
 
 void CheckAlerts(const int n)
@@ -779,7 +711,7 @@ int OnCalculate(const int rates_total,
    g_lastBarTime=time[rates_total-1];
 
    Analyse(rates_total,time,high,low,close);
-   Redraw(rates_total,time,close);
+   Redraw(rates_total,time);
    CheckAlerts(rates_total);
    ChartRedraw();
    return(rates_total);
