@@ -78,6 +78,8 @@ input int    InpZoneChochBars  = 30;     // Max bars allowed from the sweep to t
 input int    InpZoneLookback   = 60;     // Lookback for the swing the CHoCH must break
 input double InpZonePoolScore  = 40.0;   // Only from sweeps of pools scoring at least this
 input double InpZoneMinRR      = 1.5;    // Hide zones whose reward:risk is below this
+input double InpZoneMinStopATR = 0.5;    // Stop must be at least this many ATR
+input double InpZoneMinStopSpr = 4.0;    // ... and at least this many spreads
 input int    InpZoneMax        = 3;      // Max live zones per direction
 input color  InpZoneLongColor  = clrSeaGreen;
 input color  InpZoneShortColor = clrIndianRed;
@@ -825,6 +827,17 @@ void BuildZones(const int rates_total, const datetime &time[], const double &ope
       double mid     = (z_top + z_bot) / 2.0;
       double risk    = MathAbs(mid - invalid);
       if(risk <= 0.0)
+         continue;
+
+      //--- A stop the market cannot respect is not a stop. Half an ATR is
+      //--- inside one candle's normal range, and a stop under a few spreads
+      //--- is already lost at the moment of entry - both produce a flattering
+      //--- reward:risk that cannot be traded.
+      double min_risk = InpZoneMinStopATR * g_atr;
+      double spread   = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
+      if(InpZoneMinStopSpr * spread > min_risk)
+         min_risk = InpZoneMinStopSpr * spread;
+      if(risk < min_risk)
          continue;
 
       double target = NearestPool(dir, mid);
