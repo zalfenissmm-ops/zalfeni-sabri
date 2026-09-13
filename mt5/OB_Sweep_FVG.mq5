@@ -4,7 +4,7 @@
 //|      أوردر بلوك = كنس سيولة سوينق + كسر هيكل + فجوة سعرية         |
 //+------------------------------------------------------------------+
 #property copyright "zalfeni-sabri"
-#property version   "1.20"
+#property version   "1.30"
 #property description "Sweep of a real swing point -> displacement that shifts structure -> imbalance"
 #property description "كنس قاع/قمة سوينق حقيقية ثم شفت يكسر الهيكل بقوة ثم فجوة سعرية"
 #property description "Works on all timeframes / يعمل على جميع الفريمات"
@@ -27,11 +27,12 @@ input group             "=== Quality filters / فلاتر الجودة ==="
 input int    InpPivotStrength   = 3;     // Swing strength (قوة القمة/القاع: شموع كل جهة)
 input int    InpSweepSearch     = 40;    // Bars searched for that swing (مدى البحث)
 input bool   InpRequireMSS      = true;  // Shift must break structure (الشفت يكسر الهيكل)
-input int    InpMSSBars         = 3;     // Bars allowed for the shift (شموع مسموحة للشفت)
-input double InpDisplaceATR     = 0.8;   // Shift candle body >= x*ATR (قوة شمعة الشفت)
-input double InpMinFVGATR       = 0.15;  // FVG >= x*ATR (أدنى فجوة نسبة لـ ATR)
+input int    InpMSSBars         = 5;     // Bars allowed for the shift (شموع مسموحة للشفت)
+input double InpDisplaceATR     = 1.0;   // Shift leg >= x*ATR (قوة موجة الشفت)
+input double InpMinFVGATR       = 0.10;  // FVG >= x*ATR (أدنى فجوة نسبة لـ ATR)
+input double InpMaxZoneATR      = 2.0;   // Clamp zone height to x*ATR (أقصى ارتفاع للمنطقة)
 input int    InpATRPeriod       = 14;    // ATR period
-input bool   InpRequireOppColor = true;  // OB candle opposite colour (لون معاكس)
+input bool   InpRequireOppColor = false; // OB candle opposite colour (لون معاكس)
 input bool   InpRequireFVG      = true;  // No FVG = invalid (بدون فجوة = غير صالح)
 input bool   InpWickToWick      = true;  // Zone = full range (المنطقة بالذيول)
 input int    InpMaxBars         = 3000;  // History bars to scan (عدد الشموع المفحوصة)
@@ -297,12 +298,21 @@ bool Detect(const int s,const int maxIdx,
    if(atr<=0.0)
       return(false);
 
-   double minFVG = InpMinFVGATR*atr;
-   double minBody= InpDisplaceATR*atr;
+   double minFVG  = InpMinFVGATR*atr;     // size of the imbalance
+   double minLeg  = InpDisplaceATR*atr;   // size of the shift leg
+   double maxZone = InpMaxZoneATR*atr;    // a spike candle must not become a huge zone
+
+   int  win = MathMin(s+g_mssBars,maxIdx);
+   bool isLowest = true, isHighest = true;
+   for(int q=s+1; q<=win; q++)
+     {
+      if(low[q]<low[s])   isLowest  = false;
+      if(high[q]>high[s]) isHighest = false;
+     }
 
 //================= BULLISH =========================================
    int p = FindSwingLow(s,low);
-   if(p>=0 && low[s]<low[p] && close[s]>low[p] &&
+   if(p>=0 && low[s]<low[p] && isLowest &&
       (!InpRequireOppColor || close[s]<open[s]))
      {
       //--- structure level the shift has to break
@@ -312,11 +322,10 @@ bool Detect(const int s,const int maxIdx,
             structHigh = high[q];
       double target = InpRequireMSS ? structHigh : high[s];
 
-      //--- displacement candle that shifts the market
+      //--- leg that shifts the market away from the swept low
       int j = -1;
-      int last = MathMin(s+g_mssBars,maxIdx);
-      for(int x=s+1; x<=last; x++)
-         if(close[x]>target && (close[x]-open[x])>=minBody)
+      for(int x=s+1; x<=win; x++)
+         if(close[x]>target && (close[x]-low[s])>=minLeg)
            { j=x; break; }
 
       if(j>0)
@@ -330,12 +339,17 @@ bool Detect(const int s,const int maxIdx,
 
          if(hasFVG || !InpRequireFVG || InpShowInvalid)
            {
+            double bottom = InpWickToWick ? low[s]  : MathMin(open[s],close[s]);
+            double top    = InpWickToWick ? high[s] : MathMax(open[s],close[s]);
+            if(maxZone>0.0 && (top-bottom)>maxZone)
+               top = bottom+maxZone;
+
             z.tStart     = time[s];
             z.dir        = 1;
             z.hasFVG     = hasFVG;
             z.valid      = (InpRequireFVG ? hasFVG : true);
-            z.obTop      = InpWickToWick ? high[s] : MathMax(open[s],close[s]);
-            z.obBottom   = InpWickToWick ? low[s]  : MathMin(open[s],close[s]);
+            z.obTop      = top;
+            z.obBottom   = bottom;
             z.fvgTop     = fTop;
             z.fvgBottom  = fBot;
             z.sweepLevel = low[p];
@@ -351,7 +365,7 @@ bool Detect(const int s,const int maxIdx,
 
 //================= BEARISH =========================================
    int ph = FindSwingHigh(s,high);
-   if(ph>=0 && high[s]>high[ph] && close[s]<high[ph] &&
+   if(ph>=0 && high[s]>high[ph] && isHighest &&
       (!InpRequireOppColor || close[s]>open[s]))
      {
       double structLow = low[s];
@@ -361,9 +375,8 @@ bool Detect(const int s,const int maxIdx,
       double target = InpRequireMSS ? structLow : low[s];
 
       int j = -1;
-      int last = MathMin(s+g_mssBars,maxIdx);
-      for(int x=s+1; x<=last; x++)
-         if(close[x]<target && (open[x]-close[x])>=minBody)
+      for(int x=s+1; x<=win; x++)
+         if(close[x]<target && (high[s]-close[x])>=minLeg)
            { j=x; break; }
 
       if(j>0)
@@ -376,12 +389,17 @@ bool Detect(const int s,const int maxIdx,
 
          if(hasFVG || !InpRequireFVG || InpShowInvalid)
            {
+            double top    = InpWickToWick ? high[s] : MathMax(open[s],close[s]);
+            double bottom = InpWickToWick ? low[s]  : MathMin(open[s],close[s]);
+            if(maxZone>0.0 && (top-bottom)>maxZone)
+               bottom = top-maxZone;
+
             z.tStart     = time[s];
             z.dir        = -1;
             z.hasFVG     = hasFVG;
             z.valid      = (InpRequireFVG ? hasFVG : true);
-            z.obTop      = InpWickToWick ? high[s] : MathMax(open[s],close[s]);
-            z.obBottom   = InpWickToWick ? low[s]  : MathMin(open[s],close[s]);
+            z.obTop      = top;
+            z.obBottom   = bottom;
             z.fvgTop     = fTop;
             z.fvgBottom  = fBot;
             z.sweepLevel = high[ph];

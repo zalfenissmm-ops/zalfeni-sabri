@@ -112,14 +112,16 @@ def detect(k, s, cfg, last):
     a = atr_at(k, s, cfg.atr)
     if a <= 0:
         return None
-    min_body, min_fvg = cfg.displace * a, cfg.fvg_atr * a
+    min_body, min_fvg = cfg.displace * a, cfg.fvg_atr * a  # leg size / gap size
 
     p = swing_low(k, s, cfg.pivot, cfg.search)
-    if p >= 0 and k[s].l < k[p].l < k[s].c and k[s].c < k[s].o:
+    win = min(s + cfg.mss_bars, last)
+    if p >= 0 and k[s].l < k[p].l and k[s].l == min(c.l for c in k[s:win + 1]) \
+            and (not cfg.opp_colour or k[s].c < k[s].o):
         target = max(c.h for c in k[p:s + 1]) if cfg.mss else k[s].h
         j = -1
-        for x in range(s + 1, min(s + cfg.mss_bars, last) + 1):
-            if k[x].c > target and (k[x].c - k[x].o) >= min_body:
+        for x in range(s + 1, win + 1):
+            if k[x].c > target and (k[x].c - k[s].l) >= min_body:
                 j = x
                 break
         if j > 0:
@@ -129,15 +131,17 @@ def detect(k, s, cfg, last):
                     fvg = (k[b].h, k[b + 2].l)
                     break
             if fvg or not cfg.require_fvg:
-                return dict(dir=BULL, i=s, time=k[s].t, bottom=k[s].l, top=k[s].h,
+                top = min(k[s].h, k[s].l + cfg.max_zone * a)
+                return dict(dir=BULL, i=s, time=k[s].t, bottom=k[s].l, top=top,
                             fvg=fvg, swept=k[p].l, checked=j + 1)
 
     ph = swing_high(k, s, cfg.pivot, cfg.search)
-    if ph >= 0 and k[s].h > k[ph].h > k[s].c and k[s].c > k[s].o:
+    if ph >= 0 and k[s].h > k[ph].h and k[s].h == max(c.h for c in k[s:win + 1]) \
+            and (not cfg.opp_colour or k[s].c > k[s].o):
         target = min(c.l for c in k[ph:s + 1]) if cfg.mss else k[s].l
         j = -1
-        for x in range(s + 1, min(s + cfg.mss_bars, last) + 1):
-            if k[x].c < target and (k[x].o - k[x].c) >= min_body:
+        for x in range(s + 1, win + 1):
+            if k[x].c < target and (k[s].h - k[x].c) >= min_body:
                 j = x
                 break
         if j > 0:
@@ -147,7 +151,8 @@ def detect(k, s, cfg, last):
                     fvg = (k[b + 2].h, k[b].l)
                     break
             if fvg or not cfg.require_fvg:
-                return dict(dir=BEAR, i=s, time=k[s].t, bottom=k[s].l, top=k[s].h,
+                bottom = max(k[s].l, k[s].h - cfg.max_zone * a)
+                return dict(dir=BEAR, i=s, time=k[s].t, bottom=bottom, top=k[s].h,
                             fvg=fvg, swept=k[ph].h, checked=j + 1)
     return None
 
@@ -195,8 +200,13 @@ def main():
     ap.add_argument("csv")
     ap.add_argument("--pivot", type=int, default=3, help="swing strength")
     ap.add_argument("--search", type=int, default=40, help="bars searched for the swing")
-    ap.add_argument("--mss-bars", type=int, default=3, help="bars allowed for the shift")
-    ap.add_argument("--displace", type=float, default=0.8, help="shift body >= x*ATR")
+    ap.add_argument("--mss-bars", type=int, default=5, help="bars allowed for the shift")
+    ap.add_argument("--displace", type=float, default=1.0,
+                    help="size of the shift leg (close - sweep extreme) >= x*ATR")
+    ap.add_argument("--max-zone", type=float, default=2.0,
+                    help="clamp the zone height to x*ATR")
+    ap.add_argument("--opp-colour", action="store_true",
+                    help="also require the OB candle to be the opposite colour")
     ap.add_argument("--fvg-atr", type=float, default=0.15, help="FVG >= x*ATR")
     ap.add_argument("--atr", type=int, default=14)
     ap.add_argument("--max-bars", type=int, default=3000)
