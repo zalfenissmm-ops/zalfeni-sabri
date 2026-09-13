@@ -116,9 +116,11 @@ def detect(k, s, cfg, last):
 
     p = swing_low(k, s, cfg.pivot, cfg.search)
     win = min(s + cfg.mss_bars, last)
-    if p >= 0 and k[s].l < k[p].l and k[s].l == min(c.l for c in k[s:win + 1]) \
+    swept_low = p >= 0 and k[s].l < k[p].l
+    if (swept_low or (not cfg.require_sweep and k[s].c < k[s].o)) \
+            and k[s].l == min(c.l for c in k[s:win + 1]) \
             and (not cfg.opp_colour or k[s].c < k[s].o):
-        target = max(c.h for c in k[p:s + 1]) if cfg.mss else k[s].h
+        target = max(c.h for c in k[p:s + 1]) if (cfg.mss and swept_low) else k[s].h
         j = -1
         for x in range(s + 1, win + 1):
             if k[x].c > target and (k[x].c - k[s].l) >= min_body:
@@ -133,12 +135,15 @@ def detect(k, s, cfg, last):
             if fvg or not cfg.require_fvg:
                 top = min(k[s].h, k[s].l + cfg.max_zone * a)
                 return dict(dir=BULL, i=s, time=k[s].t, bottom=k[s].l, top=top,
-                            fvg=fvg, swept=k[p].l, checked=j + 1)
+                            fvg=fvg, swept=k[p].l if swept_low else k[s].l,
+                            has_sweep=swept_low, checked=j + 1)
 
     ph = swing_high(k, s, cfg.pivot, cfg.search)
-    if ph >= 0 and k[s].h > k[ph].h and k[s].h == max(c.h for c in k[s:win + 1]) \
+    swept_high = ph >= 0 and k[s].h > k[ph].h
+    if (swept_high or (not cfg.require_sweep and k[s].c > k[s].o)) \
+            and k[s].h == max(c.h for c in k[s:win + 1]) \
             and (not cfg.opp_colour or k[s].c > k[s].o):
-        target = min(c.l for c in k[ph:s + 1]) if cfg.mss else k[s].l
+        target = min(c.l for c in k[ph:s + 1]) if (cfg.mss and swept_high) else k[s].l
         j = -1
         for x in range(s + 1, win + 1):
             if k[x].c < target and (k[s].h - k[x].c) >= min_body:
@@ -153,7 +158,8 @@ def detect(k, s, cfg, last):
             if fvg or not cfg.require_fvg:
                 bottom = max(k[s].l, k[s].h - cfg.max_zone * a)
                 return dict(dir=BEAR, i=s, time=k[s].t, bottom=bottom, top=k[s].h,
-                            fvg=fvg, swept=k[ph].h, checked=j + 1)
+                            fvg=fvg, swept=k[ph].h if swept_high else k[s].h,
+                            has_sweep=swept_high, checked=j + 1)
     return None
 
 
@@ -212,6 +218,8 @@ def main():
     ap.add_argument("--max-bars", type=int, default=3000)
     ap.add_argument("--overlap", type=float, default=50.0)
     ap.add_argument("--no-mss", dest="mss", action="store_false", help="skip the structure break")
+    ap.add_argument("--sweep-only", dest="require_sweep", action="store_true",
+                    help="keep only blocks that swept a swing point (the strict method)")
     ap.add_argument("--keep-overlap", dest="no_overlap", action="store_false")
     ap.add_argument("--allow-no-fvg", dest="require_fvg", action="store_false")
     ap.add_argument("--show-broken", action="store_true")
@@ -227,11 +235,12 @@ def main():
     live.sort(key=lambda z: z["top"], reverse=True)
 
     print(f"\nالشموع: {len(k)}   من {k[0].t}   إلى {k[-1].t}   آخر سعر: {price:.{d}f}")
-    print(f"مناطق حيّة: {len(live)}   |   مكسورة: {len(zones) - len(live)}\n")
+    print(f"مناطق حيّة: {len(live)}   |   مكسورة: {len(zones) - len(live)}"
+          f"   (* = كنست سيولة سوينق)\n")
     print(f"{'النوع':<10}{'الحالة':<8}{'من':<12}{'إلى':<12}{'الفجوة FVG':<22}{'المسافة':<10}الوقت")
     print("-" * 96)
     for z in live:
-        kind = "Bull OB" if z["dir"] == BULL else "Bear OB"
+        kind = ("Bull OB" if z["dir"] == BULL else "Bear OB") + ("*" if z.get("has_sweep") else "")
         fvg = f"{z['fvg'][0]:.{d}f} - {z['fvg'][1]:.{d}f}" if z["fvg"] else "-"
         mid = (z["top"] + z["bottom"]) / 2
         dist = f"{mid - price:+.{d}f}"

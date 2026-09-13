@@ -4,7 +4,7 @@
 //|      أوردر بلوك = كنس سيولة سوينق + كسر هيكل + فجوة سعرية         |
 //+------------------------------------------------------------------+
 #property copyright "zalfeni-sabri"
-#property version   "1.30"
+#property version   "1.40"
 #property description "Sweep of a real swing point -> displacement that shifts structure -> imbalance"
 #property description "كنس قاع/قمة سوينق حقيقية ثم شفت يكسر الهيكل بقوة ثم فجوة سعرية"
 #property description "Works on all timeframes / يعمل على جميع الفريمات"
@@ -26,6 +26,7 @@
 input group             "=== Quality filters / فلاتر الجودة ==="
 input int    InpPivotStrength   = 3;     // Swing strength (قوة القمة/القاع: شموع كل جهة)
 input int    InpSweepSearch     = 40;    // Bars searched for that swing (مدى البحث)
+input bool   InpRequireSweep    = false; // Sweep of a swing is mandatory (اشتراط كنس السيولة)
 input bool   InpRequireMSS      = true;  // Shift must break structure (الشفت يكسر الهيكل)
 input int    InpMSSBars         = 5;     // Bars allowed for the shift (شموع مسموحة للشفت)
 input double InpDisplaceATR     = 1.0;   // Shift leg >= x*ATR (قوة موجة الشفت)
@@ -81,6 +82,7 @@ struct SZone
    int               dir;          // +1 bullish, -1 bearish
    bool              valid;
    bool              hasFVG;
+   bool              hasSweep;
    double            obTop;
    double            obBottom;
    double            fvgTop;
@@ -311,16 +313,21 @@ bool Detect(const int s,const int maxIdx,
      }
 
 //================= BULLISH =========================================
-   int p = FindSwingLow(s,low);
-   if(p>=0 && low[s]<low[p] && isLowest &&
-      (!InpRequireOppColor || close[s]<open[s]))
+   int  p         = FindSwingLow(s,low);
+   bool sweptLow  = (p>=0 && low[s]<low[p]);
+   bool bullSetup = isLowest &&
+                    (sweptLow || (!InpRequireSweep && close[s]<open[s])) &&
+                    (!InpRequireOppColor || close[s]<open[s]);
+   if(bullSetup)
      {
-      //--- structure level the shift has to break
+      //--- level the shift has to break: structure high after a sweep,
+      //--- otherwise just the order block candle itself
       double structHigh = high[s];
-      for(int q=p; q<=s; q++)
-         if(high[q]>structHigh)
-            structHigh = high[q];
-      double target = InpRequireMSS ? structHigh : high[s];
+      if(sweptLow)
+         for(int q=p; q<=s; q++)
+            if(high[q]>structHigh)
+               structHigh = high[q];
+      double target = (InpRequireMSS && sweptLow) ? structHigh : high[s];
 
       //--- leg that shifts the market away from the swept low
       int j = -1;
@@ -346,14 +353,15 @@ bool Detect(const int s,const int maxIdx,
 
             z.tStart     = time[s];
             z.dir        = 1;
+            z.hasSweep   = sweptLow;
             z.hasFVG     = hasFVG;
             z.valid      = (InpRequireFVG ? hasFVG : true);
             z.obTop      = top;
             z.obBottom   = bottom;
             z.fvgTop     = fTop;
             z.fvgBottom  = fBot;
-            z.sweepLevel = low[p];
-            z.tSweepFrom = time[p];
+            z.sweepLevel = sweptLow ? low[p]  : low[s];
+            z.tSweepFrom = sweptLow ? time[p] : time[s];
             z.state      = ZONE_FRESH;
             z.checked    = j+1;
             z.tBroken    = 0;
@@ -364,15 +372,19 @@ bool Detect(const int s,const int maxIdx,
      }
 
 //================= BEARISH =========================================
-   int ph = FindSwingHigh(s,high);
-   if(ph>=0 && high[s]>high[ph] && isHighest &&
-      (!InpRequireOppColor || close[s]>open[s]))
+   int  ph        = FindSwingHigh(s,high);
+   bool sweptHigh = (ph>=0 && high[s]>high[ph]);
+   bool bearSetup = isHighest &&
+                    (sweptHigh || (!InpRequireSweep && close[s]>open[s])) &&
+                    (!InpRequireOppColor || close[s]>open[s]);
+   if(bearSetup)
      {
       double structLow = low[s];
-      for(int q=ph; q<=s; q++)
-         if(low[q]<structLow)
-            structLow = low[q];
-      double target = InpRequireMSS ? structLow : low[s];
+      if(sweptHigh)
+         for(int q=ph; q<=s; q++)
+            if(low[q]<structLow)
+               structLow = low[q];
+      double target = (InpRequireMSS && sweptHigh) ? structLow : low[s];
 
       int j = -1;
       for(int x=s+1; x<=win; x++)
@@ -396,14 +408,15 @@ bool Detect(const int s,const int maxIdx,
 
             z.tStart     = time[s];
             z.dir        = -1;
+            z.hasSweep   = sweptHigh;
             z.hasFVG     = hasFVG;
             z.valid      = (InpRequireFVG ? hasFVG : true);
             z.obTop      = top;
             z.obBottom   = bottom;
             z.fvgTop     = fTop;
             z.fvgBottom  = fBot;
-            z.sweepLevel = high[ph];
-            z.tSweepFrom = time[ph];
+            z.sweepLevel = sweptHigh ? high[ph] : high[s];
+            z.tSweepFrom = sweptHigh ? time[ph] : time[s];
             z.state      = ZONE_FRESH;
             z.checked    = j+1;
             z.tBroken    = 0;
@@ -501,7 +514,7 @@ void DrawZone(const int i,const datetime tRight,const bool withLabel)
       ObjectDelete(0,base+"FVG");
 
 //--- swept swing level
-   if(InpShowSweepLine && z.state!=ZONE_BROKEN)
+   if(InpShowSweepLine && z.hasSweep && z.state!=ZONE_BROKEN)
       ObjSegment(base+"SW",z.tSweepFrom,z.sweepLevel,(datetime)(z.tStart+PeriodSeconds()),
                  z.sweepLevel,InpSweepColor,STYLE_DOT,1);
    else
@@ -520,6 +533,8 @@ void DrawZone(const int i,const datetime tRight,const bool withLabel)
    if(withLabel && z.state!=ZONE_BROKEN)
      {
       string txt = z.valid ? (z.dir>0 ? " Bull OB" : " Bear OB") : " OB (no FVG)";
+      if(z.hasSweep)
+         txt += " +sweep";
       if(z.state==ZONE_TOUCHED)
          txt += " •";
       ObjLabelText(base+"T",tEnd,(z.obTop+z.obBottom)/2.0,txt,InpTextColor);
